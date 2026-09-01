@@ -435,6 +435,124 @@ def _qwen38_layer_mlp_crystal_policy(
     }
 
 
+def _qwen38_layer_mlp_o1_policy(args: argparse.Namespace) -> dict[str, object] | None:
+    """Return a path-free identity/configuration for passive MLP O1 charging."""
+
+    configured = getattr(args, "layer_mlp_o1_state", None)
+    configured_atlas = getattr(args, "layer_mlp_o1_atlas", None)
+    configured_compute = getattr(args, "layer_mlp_o1_compute_root", None)
+    if configured is None:
+        if configured_atlas is not None or configured_compute is not None:
+            raise ValueError("layer-MLP O1 authorities require --layer-mlp-o1-state")
+        return None
+    if configured_atlas is None or configured_compute is None:
+        raise ValueError("--layer-mlp-o1-state requires Atlas and Compute authorities")
+    from .runtimes.ooe.compute_crystals import ComputeCrystalBank
+    from .runtimes.ooe.compute_graph import ComputeOperatorGraph
+    from .knowledge.livecausal import LiveGraph
+    from .runtimes.qwen3_8.adapter import (
+        DEFAULT_LAYER_MLP_O1_PROJECTION_SEED,
+    )
+    from .runtimes.qwen3_8.layer_mlp_o1 import Layer63MlpO1Accumulator
+    from .runtimes.qwen3_8.layer_transition_crystal import (
+        LayerTransitionProjectionIdentity,
+    )
+    from .runtimes.qwen3_8.semantic_atlas import GraphRevision
+
+    state_path = Path(configured).expanduser().absolute()
+    atlas_path = Path(configured_atlas).expanduser().absolute()
+    compute_root = Path(configured_compute).expanduser().absolute()
+    sketch_dim = int(getattr(args, "layer_mlp_o1_sketch_dim", 128))
+    seed = getattr(
+        args,
+        "layer_mlp_o1_seed",
+        DEFAULT_LAYER_MLP_O1_PROJECTION_SEED,
+    )
+    ridge = float(getattr(args, "layer_mlp_o1_ridge", 1e-8))
+    coverage_guard = float(getattr(args, "layer_mlp_o1_coverage_guard", 0.0))
+    error_guard = float(getattr(args, "layer_mlp_o1_error_guard", 0.0))
+    queue_capacity = int(getattr(args, "layer_mlp_o1_queue_capacity", 8))
+    if not 0 < sketch_dim <= 256:
+        raise ValueError("layer-MLP O1 sketch_dim must lie in [1, 256]")
+    if (
+        not isinstance(seed, str)
+        or len(seed) != 64
+        or set(seed) - set("0123456789abcdef")
+    ):
+        raise ValueError("layer-MLP O1 seed must be a lowercase SHA-256")
+    if not math.isfinite(ridge) or ridge <= 0:
+        raise ValueError("layer-MLP O1 ridge must be positive and finite")
+    if any(
+        not math.isfinite(value) or value < 0 for value in (coverage_guard, error_guard)
+    ):
+        raise ValueError("layer-MLP O1 guards must be finite and non-negative")
+    if queue_capacity <= 0:
+        raise ValueError("layer-MLP O1 queue capacity must be positive")
+    try:
+        atlas = LiveGraph(atlas_path)
+        sequence, event_sha256 = atlas.store.revision()
+        atlas_revision = GraphRevision(sequence, event_sha256).sha256
+        compute_revision = (
+            ComputeOperatorGraph(ComputeCrystalBank(compute_root)).state().sha256
+        )
+    except Exception as exc:
+        raise ValueError(
+            "layer-MLP O1 authorities are unavailable or unauthenticated"
+        ) from exc
+    identity: dict[str, object] | None = None
+    if state_path.exists():
+        accumulator = Layer63MlpO1Accumulator.load(state_path)
+        state_identity = accumulator.identity
+        _authenticate_layer_transition_crystal_atlas(
+            atlas_path,
+            atlas_revision_sha256=state_identity.atlas_revision_sha256,
+            option="--layer-mlp-o1-atlas",
+            subject="layer-MLP O1",
+        )
+        _authenticate_layer_transition_crystal_compute_graph(
+            compute_root,
+            graph_revision_sha256=state_identity.graph_revision_sha256,
+            option="--layer-mlp-o1-compute-root",
+            subject="layer-MLP O1",
+        )
+        expected_projection = LayerTransitionProjectionIdentity(
+            hidden_dim=state_identity.hidden_dim,
+            sketch_dim=sketch_dim,
+            seed_sha256=seed,
+        )
+        if (
+            state_identity.projection != expected_projection
+            or accumulator.ridge != ridge
+            or accumulator.coverage_guard != coverage_guard
+            or accumulator.error_guard != error_guard
+        ):
+            raise ValueError("layer-MLP O1 state differs from its CLI configuration")
+        atlas_revision = state_identity.atlas_revision_sha256
+        compute_revision = state_identity.graph_revision_sha256
+        identity = {
+            "atlas_revision_sha256": state_identity.atlas_revision_sha256,
+            "graph_revision_sha256": state_identity.graph_revision_sha256,
+            "identity_sha256": state_identity.identity_sha256,
+            "model_sha256": state_identity.model_sha256,
+            "q4_sha256": state_identity.q4_sha256,
+        }
+    return {
+        "authorities": {
+            "atlas_revision_sha256": atlas_revision,
+            "compute_revision_sha256": compute_revision,
+        },
+        "coverage_guard": coverage_guard.hex(),
+        "enabled": True,
+        "error_guard": error_guard.hex(),
+        "identity": identity,
+        "projection_seed_sha256": seed,
+        "queue_capacity": queue_capacity,
+        "ridge": ridge.hex(),
+        "schema": "immer.qwen3.8-layer63-mlp-o1-policy/v1",
+        "sketch_dim": sketch_dim,
+    }
+
+
 def _resolve_qwen38_chat_paths(
     args: argparse.Namespace,
 ) -> tuple[Path, Path, Path | None, Path | None]:
@@ -648,6 +766,7 @@ def _qwen38_service_profile(
     profile = {
         "attention_output_crystal": (attention_output_crystal_state_path is not None),
         "layer_mlp_crystal": _qwen38_layer_mlp_crystal_policy(args),
+        "layer_mlp_o1": _qwen38_layer_mlp_o1_policy(args),
         "layer_transition_crystal": (_qwen38_layer_transition_crystal_policy(args)),
         "mlp_page_coordinate": mlp_page_coordinate_enabled,
         "arguments": {
@@ -812,6 +931,7 @@ def _qwen38_growing_warm_profile(
         ),
         "layer_transition_crystal": (_qwen38_layer_transition_crystal_policy(args)),
         "layer_mlp_crystal": _qwen38_layer_mlp_crystal_policy(args),
+        "layer_mlp_o1": _qwen38_layer_mlp_o1_policy(args),
         "mlp_page_coordinate": (
             getattr(args, "mlp_page_coordinate_state", None) is not None
         ),
@@ -2168,6 +2288,73 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         args.layer_mlp_crystal_atlas = layer_mlp_crystal_atlas_path
         args.layer_mlp_crystal_compute_root = layer_mlp_crystal_compute_root
         args.layer_mlp_crystal_max_error_radius = layer_mlp_crystal_max_error_radius
+        layer_mlp_o1_state_path = _chat_path(
+            getattr(args, "layer_mlp_o1_state", None),
+            "IMMER_QWEN38_LAYER_MLP_O1_STATE",
+        )
+        layer_mlp_o1_atlas_path = _chat_path(
+            getattr(args, "layer_mlp_o1_atlas", None),
+            "IMMER_QWEN38_LAYER_MLP_O1_ATLAS",
+        )
+        layer_mlp_o1_compute_root = _chat_path(
+            getattr(args, "layer_mlp_o1_compute_root", None),
+            "IMMER_QWEN38_LAYER_MLP_O1_COMPUTE_ROOT",
+        )
+        if layer_mlp_o1_state_path is not None:
+            if q4_root is None:
+                raise ValueError("layer-MLP O1 collection requires local Q4 execution")
+            if args.compute_dtype not in {"auto", "bfloat16"}:
+                raise ValueError("layer-MLP O1 collection requires bfloat16 compute")
+            if layer_mlp_o1_atlas_path is None or layer_mlp_o1_compute_root is None:
+                raise ValueError(
+                    "--layer-mlp-o1-state requires --layer-mlp-o1-atlas and "
+                    "--layer-mlp-o1-compute-root"
+                )
+            if (
+                layer_mlp_o1_state_path.exists()
+                and not layer_mlp_o1_state_path.is_file()
+            ):
+                raise ValueError(
+                    "--layer-mlp-o1-state must name a regular file or new file"
+                )
+            _require_existing_real_directory(
+                layer_mlp_o1_state_path.parent,
+                "--layer-mlp-o1-state parent",
+            )
+        elif (
+            layer_mlp_o1_atlas_path is not None or layer_mlp_o1_compute_root is not None
+        ):
+            raise ValueError("layer-MLP O1 authorities require --layer-mlp-o1-state")
+        if layer_mlp_o1_atlas_path is not None:
+            _require_existing_real_directory(
+                layer_mlp_o1_atlas_path,
+                "--layer-mlp-o1-atlas",
+            )
+        if layer_mlp_o1_compute_root is not None:
+            _require_existing_real_directory(
+                layer_mlp_o1_compute_root,
+                "--layer-mlp-o1-compute-root",
+            )
+        if not 0 < args.layer_mlp_o1_sketch_dim <= 256:
+            raise ValueError("--layer-mlp-o1-sketch-dim must lie in [1, 256]")
+        if len(args.layer_mlp_o1_seed) != 64 or set(args.layer_mlp_o1_seed) - set(
+            "0123456789abcdef"
+        ):
+            raise ValueError("--layer-mlp-o1-seed must be a lowercase SHA-256")
+        if not math.isfinite(args.layer_mlp_o1_ridge) or args.layer_mlp_o1_ridge <= 0:
+            raise ValueError("--layer-mlp-o1-ridge must be positive and finite")
+        for value, option in (
+            (args.layer_mlp_o1_coverage_guard, "--layer-mlp-o1-coverage-guard"),
+            (args.layer_mlp_o1_error_guard, "--layer-mlp-o1-error-guard"),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{option} must be finite and non-negative")
+        if args.layer_mlp_o1_queue_capacity <= 0:
+            raise ValueError("--layer-mlp-o1-queue-capacity must be positive")
+        args.layer_mlp_o1_state = layer_mlp_o1_state_path
+        args.layer_mlp_o1_atlas = layer_mlp_o1_atlas_path
+        args.layer_mlp_o1_compute_root = layer_mlp_o1_compute_root
+        _qwen38_layer_mlp_o1_policy(args)
         disable_draft_window = bool(getattr(args, "no_draft_window_controller", False))
         if disable_draft_window and getattr(args, "draft_window_state", None):
             raise ValueError(
@@ -2330,6 +2517,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                             _qwen38_layer_transition_crystal_policy(args)
                         ),
                         "layer_mlp_crystal": _qwen38_layer_mlp_crystal_policy(args),
+                        "layer_mlp_o1": _qwen38_layer_mlp_o1_policy(args),
                         "prefix_sinkhorn": bool(args.prefix_sinkhorn),
                         "raw_qwen": bool(args.raw_qwen),
                         "runtime_code_revision": runtime_code_revision,
@@ -2731,6 +2919,27 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 else str(layer_mlp_crystal_compute_root)
             ),
             layer_mlp_crystal_max_error_radius=(layer_mlp_crystal_max_error_radius),
+            layer_mlp_o1_state_path=(
+                None
+                if layer_mlp_o1_state_path is None
+                else str(layer_mlp_o1_state_path)
+            ),
+            layer_mlp_o1_atlas_path=(
+                None
+                if layer_mlp_o1_atlas_path is None
+                else str(layer_mlp_o1_atlas_path)
+            ),
+            layer_mlp_o1_compute_root=(
+                None
+                if layer_mlp_o1_compute_root is None
+                else str(layer_mlp_o1_compute_root)
+            ),
+            layer_mlp_o1_sketch_dim=args.layer_mlp_o1_sketch_dim,
+            layer_mlp_o1_projection_seed=args.layer_mlp_o1_seed,
+            layer_mlp_o1_ridge=args.layer_mlp_o1_ridge,
+            layer_mlp_o1_coverage_guard=args.layer_mlp_o1_coverage_guard,
+            layer_mlp_o1_error_guard=args.layer_mlp_o1_error_guard,
+            layer_mlp_o1_queue_capacity=args.layer_mlp_o1_queue_capacity,
             mtp_draft_state_path=mtp_draft_state,
             draft_window_state_path=(
                 None
@@ -3904,6 +4113,62 @@ def build_parser() -> argparse.ArgumentParser:
             "maximum admitted artifact error radius for the private BF16 "
             "layer-63 MLP bank (default: 0)"
         ),
+    )
+    chat.add_argument(
+        "--layer-mlp-o1-state",
+        help=(
+            "persistent passive layer-63 MLP O1 sufficient statistics; "
+            "never mounts the learned approximate bank"
+        ),
+    )
+    chat.add_argument(
+        "--layer-mlp-o1-atlas",
+        help="authenticated O1 Semantic Atlas authority for passive MLP charging",
+    )
+    chat.add_argument(
+        "--layer-mlp-o1-compute-root",
+        help="authenticated ComputeOperatorGraph authority for passive MLP charging",
+    )
+    chat.add_argument(
+        "--layer-mlp-o1-sketch-dim",
+        type=int,
+        default=128,
+        metavar="D",
+        help="O1 Rademacher sketch width (default: 128)",
+    )
+    chat.add_argument(
+        "--layer-mlp-o1-seed",
+        default=("2b188a99b4b36f51bd910866e6d9a007fd02ec7256d6596fc87eb76f0444eccf"),
+        metavar="SHA256",
+        help="deterministic O1 projection seed",
+    )
+    chat.add_argument(
+        "--layer-mlp-o1-ridge",
+        type=float,
+        default=1e-8,
+        metavar="LAMBDA",
+        help="positive centered-ridge coefficient (default: 1e-8)",
+    )
+    chat.add_argument(
+        "--layer-mlp-o1-coverage-guard",
+        type=float,
+        default=0.0,
+        metavar="RADIUS",
+        help="non-negative persistent feature-coverage guard",
+    )
+    chat.add_argument(
+        "--layer-mlp-o1-error-guard",
+        type=float,
+        default=0.0,
+        metavar="RADIUS",
+        help="non-negative persistent error-envelope guard",
+    )
+    chat.add_argument(
+        "--layer-mlp-o1-queue-capacity",
+        type=int,
+        default=8,
+        metavar="N",
+        help="bounded asynchronous request-batch queue (default: 8)",
     )
     chat.add_argument(
         "--mtp-draft-state",

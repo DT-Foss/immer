@@ -19,6 +19,7 @@ from immer.cli import (
     _QWEN38_MARKOV_DRAFT_ABI,
     _QWEN38_MTP_DRAFT_ABI,
     _qwen38_growing_warm_profile,
+    _qwen38_layer_mlp_o1_policy,
     _qwen38_output_semantics,
     _qwen38_service_profile,
     _qwen38_runtime_code_paths,
@@ -74,6 +75,8 @@ from immer.runtimes.qwen3_8.layer_mlp_crystal import (
     LAYER_MLP_RESIDUAL_ACTION_ABI,
     Layer63MlpResidualCrystalIdentity,
 )
+from immer.runtimes.qwen3_8.layer_mlp_o1 import Layer63MlpO1Accumulator
+from immer.runtimes.qwen3_8.layer_mlp_o1_runtime import Layer63MlpO1AsyncWorker
 from immer.runtimes.qwen3_8.markov_draft import MARKOV_DRAFT_PROVIDER_ABI
 from immer.runtimes.qwen3_8.mlp_page_coordinate import (
     MLP_PAGE_COORDINATE_EVIDENCE_SCHEMA,
@@ -330,6 +333,39 @@ class _StreamingModel(_Model):
         return super().generate_greedy(prompt, **kwargs)
 
 
+class _LayerMlpO1Model(_Model):
+    def __init__(self, *, generation_error: Exception | None = None) -> None:
+        super().__init__(generation_error=generation_error)
+        self.layer_mlp_o1_observer = None
+        self.o1_rows = 0
+        self.o1_failures = 0
+
+    def set_layer_mlp_o1_observer(self, observer) -> None:
+        self.layer_mlp_o1_observer = observer
+
+    def layer_mlp_o1_observer_metrics(self):
+        return {
+            "failures": self.o1_failures,
+            "rows": self.o1_rows,
+            "schema": "immer.qwen3.8-layer63-mlp-o1-observer/v1",
+        }
+
+    def generate_greedy(self, prompt, **kwargs):
+        generated, evidence = super().generate_greedy(prompt, **kwargs)
+        observer = self.layer_mlp_o1_observer
+        if observer is not None:
+            base = torch.arange(8, dtype=torch.float32).to(torch.bfloat16)
+            feature = (base.float() + 1.0).to(torch.bfloat16)
+            target = (base.float() + feature.float() * 0.1).to(torch.bfloat16)
+            observer(
+                base.reshape(1, 1, 8),
+                feature.reshape(1, 1, 8),
+                target.reshape(1, 1, 8),
+            )
+            self.o1_rows += 1
+        return generated, evidence
+
+
 class _PrefixSinkhornModel(_Model):
     def __init__(self) -> None:
         super().__init__()
@@ -561,6 +597,232 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         deployment_state.start()
         self.addCleanup(deployment_state.stop)
+
+    def test_layer_mlp_o1_policy_is_path_free_and_binds_authorities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            atlas_root = root / "atlas"
+            compute_root = root / "compute"
+            _semantic_atlas_authority(atlas_root)
+            _compute_graph_authority(compute_root)
+            args = SimpleNamespace(
+                layer_mlp_o1_state=root / "private-o1.json",
+                layer_mlp_o1_atlas=atlas_root,
+                layer_mlp_o1_compute_root=compute_root,
+                layer_mlp_o1_sketch_dim=128,
+                layer_mlp_o1_seed=(
+                    "2b188a99b4b36f51bd910866e6d9a007fd02ec7256d6596fc87eb76f0444eccf"
+                ),
+                layer_mlp_o1_ridge=1e-8,
+                layer_mlp_o1_coverage_guard=0.0,
+                layer_mlp_o1_error_guard=0.0,
+                layer_mlp_o1_queue_capacity=8,
+            )
+            policy = _qwen38_layer_mlp_o1_policy(args)
+            self.assertIsNotNone(policy)
+            assert policy is not None
+            encoded = json.dumps(policy, sort_keys=True)
+            self.assertNotIn(str(root), encoded)
+            self.assertEqual(policy["sketch_dim"], 128)
+            self.assertEqual(policy["queue_capacity"], 8)
+            self.assertIsNone(policy["identity"])
+            self.assertEqual(len(policy["authorities"]["atlas_revision_sha256"]), 64)
+            self.assertEqual(
+                len(policy["authorities"]["compute_revision_sha256"]),
+                64,
+            )
+
+    def test_layer_mlp_o1_policy_uses_existing_state_pinned_authorities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            atlas_root = root / "atlas"
+            compute_root = root / "compute"
+            atlas_revision = _semantic_atlas_authority(atlas_root)
+            graph_revision = _compute_graph_authority(compute_root)
+            live_sequence, live_event = LiveGraph(atlas_root).store.revision()
+            self.assertNotEqual(
+                GraphRevision(live_sequence, live_event).sha256,
+                atlas_revision,
+            )
+            self.assertNotEqual(
+                ComputeOperatorGraph(ComputeCrystalBank(compute_root)).state().sha256,
+                graph_revision,
+            )
+            identity = _layer_mlp_identity(
+                graph=graph_revision,
+                atlas=atlas_revision,
+            )
+            state_path = root / "o1.json"
+            accumulator = Layer63MlpO1Accumulator(
+                state_path,
+                identity,
+                packed_weight_bytes_avoided=123,
+            )
+            rows = torch.arange(48, dtype=torch.float32).reshape(6, 8)
+            base = rows.to(torch.bfloat16)
+            feature = (rows + 1).to(torch.bfloat16)
+            target = (rows + 2).to(torch.bfloat16)
+            accumulator.observe(base, feature, target)
+            args = SimpleNamespace(
+                layer_mlp_o1_state=state_path,
+                layer_mlp_o1_atlas=atlas_root,
+                layer_mlp_o1_compute_root=compute_root,
+                layer_mlp_o1_sketch_dim=3,
+                layer_mlp_o1_seed="1" * 64,
+                layer_mlp_o1_ridge=1e-8,
+                layer_mlp_o1_coverage_guard=0.0,
+                layer_mlp_o1_error_guard=0.0,
+                layer_mlp_o1_queue_capacity=8,
+            )
+            policy = _qwen38_layer_mlp_o1_policy(args)
+
+        assert policy is not None
+        self.assertEqual(
+            policy["authorities"],
+            {
+                "atlas_revision_sha256": atlas_revision,
+                "compute_revision_sha256": graph_revision,
+            },
+        )
+        self.assertEqual(
+            policy["identity"]["identity_sha256"], identity.identity_sha256
+        )
+
+    def test_passive_layer_mlp_o1_enqueues_only_after_successful_generation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "o1.json"
+            accumulator = Layer63MlpO1Accumulator(
+                state_path,
+                _layer_mlp_identity(),
+                packed_weight_bytes_avoided=123,
+            )
+            worker = Layer63MlpO1AsyncWorker(accumulator, queue_capacity=2)
+            runtime = _Runtime(model=_LayerMlpO1Model())
+            chat = _chat(runtime)
+            chat._load_locked()
+            chat._layer_mlp_o1_worker = worker
+            runtime.layer_mlp_o1_worker = worker
+
+            result = chat.handle(Request("chat", "hello"))
+            self.assertEqual(result.status, ExecutionStatus.OK)
+            self.assertEqual(result.output, "local answer")
+            request = result.evidence["layer_mlp_o1_collection"]["request"]
+            self.assertEqual(request["captured_rows"], 1)
+            self.assertTrue(request["enqueued"])
+            self.assertEqual(request["status"], "enqueued")
+            self.assertIsNone(request["accounting_error"])
+            self.assertTrue(worker.flush(timeout=5))
+            metrics = worker.metrics()
+            self.assertEqual(metrics["settled_rows"], 1)
+            serialized = json.dumps(
+                result.evidence["layer_mlp_o1_collection"],
+                sort_keys=True,
+            )
+            self.assertNotIn(str(state_path), serialized)
+            worker.close()
+            chat._layer_mlp_o1_worker = None
+            chat.close()
+
+            failed_worker = Layer63MlpO1AsyncWorker(
+                Layer63MlpO1Accumulator(
+                    Path(temporary) / "failed.json",
+                    _layer_mlp_identity(),
+                    packed_weight_bytes_avoided=123,
+                ),
+                queue_capacity=1,
+            )
+            failed_runtime = _Runtime(
+                model=_LayerMlpO1Model(generation_error=RuntimeError("generation"))
+            )
+            failed_chat = _chat(failed_runtime)
+            failed_chat._load_locked()
+            failed_chat._layer_mlp_o1_worker = failed_worker
+            failed_runtime.layer_mlp_o1_worker = failed_worker
+            failed = failed_chat.handle(Request("chat", "hello"))
+            self.assertEqual(failed.status, ExecutionStatus.ERROR)
+            self.assertEqual(failed_worker.metrics()["queued_batches"], 0)
+            failed_worker.close()
+            failed_chat._layer_mlp_o1_worker = None
+            failed_chat.close()
+
+    def test_passive_layer_mlp_o1_accounting_error_cannot_fail_output(self) -> None:
+        class BrokenMetricsModel(_LayerMlpO1Model):
+            def __init__(self) -> None:
+                super().__init__()
+                self.metric_calls = 0
+
+            def layer_mlp_o1_observer_metrics(self):
+                self.metric_calls += 1
+                if self.metric_calls == 1:
+                    return super().layer_mlp_o1_observer_metrics()
+                return {"rows": -1, "failures": -1}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = Layer63MlpO1AsyncWorker(
+                Layer63MlpO1Accumulator(
+                    Path(temporary) / "o1.json",
+                    _layer_mlp_identity(),
+                    packed_weight_bytes_avoided=123,
+                )
+            )
+            runtime = _Runtime(model=BrokenMetricsModel())
+            chat = _chat(runtime)
+            chat._load_locked()
+            chat._layer_mlp_o1_worker = worker
+            runtime.layer_mlp_o1_worker = worker
+
+            result = chat.handle(Request("chat", "hello"))
+
+            self.assertTrue(result.ok, result.reason)
+            request = result.evidence["layer_mlp_o1_collection"]["request"]
+            self.assertEqual(request["status"], "accounting-error")
+            self.assertFalse(request["enqueued"])
+            self.assertIn("ValueError", request["accounting_error"])
+            self.assertEqual(worker.metrics()["queued_batches"], 0)
+            worker.close()
+            chat._layer_mlp_o1_worker = None
+            chat.close()
+
+    def test_layer_mlp_o1_runtime_builds_authenticated_identity_without_bank_mount(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            atlas_root = root / "atlas"
+            compute_root = root / "compute"
+            _semantic_atlas_authority(atlas_root)
+            _compute_graph_authority(compute_root)
+            model = _LayerMlpO1Model()
+            model.config.dim = 8
+            model.layer_mlp_crystal_model_sha256 = lambda: "2" * 64
+            model.layer_mlp_crystal_q4_sha256 = lambda: "3" * 64
+            model._layer_mlp_crystal_avoided_q4_bytes = lambda: 456
+            runtime = _Runtime(model=model)
+            chat = _chat(
+                runtime,
+                q4_root="/fixture/q4",
+                compute_dtype="bfloat16",
+                layer_mlp_o1_state_path=root / "o1.json",
+                layer_mlp_o1_atlas_path=atlas_root,
+                layer_mlp_o1_compute_root=compute_root,
+                layer_mlp_o1_sketch_dim=3,
+                layer_mlp_o1_projection_seed="1" * 64,
+            )
+            chat._load_locked()
+            worker = chat._layer_mlp_o1_worker
+            self.assertIsNotNone(worker)
+            assert worker is not None
+            identity = worker.accumulator.identity
+            self.assertEqual(identity.model_sha256, "2" * 64)
+            self.assertEqual(identity.q4_sha256, "3" * 64)
+            self.assertEqual(identity.hidden_dim, 8)
+            self.assertEqual(identity.sketch_dim, 3)
+            self.assertIsNone(chat._layer_mlp_crystal_bank)
+            worker.close()
+            chat._layer_mlp_o1_worker = None
+            chat.close()
 
     def test_markov_atlas_loads_once_and_binds_runtime_tokenizer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import warnings
 import weakref
 
 import numpy as np
@@ -4710,6 +4711,130 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
                 )
 
         bank.replace.assert_not_called()
+
+    def test_passive_layer_mlp_o1_hook_is_exact_k1_decode_only_and_isolated(
+        self,
+    ) -> None:
+        config = _official_topology_tiny_config()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            save_file(_tiny_weights(config), root / "model.safetensors")
+            source = Streamer.from_local(root, budget_mb=20, use_cache=False)
+            pager = Qwen38WeightPager(
+                source,
+                device="cpu",
+                compute_dtype="bfloat16",
+                max_resident_bytes=2 * 1024**2,
+            )
+            model = StreamedQwen38(config, pager, max_batch_size=1, max_seq_len=8)
+            try:
+                hidden = torch.randn((1, 1, config.dim)).to(torch.bfloat16)
+                mask = torch.ones((1, 1), dtype=torch.bool)
+                expected, _ = model._forward_layer(
+                    hidden,
+                    layer=63,
+                    token_mask=mask,
+                    state=None,
+                    start_pos=1,
+                    stateful=True,
+                )
+                captured: list[tuple[torch.Tensor, ...]] = []
+
+                def observe(*rows: torch.Tensor) -> None:
+                    captured.append(rows)
+                    for row in rows:
+                        row.zero_()  # caller-owned copies cannot alter model output
+
+                model.set_layer_mlp_o1_observer(observe)
+                actual, _ = model._forward_layer(
+                    hidden,
+                    layer=63,
+                    token_mask=mask,
+                    state=None,
+                    start_pos=1,
+                    stateful=True,
+                )
+                self.assertTrue(torch.equal(actual, expected))
+                self.assertEqual(len(captured), 1)
+                self.assertTrue(
+                    all(
+                        tuple(row.shape) == (1, 1, config.dim)
+                        and row.dtype == torch.bfloat16
+                        and row.device.type == "cpu"
+                        for row in captured[0]
+                    )
+                )
+
+                # Stateful prompt position zero and non-stateful prefill are not
+                # decode observations even when their physical width is one.
+                model._forward_layer(
+                    hidden,
+                    layer=63,
+                    token_mask=mask,
+                    state=None,
+                    start_pos=0,
+                    stateful=True,
+                )
+                model._forward_layer(
+                    hidden,
+                    layer=63,
+                    token_mask=mask,
+                    state=None,
+                    start_pos=0,
+                    stateful=False,
+                )
+                model._forward_layer_token_rows(
+                    (hidden, hidden.clone()),
+                    layer=63,
+                    state=None,
+                    start_pos=1,
+                    native_head_crsa_observer=lambda _row: None,
+                )
+                self.assertEqual(len(captured), 1)
+
+                def broken(*_rows: torch.Tensor) -> None:
+                    raise RuntimeError("passive sink failed")
+
+                model.set_layer_mlp_o1_observer(broken)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    isolated, _ = model._forward_layer(
+                        hidden,
+                        layer=63,
+                        token_mask=mask,
+                        state=None,
+                        start_pos=1,
+                        stateful=True,
+                    )
+                self.assertTrue(torch.equal(isolated, expected))
+                self.assertEqual(model.layer_mlp_o1_observer_metrics()["failures"], 1)
+
+                model.set_layer_mlp_o1_observer(observe)
+                replacement = SimpleNamespace(
+                    output=expected.clone(),
+                    logical_weight_bytes_replaced=123,
+                )
+                bank = self._mlp_crystal_bank(replacement)
+                model.layer_mlp_crystal_bank = bank
+                model.layer_mlp_crystal_enabled = True
+                before = len(captured)
+                with mock.patch.object(
+                    model,
+                    "_layer_mlp_crystal_avoided_q4_bytes",
+                    return_value=123,
+                ):
+                    model._forward_layer(
+                        hidden,
+                        layer=63,
+                        token_mask=mask,
+                        state=None,
+                        start_pos=1,
+                        stateful=True,
+                    )
+                self.assertEqual(len(captured), before)
+            finally:
+                pager.close()
+                source.close()
 
 
 if __name__ == "__main__":

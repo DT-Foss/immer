@@ -81,6 +81,9 @@ from .layer_mlp_crystal import (
     Layer63MlpResidualCrystalBank,
     Layer63MlpResidualCrystalIdentity,
 )
+from .layer_mlp_o1 import Layer63MlpO1Accumulator
+from .layer_mlp_o1_runtime import Layer63MlpO1AsyncWorker
+from .layer_transition_crystal import LayerTransitionProjectionIdentity
 from .mlp_page_markov import (
     MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS,
     MLP_PAGE_MARKOV_POLICY,
@@ -152,6 +155,12 @@ LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA = (
 )
 LAYER_MLP_CRYSTAL_EVIDENCE_SCHEMA = (
     "immer.qwen3.8-layer-mlp-residual-crystal-evidence/v1"
+)
+LAYER_MLP_O1_COLLECTION_EVIDENCE_SCHEMA = (
+    "immer.qwen3.8-layer63-mlp-o1-collection-evidence/v1"
+)
+DEFAULT_LAYER_MLP_O1_PROJECTION_SEED = (
+    "2b188a99b4b36f51bd910866e6d9a007fd02ec7256d6596fc87eb76f0444eccf"
 )
 QWEN38_CHAT_HISTORY_METADATA = "qwen_chat_history"
 QWEN38_CHAT_SESSION_METADATA = "qwen_chat_session"
@@ -1056,6 +1065,7 @@ class _OwnedRuntime:
         self.q4_bank = q4_bank
         self.delta_head_router = delta_head_router
         self.mlp_page_router = mlp_page_router
+        self.layer_mlp_o1_worker: Layer63MlpO1AsyncWorker | None = None
         self.q4_receipt = None if q4_bank is None else q4_bank.metrics()
         self.exact_head_receipt = (
             None if exact_head_index is None else exact_head_index.receipt.to_record()
@@ -1074,6 +1084,21 @@ class _OwnedRuntime:
         if self._closed:
             return
         failures: list[Exception] = []
+        set_layer_mlp_o1_observer = getattr(
+            self.model,
+            "set_layer_mlp_o1_observer",
+            None,
+        )
+        if callable(set_layer_mlp_o1_observer):
+            try:
+                set_layer_mlp_o1_observer(None)
+            except Exception as exc:
+                failures.append(exc)
+        if self.layer_mlp_o1_worker is not None:
+            try:
+                self.layer_mlp_o1_worker.close()
+            except Exception as exc:
+                failures.append(exc)
         try:
             self.model.reset_state(release=True)
         except Exception as exc:  # release the remaining owners regardless
@@ -1609,6 +1634,15 @@ class Qwen38CausalChat:
         layer_mlp_crystal_atlas_path: str | Path | None = None,
         layer_mlp_crystal_compute_root: str | Path | None = None,
         layer_mlp_crystal_max_error_radius: float = 0.0,
+        layer_mlp_o1_state_path: str | Path | None = None,
+        layer_mlp_o1_atlas_path: str | Path | None = None,
+        layer_mlp_o1_compute_root: str | Path | None = None,
+        layer_mlp_o1_sketch_dim: int = 128,
+        layer_mlp_o1_projection_seed: str = DEFAULT_LAYER_MLP_O1_PROJECTION_SEED,
+        layer_mlp_o1_ridge: float = 1e-8,
+        layer_mlp_o1_coverage_guard: float = 0.0,
+        layer_mlp_o1_error_guard: float = 0.0,
+        layer_mlp_o1_queue_capacity: int = 8,
         mtp_draft_state_path: str | Path | None = None,
         draft_window_state_path: str | Path | None = None,
         fast_mlp_root: str | Path | None = None,
@@ -1846,6 +1880,42 @@ class Qwen38CausalChat:
                 "layer_mlp_crystal_max_error_radius must be finite and non-negative"
             )
         layer_mlp_crystal_max_error_radius = float(layer_mlp_crystal_max_error_radius)
+        for value, label in (
+            (layer_mlp_o1_state_path, "layer_mlp_o1_state_path"),
+            (layer_mlp_o1_atlas_path, "layer_mlp_o1_atlas_path"),
+            (layer_mlp_o1_compute_root, "layer_mlp_o1_compute_root"),
+        ):
+            if value is not None and not isinstance(value, (str, Path)):
+                raise TypeError(f"{label} must be a local path or None")
+        layer_mlp_o1_sketch_dim = _positive_int(
+            layer_mlp_o1_sketch_dim,
+            "layer_mlp_o1_sketch_dim",
+        )
+        if layer_mlp_o1_sketch_dim > 256:
+            raise ValueError("layer_mlp_o1_sketch_dim cannot exceed 256")
+        if not _is_sha256(layer_mlp_o1_projection_seed):
+            raise ValueError("layer_mlp_o1_projection_seed must be a SHA-256 digest")
+        layer_mlp_o1_ridge = _positive_number(
+            layer_mlp_o1_ridge,
+            "layer_mlp_o1_ridge",
+        )
+        for value, label in (
+            (layer_mlp_o1_coverage_guard, "layer_mlp_o1_coverage_guard"),
+            (layer_mlp_o1_error_guard, "layer_mlp_o1_error_guard"),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+            ):
+                raise ValueError(f"{label} must be finite and non-negative")
+        layer_mlp_o1_coverage_guard = float(layer_mlp_o1_coverage_guard)
+        layer_mlp_o1_error_guard = float(layer_mlp_o1_error_guard)
+        layer_mlp_o1_queue_capacity = _positive_int(
+            layer_mlp_o1_queue_capacity,
+            "layer_mlp_o1_queue_capacity",
+        )
         if mtp_draft_state_path is not None and not isinstance(
             mtp_draft_state_path, (str, Path)
         ):
@@ -2024,6 +2094,40 @@ class Qwen38CausalChat:
             _require_existing_real_directory(
                 Path(layer_mlp_crystal_compute_root).expanduser().absolute(),
                 "layer_mlp_crystal_compute_root",
+            )
+        if layer_mlp_o1_state_path is not None and q4_root is None:
+            raise ValueError("layer-MLP O1 collection requires Q4 execution")
+        if layer_mlp_o1_state_path is not None and compute_dtype not in {
+            "auto",
+            "bfloat16",
+        }:
+            raise ValueError("layer-MLP O1 collection requires bfloat16 compute_dtype")
+        if layer_mlp_o1_state_path is not None and layer_mlp_o1_atlas_path is None:
+            raise ValueError("layer_mlp_o1_state_path requires layer_mlp_o1_atlas_path")
+        if layer_mlp_o1_state_path is not None and layer_mlp_o1_compute_root is None:
+            raise ValueError(
+                "layer_mlp_o1_state_path requires layer_mlp_o1_compute_root"
+            )
+        if layer_mlp_o1_state_path is None and layer_mlp_o1_atlas_path is not None:
+            raise ValueError("layer_mlp_o1_atlas_path requires layer_mlp_o1_state_path")
+        if layer_mlp_o1_state_path is None and layer_mlp_o1_compute_root is not None:
+            raise ValueError(
+                "layer_mlp_o1_compute_root requires layer_mlp_o1_state_path"
+            )
+        if layer_mlp_o1_atlas_path is not None:
+            _require_existing_real_directory(
+                Path(layer_mlp_o1_atlas_path).expanduser().absolute(),
+                "layer_mlp_o1_atlas_path",
+            )
+        if layer_mlp_o1_compute_root is not None:
+            _require_existing_real_directory(
+                Path(layer_mlp_o1_compute_root).expanduser().absolute(),
+                "layer_mlp_o1_compute_root",
+            )
+        if layer_mlp_o1_state_path is not None:
+            _require_existing_real_directory(
+                Path(layer_mlp_o1_state_path).expanduser().absolute().parent,
+                "layer_mlp_o1_state_path parent",
             )
         if draft_mode not in {"hybrid", "mtp"} and mtp_draft_state_path is not None:
             raise ValueError("mtp_draft_state_path requires MTP or hybrid draft mode")
@@ -2243,6 +2347,27 @@ class Qwen38CausalChat:
             else Path(layer_mlp_crystal_compute_root).expanduser().absolute()
         )
         self._layer_mlp_crystal_max_error_radius = layer_mlp_crystal_max_error_radius
+        self._layer_mlp_o1_state_path = (
+            None
+            if layer_mlp_o1_state_path is None
+            else Path(layer_mlp_o1_state_path).expanduser().absolute()
+        )
+        self._layer_mlp_o1_atlas_path = (
+            None
+            if layer_mlp_o1_atlas_path is None
+            else Path(layer_mlp_o1_atlas_path).expanduser().absolute()
+        )
+        self._layer_mlp_o1_compute_root = (
+            None
+            if layer_mlp_o1_compute_root is None
+            else Path(layer_mlp_o1_compute_root).expanduser().absolute()
+        )
+        self._layer_mlp_o1_sketch_dim = layer_mlp_o1_sketch_dim
+        self._layer_mlp_o1_projection_seed = layer_mlp_o1_projection_seed
+        self._layer_mlp_o1_ridge = layer_mlp_o1_ridge
+        self._layer_mlp_o1_coverage_guard = layer_mlp_o1_coverage_guard
+        self._layer_mlp_o1_error_guard = layer_mlp_o1_error_guard
+        self._layer_mlp_o1_queue_capacity = layer_mlp_o1_queue_capacity
         self._mtp_draft_state_path = (
             None
             if mtp_draft_state_path is None
@@ -2331,6 +2456,9 @@ class Qwen38CausalChat:
         self._layer_mlp_crystal_bank: Layer63MlpResidualCrystalBank | None = None
         self._layer_mlp_crystal_atlas: LiveGraph | None = None
         self._layer_mlp_crystal_compute_graph: ComputeOperatorGraph | None = None
+        self._layer_mlp_o1_worker: Layer63MlpO1AsyncWorker | None = None
+        self._layer_mlp_o1_atlas: LiveGraph | None = None
+        self._layer_mlp_o1_compute_graph: ComputeOperatorGraph | None = None
         self._mlp_page_coordinate_bank: MlpPageCoordinateBank | None = None
         self._conversation_session_id: str | None = None
         self._conversation_prefix_token_ids: tuple[int, ...] = ()
@@ -4502,6 +4630,113 @@ class Qwen38CausalChat:
         self._last_mlp_page_coordinate_evidence = request
         return request
 
+    def _open_layer_mlp_o1_worker(
+        self,
+        runtime: _OwnedRuntime,
+    ) -> tuple[Layer63MlpO1AsyncWorker, LiveGraph, ComputeOperatorGraph]:
+        """Authenticate one passive O1 authority and start its bounded worker."""
+
+        state_path = self._layer_mlp_o1_state_path
+        atlas_path = self._layer_mlp_o1_atlas_path
+        compute_root = self._layer_mlp_o1_compute_root
+        if state_path is None or atlas_path is None or compute_root is None:
+            raise Qwen38ChatError("layer-MLP O1 collection is incompletely configured")
+        model = runtime.model
+        model_pin = getattr(model, "layer_mlp_crystal_model_sha256", None)
+        q4_pin = getattr(model, "layer_mlp_crystal_q4_sha256", None)
+        packed_bytes = getattr(model, "_layer_mlp_crystal_avoided_q4_bytes", None)
+        if not all(callable(value) for value in (model_pin, q4_pin, packed_bytes)):
+            raise Qwen38ChatError("runtime model lacks layer-MLP O1 identity pins")
+        live_model_sha256 = model_pin()
+        live_q4_sha256 = q4_pin()
+        live_packed_bytes = packed_bytes()
+        if not _is_sha256(live_model_sha256) or not _is_sha256(live_q4_sha256):
+            raise Qwen38ChatError("runtime model returned invalid layer-MLP O1 pins")
+        if (
+            isinstance(live_packed_bytes, bool)
+            or not isinstance(live_packed_bytes, int)
+            or live_packed_bytes <= 0
+        ):
+            raise Qwen38ChatError("runtime layer-MLP O1 byte scope is invalid")
+
+        try:
+            existing = Layer63MlpO1Accumulator.load(state_path)
+        except FileNotFoundError:
+            existing = None
+        if existing is None:
+            try:
+                atlas = LiveGraph(atlas_path)
+                sequence, event_sha256 = atlas.store.revision()
+                atlas_revision_sha256 = GraphRevision(
+                    sequence,
+                    event_sha256,
+                ).sha256
+            except Exception as exc:
+                raise Qwen38ChatError(
+                    "layer-MLP O1 Atlas authority is unavailable or unauthenticated"
+                ) from exc
+            try:
+                compute_bank = ComputeCrystalBank(compute_root)
+                compute_graph = ComputeOperatorGraph(compute_bank)
+                graph_revision_sha256 = compute_graph.state().sha256
+            except Exception as exc:
+                raise Qwen38ChatError(
+                    "layer-MLP O1 Compute authority is unavailable or unauthenticated"
+                ) from exc
+            identity = Layer63MlpResidualCrystalIdentity(
+                model_sha256=live_model_sha256,
+                q4_sha256=live_q4_sha256,
+                graph_revision_sha256=graph_revision_sha256,
+                atlas_revision_sha256=atlas_revision_sha256,
+                projection=LayerTransitionProjectionIdentity(
+                    hidden_dim=model.config.dim,
+                    sketch_dim=self._layer_mlp_o1_sketch_dim,
+                    seed_sha256=self._layer_mlp_o1_projection_seed,
+                ),
+            )
+            accumulator = Layer63MlpO1Accumulator(
+                state_path,
+                identity,
+                packed_weight_bytes_avoided=live_packed_bytes,
+                ridge=self._layer_mlp_o1_ridge,
+                coverage_guard=self._layer_mlp_o1_coverage_guard,
+                error_guard=self._layer_mlp_o1_error_guard,
+            )
+        else:
+            identity = existing.identity
+            atlas = _open_layer_mlp_crystal_atlas(
+                atlas_path,
+                atlas_revision_sha256=identity.atlas_revision_sha256,
+            )
+            compute_graph, _compute_state = _open_layer_mlp_crystal_compute_graph(
+                compute_root,
+                graph_revision_sha256=identity.graph_revision_sha256,
+            )
+            expected_projection = LayerTransitionProjectionIdentity(
+                hidden_dim=model.config.dim,
+                sketch_dim=self._layer_mlp_o1_sketch_dim,
+                seed_sha256=self._layer_mlp_o1_projection_seed,
+            )
+            if (
+                identity.model_sha256 != live_model_sha256
+                or identity.q4_sha256 != live_q4_sha256
+                or identity.projection != expected_projection
+                or existing.packed_weight_bytes_avoided != live_packed_bytes
+                or existing.ridge != self._layer_mlp_o1_ridge
+                or existing.coverage_guard != self._layer_mlp_o1_coverage_guard
+                or existing.error_guard != self._layer_mlp_o1_error_guard
+            ):
+                raise Qwen38ChatError(
+                    "layer-MLP O1 state differs from the configured runtime identity"
+                )
+            accumulator = existing
+        worker = Layer63MlpO1AsyncWorker(
+            accumulator,
+            queue_capacity=self._layer_mlp_o1_queue_capacity,
+        )
+        runtime.layer_mlp_o1_worker = worker
+        return worker, atlas, compute_graph
+
     def _base_evidence(self) -> dict[str, Any]:
         evidence: dict[str, Any] = {
             "execution": "local-authenticated-causal-bundle/v1",
@@ -4616,6 +4851,24 @@ class Qwen38CausalChat:
                 ),
                 "q4_sha256": identity.q4_sha256,
                 "schema": LAYER_MLP_CRYSTAL_EVIDENCE_SCHEMA,
+            }
+        if self._layer_mlp_o1_worker is not None:
+            accumulator = self._layer_mlp_o1_worker.accumulator
+            identity = accumulator.identity
+            evidence["layer_mlp_o1_collection"] = {
+                "action_abi": identity.action_abi,
+                "atlas_revision_sha256": identity.atlas_revision_sha256,
+                "coverage_guard": accumulator.coverage_guard,
+                "error_guard": accumulator.error_guard,
+                "graph_revision_sha256": identity.graph_revision_sha256,
+                "identity_sha256": identity.identity_sha256,
+                "metrics": self._layer_mlp_o1_worker.metrics(),
+                "model_sha256": identity.model_sha256,
+                "projection_sha256": identity.projection.projection_sha256,
+                "q4_sha256": identity.q4_sha256,
+                "ridge": accumulator.ridge,
+                "schema": LAYER_MLP_O1_COLLECTION_EVIDENCE_SCHEMA,
+                "sketch_dim": identity.sketch_dim,
             }
         if self._mlp_page_coordinate_bank is not None:
             identity = self._mlp_page_coordinate_bank.identity
@@ -4968,6 +5221,15 @@ class Qwen38CausalChat:
                     graph_revision_sha256=identity.graph_revision_sha256,
                     atlas_revision_sha256=identity.atlas_revision_sha256,
                 )
+            layer_mlp_o1_worker = None
+            layer_mlp_o1_atlas = None
+            layer_mlp_o1_compute_graph = None
+            if self._layer_mlp_o1_state_path is not None:
+                (
+                    layer_mlp_o1_worker,
+                    layer_mlp_o1_atlas,
+                    layer_mlp_o1_compute_graph,
+                ) = self._open_layer_mlp_o1_worker(runtime)
             mlp_page_coordinate_bank = None
             if self._mlp_page_coordinate_state_path is not None:
                 configured_delta_router = getattr(
@@ -5093,6 +5355,9 @@ class Qwen38CausalChat:
         self._layer_mlp_crystal_bank = layer_mlp_crystal_bank
         self._layer_mlp_crystal_atlas = layer_mlp_crystal_atlas
         self._layer_mlp_crystal_compute_graph = layer_mlp_crystal_compute_graph
+        self._layer_mlp_o1_worker = layer_mlp_o1_worker
+        self._layer_mlp_o1_atlas = layer_mlp_o1_atlas
+        self._layer_mlp_o1_compute_graph = layer_mlp_o1_compute_graph
         self._mlp_page_coordinate_bank = mlp_page_coordinate_bank
         return runtime
 
@@ -5629,13 +5894,47 @@ class Qwen38CausalChat:
         )
         layer_mlp_crystal_before = self._layer_mlp_crystal_metrics(runtime)
         mlp_page_coordinate_before = self._mlp_page_coordinate_metrics()
+        layer_mlp_o1_worker = self._layer_mlp_o1_worker
+        layer_mlp_o1_buffer = (
+            None
+            if layer_mlp_o1_worker is None
+            else layer_mlp_o1_worker.request_buffer()
+        )
+        layer_mlp_o1_setter = getattr(
+            runtime.model,
+            "set_layer_mlp_o1_observer",
+            None,
+        )
+        layer_mlp_o1_model_metrics = getattr(
+            runtime.model,
+            "layer_mlp_o1_observer_metrics",
+            None,
+        )
+        previous_layer_mlp_o1_observer = getattr(
+            runtime.model,
+            "layer_mlp_o1_observer",
+            None,
+        )
+        layer_mlp_o1_observer_before = None
+        if layer_mlp_o1_buffer is not None:
+            if not callable(layer_mlp_o1_setter) or not callable(
+                layer_mlp_o1_model_metrics
+            ):
+                raise Qwen38ChatError("runtime model lacks passive layer-MLP O1 hooks")
+            layer_mlp_o1_observer_before = layer_mlp_o1_model_metrics()
+            layer_mlp_o1_setter(layer_mlp_o1_buffer)
         request_started = time.perf_counter()
         try:
-            raw_generated, raw_evidence = self._generate_locked(
-                runtime,
-                prompt_ids,
-                generation_options,
-            )
+            try:
+                raw_generated, raw_evidence = self._generate_locked(
+                    runtime,
+                    prompt_ids,
+                    generation_options,
+                )
+            finally:
+                if layer_mlp_o1_buffer is not None:
+                    assert callable(layer_mlp_o1_setter)
+                    layer_mlp_o1_setter(previous_layer_mlp_o1_observer)
         finally:
             if restore_lm_head_index is not None:
                 restore_lm_head_index(lm_head_index)
@@ -5743,6 +6042,50 @@ class Qwen38CausalChat:
         if not isinstance(decoded, str):
             raise Qwen38ChatError("runtime tokenizer returned a non-text response")
         output = decoded.strip()
+        layer_mlp_o1_request = None
+        if layer_mlp_o1_buffer is not None:
+            assert layer_mlp_o1_worker is not None
+            assert callable(layer_mlp_o1_model_metrics)
+            try:
+                observer_after = layer_mlp_o1_model_metrics()
+                if not isinstance(
+                    layer_mlp_o1_observer_before,
+                    Mapping,
+                ) or not isinstance(observer_after, Mapping):
+                    raise ValueError("observer metrics are not mappings")
+                observer_rows = int(observer_after.get("rows", -1)) - int(
+                    layer_mlp_o1_observer_before.get("rows", -1)
+                )
+                observer_failures = int(observer_after.get("failures", -1)) - int(
+                    layer_mlp_o1_observer_before.get("failures", -1)
+                )
+                if observer_rows < 0 or observer_failures < 0:
+                    raise ValueError("observer counters moved backwards")
+                batch = layer_mlp_o1_buffer.batch()
+                captured_rows = 0 if batch is None else batch.rows
+                accepted = layer_mlp_o1_worker.submit(batch)
+            except Exception as exc:
+                layer_mlp_o1_request = {
+                    "accounting_error": (
+                        f"{type(exc).__module__}.{type(exc).__qualname__}"
+                    ),
+                    "captured_rows": layer_mlp_o1_buffer.rows,
+                    "enqueued": False,
+                    "enqueued_rows": 0,
+                    "schema": "immer.qwen3.8-layer63-mlp-o1-request/v1",
+                    "status": "accounting-error",
+                }
+            else:
+                layer_mlp_o1_request = {
+                    "accounting_error": None,
+                    "captured_rows": captured_rows,
+                    "enqueued": accepted,
+                    "enqueued_rows": captured_rows if accepted else 0,
+                    "observer_failures": observer_failures,
+                    "observer_rows": observer_rows,
+                    "schema": "immer.qwen3.8-layer63-mlp-o1-request/v1",
+                    "status": "enqueued" if accepted else "empty-or-dropped",
+                }
         conversation_evidence = {
             "history_messages": len(history),
             "history_turns": len(history) // 2,
@@ -5773,6 +6116,10 @@ class Qwen38CausalChat:
                 **_process_usage_delta(process_usage_before, process_usage_after),
             },
         }
+        if layer_mlp_o1_request is not None:
+            collection = dict(evidence["layer_mlp_o1_collection"])
+            collection["request"] = layer_mlp_o1_request
+            evidence["layer_mlp_o1_collection"] = collection
         q4_request: dict[str, int] = {}
         if q4_after:
             fields = (
@@ -6655,6 +7002,9 @@ class Qwen38CausalChat:
             self._layer_mlp_crystal_bank = None
             self._layer_mlp_crystal_atlas = None
             self._layer_mlp_crystal_compute_graph = None
+            self._layer_mlp_o1_worker = None
+            self._layer_mlp_o1_atlas = None
+            self._layer_mlp_o1_compute_graph = None
             self._mlp_page_coordinate_bank = None
             self._clear_conversation_binding()
             self._closed = True

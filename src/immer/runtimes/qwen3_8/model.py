@@ -91,6 +91,10 @@ LAYER_BOUNDARY_STAGES = (
     "layer.output",
 )
 LayerBoundaryObserver = Callable[[int, str, torch.Tensor], None]
+LayerMlpO1Observer = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor],
+    None,
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +325,7 @@ class StreamedQwen38:
         layer_boundary_observer: LayerBoundaryObserver | None = None,
         layer_boundary_stages: Sequence[str] | None = None,
         layer_boundary_layers: Sequence[int] | None = None,
+        layer_mlp_o1_observer: LayerMlpO1Observer | None = None,
         mlp_sparse_executor: Any | None = None,
         mlp_page_router: Any | None = None,
         delta_head_router: Any | None = None,
@@ -386,6 +391,8 @@ class StreamedQwen38:
             raise ValueError("layer_boundary_stages require a layer_boundary_observer")
         if layer_boundary_observer is None and layer_boundary_layers is not None:
             raise ValueError("layer_boundary_layers require a layer_boundary_observer")
+        if layer_mlp_o1_observer is not None and not callable(layer_mlp_o1_observer):
+            raise TypeError("layer_mlp_o1_observer must be callable or None")
         if mlp_sparse_executor is not None:
             required = (
                 "execute",
@@ -561,6 +568,9 @@ class StreamedQwen38:
         self.layer_boundary_observer = layer_boundary_observer
         self.layer_boundary_stages = tuple(selected_boundary_stages)
         self.layer_boundary_layers = selected_boundary_layers
+        self.layer_mlp_o1_observer = layer_mlp_o1_observer
+        self._layer_mlp_o1_observer_rows = 0
+        self._layer_mlp_o1_observer_failures = 0
         self.mlp_sparse_executor = mlp_sparse_executor
         self.mlp_page_router = mlp_page_router
         self.delta_head_router = delta_head_router
@@ -2521,6 +2531,70 @@ class StreamedQwen38:
             raise Qwen38RuntimeError("layer boundary stage is not registered")
         observer(layer, stage, value.detach().clone())
 
+    def set_layer_mlp_o1_observer(
+        self,
+        observer: LayerMlpO1Observer | None,
+    ) -> None:
+        """Select one passive exact K1 MLP sink without changing runtime math."""
+
+        if observer is not None and not callable(observer):
+            raise TypeError("layer_mlp_o1_observer must be callable or None")
+        self.layer_mlp_o1_observer = observer
+
+    def layer_mlp_o1_observer_metrics(self) -> dict[str, object]:
+        return {
+            "failures": self._layer_mlp_o1_observer_failures,
+            "rows": self._layer_mlp_o1_observer_rows,
+            "schema": "immer.qwen3.8-layer63-mlp-o1-observer/v1",
+        }
+
+    def _observe_layer_mlp_o1(
+        self,
+        attention_residual: torch.Tensor,
+        mlp_input: torch.Tensor,
+        layer_output: torch.Tensor,
+        *,
+        layer: int,
+        start_pos: int,
+    ) -> None:
+        """Copy one completed decode row into a passive sink after exact math."""
+
+        observer = self.layer_mlp_o1_observer
+        if (
+            observer is None
+            or start_pos <= 0
+            or layer != LAYER_MLP_TARGET_LAYER_INDEX
+            or layer != self.config.n_layers - 1
+            or any(
+                tuple(value.shape) != (1, 1, self.config.dim)
+                or value.dtype != torch.bfloat16
+                for value in (attention_residual, mlp_input, layer_output)
+            )
+        ):
+            return
+        try:
+            rows = tuple(
+                value.detach()
+                .to(device="cpu", dtype=torch.bfloat16)
+                .contiguous()
+                .clone()
+                for value in (attention_residual, mlp_input, layer_output)
+            )
+            observer(*rows)
+        except Exception as exc:
+            self._layer_mlp_o1_observer_failures += 1
+            try:
+                warnings.warn(
+                    "layer-63 MLP O1 observer failed after exact target math: "
+                    f"{type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            except Exception:
+                pass
+        else:
+            self._layer_mlp_o1_observer_rows += 1
+
     def _requires_unfused_mlp_boundaries(self, layer: int) -> bool:
         """Return whether this observer needs Gate/Up/activation/output tensors."""
 
@@ -4001,8 +4075,19 @@ class StreamedQwen38:
             layer=layer,
             start_pos=start_pos,
         )
+        output = tuple(
+            after_attention[index] + mlp[index] for index in range(len(hidden))
+        )
+        if len(output) == 1:
+            self._observe_layer_mlp_o1(
+                after_attention[0],
+                mlp_input[0],
+                output[0],
+                layer=layer,
+                start_pos=start_pos,
+            )
         return (
-            tuple(after_attention[index] + mlp[index] for index in range(len(hidden))),
+            output,
             next_state,
             prefix_trace,
         )
@@ -4329,6 +4414,14 @@ class StreamedQwen38:
                     absolute_position=start_pos,
                 )
             hidden = residual + mlp_output
+            if stateful:
+                self._observe_layer_mlp_o1(
+                    residual,
+                    mlp_input,
+                    hidden,
+                    layer=layer,
+                    start_pos=start_pos,
+                )
         self._observe_layer_boundary(layer, "layer.output", hidden)
         return hidden, retained_state
 
