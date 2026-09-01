@@ -21,6 +21,15 @@ def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _canonical(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
 def _raw_result(output: str = "answer") -> Result:
     return Result(
         ExecutionStatus.OK,
@@ -31,6 +40,7 @@ def _raw_result(output: str = "answer") -> Result:
                 "forward_passes": 3,
                 "generated_tokens": 4,
                 "linear_calls": 90,
+                "output_tokens_per_second": 1.6,
                 "seconds": 2.5,
                 "source_body_bytes": 300,
                 "time_to_first_token_seconds": 1.25,
@@ -61,6 +71,28 @@ def _raw_result(output: str = "answer") -> Result:
                 },
             },
             "runtime_metrics": {
+                "component_timings": {
+                    "accounting_error": None,
+                    "accounting_failures": 0,
+                    "clock": "time.perf_counter_ns",
+                    "components": {
+                        "deltanet_core": {
+                            "boundary": "StreamedQwen38._linear_attention",
+                            "calls": 12,
+                            "nanoseconds": 1_200,
+                        },
+                        "mlp_core": {
+                            "boundary": "StreamedQwen38._mlp",
+                            "calls": 16,
+                            "nanoseconds": 3_200,
+                        },
+                    },
+                    "measured_nanoseconds": 4_400,
+                    "schema": "immer.qwen3.8-component-timing-request/v1",
+                    "source_schema": ("immer.qwen3.8-component-timing-counters/v1"),
+                    "status": "ok",
+                    "unit": "nanoseconds",
+                },
                 "generation_wall_seconds": 2.75,
                 "physical_read_bytes": 123,
                 "process_peak_rss_bytes": 1024,
@@ -132,6 +164,19 @@ class InferenceEconomicsReceiptTests(unittest.TestCase):
         self.assertEqual(receipt.selected_pages, 384)
         self.assertEqual(receipt.saved_pages, 160)
         self.assertEqual(receipt.o1_priority, 4.5)
+        self.assertEqual(receipt.output_tokens_per_second, 1.6)
+        self.assertEqual(
+            receipt.component_timings["measured_nanoseconds"],
+            4_400,
+        )
+        self.assertEqual(
+            receipt.component_timings["components"]["mlp_core"],
+            {
+                "boundary": "StreamedQwen38._mlp",
+                "calls": 16,
+                "nanoseconds": 3_200,
+            },
+        )
         document = receipt.to_document()
         self.assertEqual(InferenceEconomicsReceipt.from_document(document), receipt)
         self.assertNotIn(
@@ -196,6 +241,33 @@ class InferenceEconomicsLedgerTests(unittest.TestCase):
             self.assertEqual(snapshot["requests"], 2)
             self.assertEqual(snapshot["target_forwards"], 3)
             self.assertEqual(snapshot["saved_qwen_forwards"], 5)
+            self.assertEqual(snapshot["output_tokens_per_second"], 1.6)
+            self.assertEqual(
+                snapshot["output_tokens_per_second_observations"],
+                1,
+            )
+            self.assertEqual(snapshot["peak_output_tokens_per_second"], 1.6)
+            self.assertEqual(
+                snapshot["component_timings"],
+                {
+                    "accounting_failures": 0,
+                    "components": {
+                        "deltanet_core": {
+                            "boundary": ("StreamedQwen38._linear_attention"),
+                            "calls": 12,
+                            "nanoseconds": 1_200,
+                        },
+                        "mlp_core": {
+                            "boundary": "StreamedQwen38._mlp",
+                            "calls": 16,
+                            "nanoseconds": 3_200,
+                        },
+                    },
+                    "measured_nanoseconds": 4_400,
+                    "requests": 1,
+                    "statuses": {"ok": 1},
+                },
+            )
             self.assertEqual(
                 snapshot["largest_avoidable_cost_class"],
                 "target_fallback",
@@ -207,10 +279,102 @@ class InferenceEconomicsLedgerTests(unittest.TestCase):
                 [first.receipt.request_sha256, second.receipt.request_sha256],
             )
             state_bytes = b"".join(
-                path.read_bytes()
-                for path in sorted((root / "events").iterdir())
+                path.read_bytes() for path in sorted((root / "events").iterdir())
             )
             self.assertNotIn(b"first private prompt", state_bytes)
+
+    def test_restart_reads_v1_event_without_rewriting_legacy_body(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "economics"
+            InferenceEconomicsLedger(root)
+            receipt = receipt_from_result(
+                _raw_result("legacy"),
+                question_sha256=_sha("legacy question"),
+                runtime_profile_sha256=_sha("profile"),
+            )
+            legacy_body = receipt.body()
+            legacy_body.pop("output_tokens_per_second")
+            legacy_body.pop("component_timings")
+            legacy_receipt = {
+                "body": legacy_body,
+                "schema": "immer.qwen3.8-inference-economics-receipt/v1",
+                "sha256": hashlib.sha256(_canonical(legacy_body)).hexdigest(),
+            }
+            event_body = {
+                "previous_event_sha256": "0" * 64,
+                "receipt": legacy_receipt,
+                "sequence": 0,
+            }
+            event_sha256 = hashlib.sha256(_canonical(event_body)).hexdigest()
+            event = {
+                "body": event_body,
+                "schema": "immer.qwen3.8-inference-economics-event/v1",
+                "sha256": event_sha256,
+            }
+            event_path = root / "events" / f"{0:020d}-{event_sha256}.json"
+            legacy_event_bytes = _canonical(event)
+            event_path.write_bytes(legacy_event_bytes)
+
+            restored = InferenceEconomicsLedger(root)
+            restored_receipt = restored.receipts()[0]
+            self.assertEqual(restored_receipt.to_document(), legacy_receipt)
+            self.assertEqual(event_path.read_bytes(), legacy_event_bytes)
+            self.assertEqual(
+                restored.snapshot()["output_tokens_per_second_observations"],
+                0,
+            )
+            self.assertEqual(restored.snapshot()["component_timings"]["requests"], 0)
+            duplicate = restored.observe(
+                _raw_result("legacy"),
+                question_sha256=_sha("legacy question"),
+                runtime_profile_sha256=_sha("profile"),
+            )
+            self.assertTrue(duplicate.duplicate)
+            self.assertEqual(len(tuple((root / "events").iterdir())), 1)
+            self.assertEqual(event_path.read_bytes(), legacy_event_bytes)
+
+            restored.observe(
+                _raw_result("current"),
+                question_sha256=_sha("current question"),
+                runtime_profile_sha256=_sha("profile"),
+            )
+            mixed_snapshot = restored.snapshot()
+            self.assertEqual(mixed_snapshot["requests"], 2)
+            self.assertEqual(mixed_snapshot["output_tokens_per_second"], 1.6)
+            self.assertEqual(mixed_snapshot["component_timings"]["requests"], 1)
+            self.assertEqual(event_path.read_bytes(), legacy_event_bytes)
+            self.assertEqual(
+                InferenceEconomicsLedger(root).snapshot(),
+                mixed_snapshot,
+            )
+
+    def test_rollup_accumulates_component_costs_across_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "economics"
+            ledger = InferenceEconomicsLedger(root)
+            for index in range(2):
+                ledger.observe(
+                    _raw_result(f"answer-{index}"),
+                    question_sha256=_sha(f"question-{index}"),
+                    runtime_profile_sha256=_sha("profile"),
+                    request_sha256=_sha(f"request-{index}"),
+                )
+
+            snapshot = InferenceEconomicsLedger(root).snapshot()
+            self.assertEqual(snapshot["output_tokens_per_second"], 1.6)
+            self.assertEqual(snapshot["component_timings"]["requests"], 2)
+            self.assertEqual(
+                snapshot["component_timings"]["measured_nanoseconds"],
+                8_800,
+            )
+            self.assertEqual(
+                snapshot["component_timings"]["components"]["mlp_core"],
+                {
+                    "boundary": "StreamedQwen38._mlp",
+                    "calls": 32,
+                    "nanoseconds": 6_400,
+                },
+            )
 
     def test_event_tamper_is_hard_and_rollup_is_recoverable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

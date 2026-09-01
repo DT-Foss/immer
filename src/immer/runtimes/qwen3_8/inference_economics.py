@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -25,20 +25,58 @@ from ...contracts import Result
 from ..ooe.identity import canonical_json_bytes, require_sha256
 
 
-INFERENCE_ECONOMICS_RECEIPT_SCHEMA = (
-    "immer.qwen3.8-inference-economics-receipt/v1"
-)
-INFERENCE_ECONOMICS_EVENT_SCHEMA = (
-    "immer.qwen3.8-inference-economics-event/v1"
-)
-INFERENCE_ECONOMICS_ROLLUP_SCHEMA = (
-    "immer.qwen3.8-inference-economics-rollup/v1"
-)
+INFERENCE_ECONOMICS_RECEIPT_SCHEMA = "immer.qwen3.8-inference-economics-receipt/v2"
+INFERENCE_ECONOMICS_EVENT_SCHEMA = "immer.qwen3.8-inference-economics-event/v2"
+INFERENCE_ECONOMICS_ROLLUP_SCHEMA = "immer.qwen3.8-inference-economics-rollup/v2"
+_LEGACY_RECEIPT_SCHEMA = "immer.qwen3.8-inference-economics-receipt/v1"
+_LEGACY_EVENT_SCHEMA = "immer.qwen3.8-inference-economics-event/v1"
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_EVENT_BYTES = 80 * 1024
 MAX_ROLLUP_BYTES = 64 * 1024
 _EVENT = re.compile(r"([0-9]{20})-([0-9a-f]{64})\.json")
 _ZERO_SHA256 = "0" * 64
+
+_RECEIPT_V1_FIELDS = (
+    "request_sha256",
+    "question_sha256",
+    "runtime_profile_sha256",
+    "result_sha256",
+    "output_sha256",
+    "status",
+    "component",
+    "route",
+    "target_forwards",
+    "saved_qwen_forwards",
+    "generated_tokens",
+    "accepted_draft_tokens",
+    "proposed_draft_tokens",
+    "source_body_bytes",
+    "target_source_body_bytes",
+    "draft_source_body_bytes",
+    "logical_weight_bytes",
+    "page_mlp_weight_bytes",
+    "prefetch_bytes",
+    "physical_read_bytes",
+    "linear_calls",
+    "process_peak_rss_bytes",
+    "generation_seconds",
+    "request_wall_seconds",
+    "time_to_first_token_seconds",
+    "selected_pages",
+    "saved_pages",
+    "o1_priority",
+    "runtime_reward",
+    "warm_hit",
+    "fertig_exact",
+    "draft_active",
+    "page_active",
+    "avoidable_work_bytes",
+)
+_RECEIPT_V2_FIELDS = (
+    *_RECEIPT_V1_FIELDS,
+    "output_tokens_per_second",
+    "component_timings",
+)
 
 
 class InferenceEconomicsError(RuntimeError):
@@ -82,6 +120,61 @@ def _json_safe(value: object) -> object:
     if isinstance(value, float) and math.isfinite(value):
         return value
     raise TypeError("inference evidence contains a non-canonical value")
+
+
+def _component_timings(value: object) -> dict[str, object]:
+    """Copy one request timing receipt without weakening its integer costs."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("component_timings must be a mapping")
+    if not value:
+        return {}
+    safe = _json_safe(value)
+    assert isinstance(safe, dict)
+    components = safe.get("components")
+    if not isinstance(components, dict):
+        raise ValueError("component_timings components must be a mapping")
+    normalized_components: dict[str, dict[str, object]] = {}
+    for name, row in components.items():
+        if not isinstance(name, str) or not name or not isinstance(row, dict):
+            raise ValueError("component_timings contains an invalid component")
+        calls = row.get("calls")
+        nanoseconds = row.get("nanoseconds")
+        if (
+            isinstance(calls, bool)
+            or not isinstance(calls, int)
+            or calls < 0
+            or isinstance(nanoseconds, bool)
+            or not isinstance(nanoseconds, int)
+            or nanoseconds < 0
+        ):
+            raise ValueError("component timing costs must be non-negative integers")
+        boundary = row.get("boundary")
+        if boundary is not None and (not isinstance(boundary, str) or not boundary):
+            raise ValueError("component timing boundary must be non-empty text")
+        normalized_components[name] = dict(sorted(row.items()))
+    for key in ("schema", "source_schema", "clock", "unit", "status"):
+        item = safe.get(key)
+        if item is not None and (not isinstance(item, str) or not item):
+            raise ValueError(f"component_timings {key} must be non-empty text")
+    accounting_error = safe.get("accounting_error")
+    if accounting_error is not None and (
+        not isinstance(accounting_error, str) or not accounting_error
+    ):
+        raise ValueError("component_timings accounting_error is invalid")
+    if "accounting_failures" in safe:
+        failures = safe["accounting_failures"]
+        if isinstance(failures, bool) or not isinstance(failures, int) or failures < 0:
+            raise ValueError("component_timings accounting_failures is invalid")
+    measured = safe.get("measured_nanoseconds")
+    if measured is not None and (
+        isinstance(measured, bool) or not isinstance(measured, int) or measured < 0
+    ):
+        raise ValueError("component_timings measured_nanoseconds is invalid")
+    safe["components"] = dict(sorted(normalized_components.items()))
+    return dict(sorted(safe.items()))
 
 
 def _generation_and_context(
@@ -135,8 +228,7 @@ def _authenticated_warm_execution(result: Result, route: str) -> bool:
     receipt = _mapping(_mapping(result.evidence).get("receipt"))
     accounting = _mapping(_mapping(receipt.get("ooe")).get("accounting"))
     return "saved_qwen_forwards" in accounting or (
-        route.startswith("ooe_")
-        and route not in {"ooe_failure", "ooe_integrity_error"}
+        route.startswith("ooe_") and route not in {"ooe_failure", "ooe_integrity_error"}
     )
 
 
@@ -194,9 +286,15 @@ class InferenceEconomicsReceipt:
     draft_active: bool
     page_active: bool
     avoidable_work_bytes: Mapping[str, int]
+    output_tokens_per_second: float = 0.0
+    component_timings: Mapping[str, object] = field(default_factory=dict)
+    _document_schema: str = field(
+        default=INFERENCE_ECONOMICS_RECEIPT_SCHEMA,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
-        for field in (
+        for field_name in (
             "request_sha256",
             "question_sha256",
             "runtime_profile_sha256",
@@ -205,18 +303,18 @@ class InferenceEconomicsReceipt:
         ):
             object.__setattr__(
                 self,
-                field,
-                require_sha256(getattr(self, field), field=field),
+                field_name,
+                require_sha256(getattr(self, field_name), field=field_name),
             )
-        for field in (
+        for field_name in (
             "status",
             "component",
             "route",
         ):
-            value = getattr(self, field)
+            value = getattr(self, field_name)
             if not isinstance(value, str) or not value:
-                raise ValueError(f"{field} must be non-empty text")
-        for field in (
+                raise ValueError(f"{field_name} must be non-empty text")
+        for field_name in (
             "target_forwards",
             "saved_qwen_forwards",
             "generated_tokens",
@@ -234,28 +332,34 @@ class InferenceEconomicsReceipt:
             "selected_pages",
             "saved_pages",
         ):
-            value = getattr(self, field)
+            value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError(f"{field} must be a non-negative integer")
-        for field in (
+                raise ValueError(f"{field_name} must be a non-negative integer")
+        for field_name in (
             "generation_seconds",
             "request_wall_seconds",
             "time_to_first_token_seconds",
             "o1_priority",
             "runtime_reward",
+            "output_tokens_per_second",
         ):
-            value = getattr(self, field)
+            value = getattr(self, field_name)
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
                 or not math.isfinite(float(value))
             ):
-                raise ValueError(f"{field} must be finite")
-            if field != "runtime_reward" and float(value) < 0.0:
-                raise ValueError(f"{field} must be non-negative")
-        for field in ("warm_hit", "fertig_exact", "draft_active", "page_active"):
-            if not isinstance(getattr(self, field), bool):
-                raise ValueError(f"{field} must be boolean")
+                raise ValueError(f"{field_name} must be finite")
+            if field_name != "runtime_reward" and float(value) < 0.0:
+                raise ValueError(f"{field_name} must be non-negative")
+        for field_name in (
+            "warm_hit",
+            "fertig_exact",
+            "draft_active",
+            "page_active",
+        ):
+            if not isinstance(getattr(self, field_name), bool):
+                raise ValueError(f"{field_name} must be boolean")
         work = dict(self.avoidable_work_bytes)
         if any(
             not isinstance(key, str)
@@ -267,26 +371,47 @@ class InferenceEconomicsReceipt:
         ):
             raise ValueError("avoidable_work_bytes is invalid")
         object.__setattr__(self, "avoidable_work_bytes", dict(sorted(work.items())))
+        try:
+            timings = _component_timings(self.component_timings)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("component_timings is invalid") from exc
+        object.__setattr__(self, "component_timings", timings)
+        if self._document_schema not in {
+            _LEGACY_RECEIPT_SCHEMA,
+            INFERENCE_ECONOMICS_RECEIPT_SCHEMA,
+        }:
+            raise ValueError("economics receipt schema is unsupported")
+        if self._document_schema == _LEGACY_RECEIPT_SCHEMA and (
+            self.output_tokens_per_second != 0.0 or timings
+        ):
+            raise ValueError("legacy economics receipts cannot contain v2 costs")
 
     @property
     def sha256(self) -> str:
         return _digest(self.body())
 
     def body(self) -> dict[str, object]:
+        fields = (
+            _RECEIPT_V1_FIELDS
+            if self._document_schema == _LEGACY_RECEIPT_SCHEMA
+            else _RECEIPT_V2_FIELDS
+        )
         return {
-            field: (
+            name: (
                 dict(self.avoidable_work_bytes)
-                if field == "avoidable_work_bytes"
-                else getattr(self, field)
+                if name == "avoidable_work_bytes"
+                else dict(self.component_timings)
+                if name == "component_timings"
+                else getattr(self, name)
             )
-            for field in self.__dataclass_fields__
+            for name in fields
         }
 
     def to_document(self) -> dict[str, object]:
         body = self.body()
         document = {
             "body": body,
-            "schema": INFERENCE_ECONOMICS_RECEIPT_SCHEMA,
+            "schema": self._document_schema,
             "sha256": _digest(body),
         }
         if len(canonical_json_bytes(document)) > MAX_RECEIPT_BYTES:
@@ -295,16 +420,29 @@ class InferenceEconomicsReceipt:
 
     @classmethod
     def from_document(cls, value: object) -> "InferenceEconomicsReceipt":
+        if not isinstance(value, Mapping):
+            raise InferenceEconomicsError("economics receipt envelope is invalid")
+        schema = value.get("schema")
+        body = value.get("body")
         if (
-            not isinstance(value, Mapping)
-            or set(value) != {"body", "schema", "sha256"}
-            or value.get("schema") != INFERENCE_ECONOMICS_RECEIPT_SCHEMA
-            or not isinstance(value.get("body"), Mapping)
-            or value.get("sha256") != _digest(value["body"])
+            set(value) != {"body", "schema", "sha256"}
+            or schema
+            not in {_LEGACY_RECEIPT_SCHEMA, INFERENCE_ECONOMICS_RECEIPT_SCHEMA}
+            or not isinstance(body, Mapping)
+            or value.get("sha256") != _digest(body)
         ):
             raise InferenceEconomicsError("economics receipt envelope is invalid")
+        expected_fields = (
+            _RECEIPT_V1_FIELDS
+            if schema == _LEGACY_RECEIPT_SCHEMA
+            else _RECEIPT_V2_FIELDS
+        )
+        if set(body) != set(expected_fields):
+            raise InferenceEconomicsError("economics receipt fields are invalid")
+        arguments = dict(body)
+        arguments["_document_schema"] = schema
         try:
-            receipt = cls(**dict(value["body"]))
+            receipt = cls(**arguments)
         except (TypeError, ValueError) as exc:
             raise InferenceEconomicsError("economics receipt is invalid") from exc
         if receipt.to_document() != dict(value):
@@ -345,11 +483,7 @@ def receipt_from_result(
     page_bytes = _uint(q4_request.get("page_mlp_weight_bytes"))
     target_work = max(target_bytes, source_bytes, logical_bytes)
     rejected = max(0, proposed - accepted)
-    draft_waste = (
-        0
-        if proposed <= 0
-        else int(draft_bytes * rejected / proposed)
-    )
+    draft_waste = 0 if proposed <= 0 else int(draft_bytes * rejected / proposed)
     work = {
         "draft_miss": draft_waste,
         "mlp_target": page_bytes,
@@ -448,6 +582,10 @@ def receipt_from_result(
         draft_active=bool(draft),
         page_active=bool(page),
         avoidable_work_bytes=work,
+        output_tokens_per_second=_nonnegative_float(
+            generation.get("output_tokens_per_second")
+        ),
+        component_timings=_component_timings(runtime_metrics.get("component_timings")),
     )
     receipt.to_document()
     return receipt
@@ -460,6 +598,21 @@ class InferenceEconomicsObservation:
     duplicate: bool
 
 
+def _same_receipt_result(
+    existing: InferenceEconomicsReceipt,
+    observed: InferenceEconomicsReceipt,
+) -> bool:
+    if existing.sha256 == observed.sha256:
+        return True
+    if (
+        existing._document_schema != _LEGACY_RECEIPT_SCHEMA
+        or observed._document_schema != INFERENCE_ECONOMICS_RECEIPT_SCHEMA
+    ):
+        return False
+    observed_body = observed.body()
+    return existing.body() == {name: observed_body[name] for name in _RECEIPT_V1_FIELDS}
+
+
 def _empty_rollup() -> dict[str, Any]:
     return {
         "accepted_draft_tokens": 0,
@@ -468,11 +621,22 @@ def _empty_rollup() -> dict[str, Any]:
             "mlp_target": 0,
             "target_fallback": 0,
         },
+        "component_timings": {
+            "accounting_failures": 0,
+            "components": {},
+            "measured_nanoseconds": 0,
+            "requests": 0,
+            "statuses": {},
+        },
         "draft_requests": 0,
         "generated_tokens": 0,
         "head_event_sha256": _ZERO_SHA256,
         "largest_avoidable_cost_class": None,
+        "output_tokens_per_second": 0.0,
+        "output_tokens_per_second_observations": 0,
+        "output_tokens_per_second_sum": 0.0,
         "page_requests": 0,
+        "peak_output_tokens_per_second": 0.0,
         "requests": 0,
         "saved_pages": 0,
         "saved_qwen_forwards": 0,
@@ -504,13 +668,69 @@ def _accumulate(
     result["saved_pages"] += receipt.saved_pages
     result["total_generation_seconds"] += receipt.generation_seconds
     result["total_request_wall_seconds"] += receipt.request_wall_seconds
+    if (
+        receipt._document_schema == INFERENCE_ECONOMICS_RECEIPT_SCHEMA
+        and receipt.output_tokens_per_second > 0.0
+    ):
+        result["output_tokens_per_second_observations"] += 1
+        result["output_tokens_per_second_sum"] += receipt.output_tokens_per_second
+        result["output_tokens_per_second"] = (
+            result["output_tokens_per_second_sum"]
+            / result["output_tokens_per_second_observations"]
+        )
+        result["peak_output_tokens_per_second"] = max(
+            result["peak_output_tokens_per_second"],
+            receipt.output_tokens_per_second,
+        )
     result["warm_hits"] += int(
-        receipt.warm_hit
-        and receipt.target_forwards == 0
-        and receipt.status == "ok"
+        receipt.warm_hit and receipt.target_forwards == 0 and receipt.status == "ok"
     )
     result["draft_requests"] += int(receipt.draft_active)
     result["page_requests"] += int(receipt.page_active)
+    if receipt.component_timings:
+        timing = receipt.component_timings
+        timing_rollup = dict(result["component_timings"])
+        timing_rollup["requests"] += 1
+        timing_rollup["accounting_failures"] += _uint(timing.get("accounting_failures"))
+        measured_nanoseconds = timing.get("measured_nanoseconds")
+        if isinstance(measured_nanoseconds, int) and not isinstance(
+            measured_nanoseconds, bool
+        ):
+            timing_rollup["measured_nanoseconds"] += measured_nanoseconds
+        status = timing.get("status")
+        status_name = status if isinstance(status, str) and status else "unknown"
+        statuses = dict(timing_rollup["statuses"])
+        statuses[status_name] = statuses.get(status_name, 0) + 1
+        timing_rollup["statuses"] = dict(sorted(statuses.items()))
+        components = {
+            name: dict(row) for name, row in dict(timing_rollup["components"]).items()
+        }
+        for name, raw_row in _mapping(timing.get("components")).items():
+            row = _mapping(raw_row)
+            aggregate = components.setdefault(
+                name,
+                {
+                    "boundary": row.get("boundary"),
+                    "calls": 0,
+                    "nanoseconds": 0,
+                },
+            )
+            boundary = row.get("boundary")
+            known_boundary = aggregate.get("boundary")
+            if known_boundary is None and boundary is not None:
+                aggregate["boundary"] = boundary
+            elif (
+                boundary is not None
+                and known_boundary is not None
+                and boundary != known_boundary
+            ):
+                raise InferenceEconomicsError(
+                    f"component timing boundary changed for {name!r}"
+                )
+            aggregate["calls"] += _uint(row.get("calls"))
+            aggregate["nanoseconds"] += _uint(row.get("nanoseconds"))
+        timing_rollup["components"] = dict(sorted(components.items()))
+        result["component_timings"] = timing_rollup
     work = dict(result["avoidable_work_bytes"])
     for key, value in receipt.avoidable_work_bytes.items():
         work[key] = work.get(key, 0) + value
@@ -518,9 +738,7 @@ def _accumulate(
     result["largest_avoidable_cost_class"] = (
         None
         if not work or max(work.values()) <= 0
-        else min(
-            key for key, value in work.items() if value == max(work.values())
-        )
+        else min(key for key, value in work.items() if value == max(work.values()))
     )
     result["head_event_sha256"] = require_sha256(
         head_event_sha256,
@@ -538,6 +756,73 @@ def _rollup_document(body: Mapping[str, Any]) -> dict[str, object]:
     if len(canonical_json_bytes(document)) > MAX_ROLLUP_BYTES:
         raise InferenceEconomicsError("economics rollup exceeds its byte limit")
     return document
+
+
+def _parse_event_envelope(
+    document: Mapping[str, object],
+    *,
+    sequence: int,
+    previous_event_sha256: str,
+    filename_sha256: str,
+    event_schema: str,
+    receipt_schema: str,
+) -> tuple[str, InferenceEconomicsReceipt]:
+    body = document.get("body")
+    if (
+        set(document) != {"body", "schema", "sha256"}
+        or document.get("schema") != event_schema
+        or not isinstance(body, Mapping)
+        or set(body) != {"previous_event_sha256", "receipt", "sequence"}
+        or body.get("sequence") != sequence
+        or body.get("previous_event_sha256") != previous_event_sha256
+        or document.get("sha256") != _digest(body)
+        or document.get("sha256") != filename_sha256
+    ):
+        raise InferenceEconomicsError("economics event envelope is invalid")
+    receipt_document = body.get("receipt")
+    if (
+        not isinstance(receipt_document, Mapping)
+        or receipt_document.get("schema") != receipt_schema
+    ):
+        raise InferenceEconomicsError("economics event receipt schema is invalid")
+    receipt = InferenceEconomicsReceipt.from_document(receipt_document)
+    return filename_sha256, receipt
+
+
+def _parse_legacy_event_document(
+    document: Mapping[str, object],
+    *,
+    sequence: int,
+    previous_event_sha256: str,
+    filename_sha256: str,
+) -> tuple[str, InferenceEconomicsReceipt]:
+    """Read an immutable v1 event without upgrading or rewriting its body."""
+
+    return _parse_event_envelope(
+        document,
+        sequence=sequence,
+        previous_event_sha256=previous_event_sha256,
+        filename_sha256=filename_sha256,
+        event_schema=_LEGACY_EVENT_SCHEMA,
+        receipt_schema=_LEGACY_RECEIPT_SCHEMA,
+    )
+
+
+def _parse_current_event_document(
+    document: Mapping[str, object],
+    *,
+    sequence: int,
+    previous_event_sha256: str,
+    filename_sha256: str,
+) -> tuple[str, InferenceEconomicsReceipt]:
+    return _parse_event_envelope(
+        document,
+        sequence=sequence,
+        previous_event_sha256=previous_event_sha256,
+        filename_sha256=filename_sha256,
+        event_schema=INFERENCE_ECONOMICS_EVENT_SCHEMA,
+        receipt_schema=INFERENCE_ECONOMICS_RECEIPT_SCHEMA,
+    )
 
 
 class InferenceEconomicsLedger:
@@ -632,7 +917,10 @@ class InferenceEconomicsLedger:
         rows = []
         for path in self.events.iterdir():
             metadata = path.lstat()
-            if not stat.S_ISREG(metadata.st_mode) or _EVENT.fullmatch(path.name) is None:
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or _EVENT.fullmatch(path.name) is None
+            ):
                 raise InferenceEconomicsError("economics event inventory is invalid")
             rows.append(path)
         return tuple(sorted(rows, key=lambda path: path.name))
@@ -656,24 +944,30 @@ class InferenceEconomicsLedger:
             try:
                 document = json.loads(raw)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise InferenceEconomicsError("economics event is invalid JSON") from exc
+                raise InferenceEconomicsError(
+                    "economics event is invalid JSON"
+                ) from exc
             if canonical_json_bytes(document) != raw:
                 raise InferenceEconomicsError("economics event is not canonical")
-            body = document.get("body") if isinstance(document, Mapping) else None
-            if (
-                not isinstance(document, Mapping)
-                or set(document) != {"body", "schema", "sha256"}
-                or document.get("schema") != INFERENCE_ECONOMICS_EVENT_SCHEMA
-                or not isinstance(body, Mapping)
-                or set(body)
-                != {"previous_event_sha256", "receipt", "sequence"}
-                or body.get("sequence") != sequence
-                or body.get("previous_event_sha256") != previous
-                or document.get("sha256") != _digest(body)
-                or document.get("sha256") != match.group(2)
-            ):
+            if not isinstance(document, Mapping):
                 raise InferenceEconomicsError("economics event envelope is invalid")
-            receipt = InferenceEconomicsReceipt.from_document(body["receipt"])
+            schema = document.get("schema")
+            if schema == _LEGACY_EVENT_SCHEMA:
+                event_sha256, receipt = _parse_legacy_event_document(
+                    document,
+                    sequence=sequence,
+                    previous_event_sha256=previous,
+                    filename_sha256=match.group(2),
+                )
+            elif schema == INFERENCE_ECONOMICS_EVENT_SCHEMA:
+                event_sha256, receipt = _parse_current_event_document(
+                    document,
+                    sequence=sequence,
+                    previous_event_sha256=previous,
+                    filename_sha256=match.group(2),
+                )
+            else:
+                raise InferenceEconomicsError("economics event schema is unsupported")
             if receipt.sha256 in seen_receipts:
                 raise InferenceEconomicsError("economics receipt is duplicated")
             prior_receipt = seen_requests.get(receipt.request_sha256)
@@ -683,7 +977,7 @@ class InferenceEconomicsLedger:
                 )
             seen_receipts.add(receipt.sha256)
             seen_requests[receipt.request_sha256] = receipt.sha256
-            previous = document["sha256"]
+            previous = event_sha256
             rollup = _accumulate(rollup, receipt, head_event_sha256=previous)
             events.append((previous, receipt))
         expected = _rollup_document(rollup)
@@ -748,7 +1042,7 @@ class InferenceEconomicsLedger:
             events, rollup = self._restore_unlocked()
             for _event_sha256, existing in events:
                 if existing.request_sha256 == receipt.request_sha256:
-                    if existing.sha256 != receipt.sha256:
+                    if not _same_receipt_result(existing, receipt):
                         raise InferenceEconomicsError(
                             "one economics request produced conflicting results"
                         )
@@ -759,9 +1053,7 @@ class InferenceEconomicsLedger:
                         duplicate=True,
                     )
             sequence = len(events)
-            previous = (
-                _ZERO_SHA256 if not events else events[-1][0]
-            )
+            previous = _ZERO_SHA256 if not events else events[-1][0]
             body = {
                 "previous_event_sha256": previous,
                 "receipt": receipt.to_document(),
