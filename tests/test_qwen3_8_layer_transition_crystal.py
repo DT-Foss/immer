@@ -436,6 +436,33 @@ class PersistentBankTests(unittest.TestCase):
                 (crystal.crystal_sha256,),
             )
 
+    def test_multirow_replacement_is_all_or_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "layer63.json"
+            identity = _identity()
+            bank = LayerTransitionCrystalBank(path, identity)
+            bank.publish(
+                _crystal(
+                    identity,
+                    coverage_radius=0.0,
+                    error_radius=0.25,
+                )
+            )
+            inside = torch.zeros((1, 1, 8), dtype=torch.bfloat16)
+            outside = torch.ones((1, 1, 8), dtype=torch.bfloat16)
+
+            result = bank.replace_many(
+                (inside, outside),
+                max_error_radius=0.25,
+            )
+
+            self.assertIsNone(result)
+            metrics = bank.metrics()
+            self.assertEqual(metrics.attempts, 2)
+            self.assertEqual(metrics.replacements, 0)
+            self.assertEqual(metrics.fallbacks, 2)
+            self.assertEqual(metrics.logical_weight_bytes_replaced, 0)
+
     def test_foreign_identity_capacity_and_symlink_state_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

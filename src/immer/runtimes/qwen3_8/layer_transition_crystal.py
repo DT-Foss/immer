@@ -1702,57 +1702,84 @@ class LayerTransitionCrystalBank:
     ) -> LayerTransitionReplacement | None:
         """Try the tightest eligible crystal and settle one runtime attempt."""
 
+        replacements = self.replace_many(
+            (hidden,),
+            max_error_radius=max_error_radius,
+        )
+        return None if replacements is None else replacements[0]
+
+    def replace_many(
+        self,
+        hidden: Sequence[torch.Tensor],
+        *,
+        max_error_radius: float,
+    ) -> tuple[LayerTransitionReplacement, ...] | None:
+        """Replace one K1-K16 wave atomically or settle the entire wave as fallback."""
+
         allowed = _finite_non_negative(max_error_radius, "max_error_radius")
+        if isinstance(hidden, (str, bytes, bytearray)):
+            raise TypeError("hidden rows must be a tensor sequence")
+        try:
+            rows = tuple(hidden)
+        except TypeError as exc:
+            raise TypeError("hidden rows must be a tensor sequence") from exc
+        if not 1 <= len(rows) <= 16:
+            raise ValueError("hidden rows must contain one to sixteen K1 rows")
         # Validate before charging an attempt: malformed caller input is a
         # contract violation, not a runtime fallback.
-        _k1_hidden(hidden, hidden_dim=self.identity.hidden_dim)
+        for row in rows:
+            _k1_hidden(row, hidden_dim=self.identity.hidden_dim)
         with self._lock:
             self._refresh_if_changed()
-            ranked: list[tuple[float, float, str, LayerTransitionCrystal]] = []
-            for crystal in self._state.crystals:
-                distance = crystal.coverage_distance(hidden)
-                if (
-                    distance <= crystal._coverage.sketch_radius
-                    and crystal._coverage.error_radius <= allowed
-                ):
-                    ranked.append(
-                        (
-                            crystal._coverage.error_radius,
-                            distance,
-                            crystal.crystal_sha256,
-                            crystal,
+            selected: list[LayerTransitionCrystal] = []
+            for row in rows:
+                ranked: list[tuple[float, float, str, LayerTransitionCrystal]] = []
+                for crystal in self._state.crystals:
+                    distance = crystal.coverage_distance(row)
+                    if (
+                        distance <= crystal._coverage.sketch_radius
+                        and crystal._coverage.error_radius <= allowed
+                    ):
+                        ranked.append(
+                            (
+                                crystal._coverage.error_radius,
+                                distance,
+                                crystal.crystal_sha256,
+                                crystal,
+                            )
                         )
-                    )
-            self._attempts = _bounded_add(self._attempts, 1)
-            if not ranked:
-                self._fallbacks = _bounded_add(self._fallbacks, 1)
-                return None
-            selected = min(ranked)[-1]
-        try:
-            replacement = selected.apply(hidden, max_error_radius=allowed)
-        except Exception:
-            with self._lock:
-                self._fallbacks = _bounded_add(self._fallbacks, 1)
-            raise
-        if replacement is None:
-            # State is immutable under our thread lock selection, so this is
-            # fail-closed evidence of inconsistent coverage arithmetic.
-            with self._lock:
-                self._fallbacks = _bounded_add(self._fallbacks, 1)
-            raise LayerTransitionCrystalIntegrityError(
-                "eligible crystal rejected the same hidden row"
+                if not ranked:
+                    self._attempts = _bounded_add(self._attempts, len(rows))
+                    self._fallbacks = _bounded_add(self._fallbacks, len(rows))
+                    return None
+                selected.append(min(ranked)[-1])
+            self._attempts = _bounded_add(self._attempts, len(rows))
+            try:
+                replacements = tuple(
+                    crystal.apply(row, max_error_radius=allowed)
+                    for crystal, row in zip(selected, rows, strict=True)
+                )
+            except Exception:
+                self._fallbacks = _bounded_add(self._fallbacks, len(rows))
+                raise
+            if any(replacement is None for replacement in replacements):
+                self._fallbacks = _bounded_add(self._fallbacks, len(rows))
+                raise LayerTransitionCrystalIntegrityError(
+                    "eligible crystal rejected the same hidden row"
+                )
+            settled = tuple(
+                replacement for replacement in replacements if replacement is not None
             )
-        with self._lock:
-            self._replacements = _bounded_add(self._replacements, 1)
+            self._replacements = _bounded_add(self._replacements, len(rows))
             self._logical_weight_bytes_replaced = _bounded_add(
                 self._logical_weight_bytes_replaced,
-                replacement.logical_weight_bytes_replaced,
+                sum(row.logical_weight_bytes_replaced for row in settled),
             )
             self._output_bytes_emitted = _bounded_add(
                 self._output_bytes_emitted,
-                replacement.output.numel() * replacement.output.element_size(),
+                sum(row.output.numel() * row.output.element_size() for row in settled),
             )
-        return replacement
+            return settled
 
     def try_replace(
         self,

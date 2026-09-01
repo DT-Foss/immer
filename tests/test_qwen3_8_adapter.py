@@ -949,8 +949,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "physical_transitions": values[3],
                 "q4_sha256": identity.q4_sha256,
                 "replacements": values[1],
-                "schema": "immer.qwen3.8-layer-transition-crystal-metrics/v1",
+                "schema": "immer.qwen3.8-layer-transition-crystal-metrics/v2",
                 "skipped_q4_matrix_calls": values[5],
+                "transition_rows": values[4],
             }
 
         runtime.model.layer_transition_crystal_metrics = Mock(
@@ -965,7 +966,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         chat._layer_transition_crystal_max_error_radius = radius
         chat._layer_transition_crystal_bank = SimpleNamespace(
             identity=identity,
-            crystals=(),
+            crystals=(SimpleNamespace(logical_weight_bytes_replaced=10_000),),
         )
 
         result = chat.handle(Request("chat", "hello"))
@@ -992,10 +993,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "max_error_radius": radius,
                 "model_sha256": identity.model_sha256,
                 "packed_weight_bytes_avoided": 20_000,
+                "packed_weight_bytes_per_transition": 10_000,
                 "physical_transitions": 2,
                 "q4_sha256": identity.q4_sha256,
                 "replacements": 2,
                 "skipped_q4_matrix_calls": 10,
+                "transition_rows": 2,
             },
         )
         self.assertNotIn("hello", json.dumps(evidence, sort_keys=True))
@@ -1039,8 +1042,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "physical_transitions": 0,
                 "q4_sha256": identity.q4_sha256,
                 "replacements": 0,
-                "schema": "immer.qwen3.8-layer-transition-crystal-metrics/v1",
+                "schema": "immer.qwen3.8-layer-transition-crystal-metrics/v2",
                 "skipped_q4_matrix_calls": 0,
+                "transition_rows": 0,
             }
 
         runtime.model.layer_transition_crystal_metrics = Mock(
@@ -1052,7 +1056,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         chat._layer_transition_crystal_max_error_radius = radius
         chat._layer_transition_crystal_bank = SimpleNamespace(
             identity=identity,
-            crystals=(),
+            crystals=(SimpleNamespace(logical_weight_bytes_replaced=10_000),),
         )
 
         def directive(

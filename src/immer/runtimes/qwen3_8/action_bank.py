@@ -117,9 +117,14 @@ def physical_lm_head_coordinate_executed(value: object) -> bool:
 def physical_layer_transition_crystal_executed(value: object) -> bool:
     """Accept only physically executed layer transitions with pinned identity."""
 
+    schema = value.get("schema") if isinstance(value, Mapping) else None
     if (
         not isinstance(value, Mapping)
-        or value.get("schema") != "immer.qwen3.8-layer-transition-crystal-evidence/v1"
+        or schema
+        not in {
+            "immer.qwen3.8-layer-transition-crystal-evidence/v1",
+            "immer.qwen3.8-layer-transition-crystal-evidence/v2",
+        }
         or not all(
             _is_sha256(value.get(field))
             for field in (
@@ -149,13 +154,16 @@ def physical_layer_transition_crystal_executed(value: object) -> bool:
         request.get("skipped_q4_matrix_calls"),
         request.get("packed_weight_bytes_avoided"),
         request.get("exact_kv_state_updates"),
+        request.get("transition_rows", request.get("physical_transitions")),
     )
     if any(
         isinstance(counter, bool) or not isinstance(counter, int) or counter <= 0
         for counter in counters
     ):
         return False
-    transitions, skipped_matrices, avoided_bytes, exact_updates = counters
+    transitions, skipped_matrices, avoided_bytes, exact_updates, transition_rows = (
+        counters
+    )
     attempts = request.get("attempts")
     replacements = request.get("replacements")
     fallbacks = request.get("fallbacks")
@@ -172,17 +180,29 @@ def physical_layer_transition_crystal_executed(value: object) -> bool:
     ):
         return False
     radius = value.get("max_error_radius")
-    return (
+    common = (
         isinstance(radius, (int, float))
         and not isinstance(radius, bool)
         and float(radius) >= 0.0
         and float(radius) not in {float("inf"), float("-inf")}
         and float(radius) == float(radius)
         and request.get("max_error_radius") == radius
-        and replacements == transitions == exact_updates
+        and replacements == transition_rows == exact_updates
+        and transitions <= transition_rows
         and attempts == replacements + fallbacks
         and skipped_matrices == 5 * transitions
-        and avoided_bytes % transitions == 0
+    )
+    if not common:
+        return False
+    if schema == "immer.qwen3.8-layer-transition-crystal-evidence/v1":
+        return transitions == transition_rows and avoided_bytes % transitions == 0
+    per_transition = value.get("packed_weight_bytes_per_transition")
+    return (
+        isinstance(per_transition, int)
+        and not isinstance(per_transition, bool)
+        and per_transition > 0
+        and request.get("packed_weight_bytes_per_transition") == per_transition
+        and avoided_bytes == transitions * per_transition
     )
 
 

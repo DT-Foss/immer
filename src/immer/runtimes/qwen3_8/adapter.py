@@ -142,7 +142,7 @@ _GENERATION_RECEIPT_FIELDS = (
 )
 RESULT_CELL_GENERATION_POLICY_SCHEMA = "immer.qwen3.8-result-cell-generation-policy/v1"
 LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA = (
-    "immer.qwen3.8-layer-transition-crystal-evidence/v1"
+    "immer.qwen3.8-layer-transition-crystal-evidence/v2"
 )
 QWEN38_CHAT_HISTORY_METADATA = "qwen_chat_history"
 QWEN38_CHAT_SESSION_METADATA = "qwen_chat_session"
@@ -3852,7 +3852,7 @@ class Qwen38CausalChat:
         if not isinstance(record, Mapping):
             raise Qwen38ChatError("layer-transition Crystal metrics are not a mapping")
         if record.get("schema") != (
-            "immer.qwen3.8-layer-transition-crystal-metrics/v1"
+            "immer.qwen3.8-layer-transition-crystal-metrics/v2"
         ):
             raise Qwen38ChatError("layer-transition Crystal metrics schema is invalid")
         identity = bank.identity
@@ -3888,12 +3888,30 @@ class Qwen38CausalChat:
             "physical_transitions",
             "replacements",
             "skipped_q4_matrix_calls",
+            "transition_rows",
         ):
             value = record.get(field)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise Qwen38ChatError(f"layer-transition Crystal {field} is invalid")
             counters[field] = value
         return counters
+
+    def _layer_transition_packed_bytes_per_transition(self) -> int:
+        bank = self._layer_transition_crystal_bank
+        if bank is None:
+            raise Qwen38ChatError("layer-transition Crystal bank is unavailable")
+        costs = {crystal.logical_weight_bytes_replaced for crystal in bank.crystals}
+        cost = next(iter(costs), None)
+        if (
+            len(costs) != 1
+            or isinstance(cost, bool)
+            or not isinstance(cost, int)
+            or cost <= 0
+        ):
+            raise Qwen38ChatError(
+                "layer-transition Crystal packed wave cost is invalid"
+            )
+        return cost
 
     def _record_layer_transition_crystal_request(
         self,
@@ -3913,6 +3931,7 @@ class Qwen38CausalChat:
                 "physical_transitions",
                 "replacements",
                 "skipped_q4_matrix_calls",
+                "transition_rows",
             )
         }
         if any(value < 0 for value in request.values()):
@@ -3927,6 +3946,9 @@ class Qwen38CausalChat:
                 "identity_sha256": identity.identity_sha256,
                 "max_error_radius": (self._layer_transition_crystal_max_error_radius),
                 "model_sha256": identity.model_sha256,
+                "packed_weight_bytes_per_transition": (
+                    self._layer_transition_packed_bytes_per_transition()
+                ),
                 "q4_sha256": identity.q4_sha256,
             }
         )
@@ -4076,6 +4098,9 @@ class Qwen38CausalChat:
                 "identity_sha256": identity.identity_sha256,
                 "max_error_radius": (self._layer_transition_crystal_max_error_radius),
                 "model_sha256": identity.model_sha256,
+                "packed_weight_bytes_per_transition": (
+                    self._layer_transition_packed_bytes_per_transition()
+                ),
                 "q4_sha256": identity.q4_sha256,
                 "schema": LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA,
             }

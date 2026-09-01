@@ -4232,6 +4232,7 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
         bank.replace.assert_called_once_with(hidden, max_error_radius=0.0)
         metrics = self.model.layer_transition_crystal_metrics()
         self.assertEqual(metrics["physical_transitions"], 1)
+        self.assertEqual(metrics["transition_rows"], 1)
         self.assertEqual(metrics["exact_kv_state_updates"], 1)
         self.assertEqual(metrics["skipped_q4_matrix_calls"], 5)
         self.assertEqual(metrics["packed_weight_bytes_avoided"], avoided_bytes)
@@ -4261,6 +4262,123 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
             self.model._layer_transition_crystal_packed_weight_bytes_avoided,
             0,
         )
+
+    def test_k4_wave_skips_one_weight_wave_and_retains_every_exact_kv_prefix(
+        self,
+    ) -> None:
+        layer = self.config.n_layers - 1
+        hidden = tuple(
+            torch.randn((1, 1, self.config.dim)).to(torch.bfloat16) for _ in range(4)
+        )
+        expected_hidden, expected_state, expected_trace = (
+            self.model._forward_layer_token_rows(
+                hidden,
+                layer=layer,
+                state=None,
+                start_pos=0,
+                native_head_crsa_observer=lambda _row: None,
+            )
+        )
+        self.assertIsInstance(expected_state, AttentionState)
+        self.assertEqual(expected_trace.attention_log_usage, (None,) * 4)
+        avoided_bytes = 123_456
+        replacements = tuple(
+            SimpleNamespace(
+                output=row.clone(),
+                logical_weight_bytes_replaced=avoided_bytes,
+            )
+            for row in expected_hidden
+        )
+        bank = SimpleNamespace(
+            identity=SimpleNamespace(
+                atlas_revision_sha256="a" * 64,
+                graph_revision_sha256="b" * 64,
+                identity_sha256="c" * 64,
+                model_sha256="d" * 64,
+                q4_sha256="e" * 64,
+            ),
+            metrics=lambda: SimpleNamespace(
+                to_dict=lambda: {"attempts": 4, "fallbacks": 0, "replacements": 4}
+            ),
+            replace_many=mock.Mock(return_value=replacements),
+        )
+        self.model.layer_transition_crystal_bank = bank
+        self.model.layer_transition_crystal_enabled = True
+        self.model.layer_transition_crystal_max_error_radius = 0.0
+        projected_names: list[tuple[str, ...]] = []
+        original_group = self.model._linear_group_token_rows
+
+        def record_group(rows, names):
+            projected_names.append(tuple(names))
+            return original_group(rows, names)
+
+        with (
+            mock.patch.object(
+                self.model,
+                "_layer_transition_avoided_q4_bytes",
+                return_value=avoided_bytes,
+            ),
+            mock.patch.object(
+                self.model,
+                "_linear_group_token_rows",
+                side_effect=record_group,
+            ),
+            mock.patch.object(
+                self.model,
+                "_full_attention_token_rows",
+                side_effect=AssertionError("full attention executed"),
+            ),
+            mock.patch.object(
+                self.model,
+                "_mlp_token_rows",
+                side_effect=AssertionError("MLP executed"),
+            ),
+        ):
+            actual_hidden, actual_state, actual_trace = (
+                self.model._forward_layer_token_rows(
+                    hidden,
+                    layer=layer,
+                    state=None,
+                    start_pos=0,
+                    native_head_crsa_observer=lambda _row: None,
+                )
+            )
+
+        self.assertTrue(
+            all(
+                torch.equal(actual, expected)
+                for actual, expected in zip(
+                    actual_hidden,
+                    expected_hidden,
+                    strict=True,
+                )
+            )
+        )
+        self.assertIsInstance(actual_state, AttentionState)
+        assert isinstance(actual_state, AttentionState)
+        assert isinstance(expected_state, AttentionState)
+        self.assertTrue(torch.equal(actual_state.key, expected_state.key))
+        self.assertTrue(torch.equal(actual_state.value, expected_state.value))
+        self.assertEqual(actual_trace.attention_log_usage, (None,) * 4)
+        self.assertTrue(
+            torch.equal(actual_state.key[:, :, :2], expected_state.key[:, :, :2])
+        )
+        self.assertEqual(
+            projected_names,
+            [
+                (
+                    f"model.language_model.layers.{layer}.self_attn.k_proj",
+                    f"model.language_model.layers.{layer}.self_attn.v_proj",
+                )
+            ],
+        )
+        bank.replace_many.assert_called_once_with(hidden, max_error_radius=0.0)
+        metrics = self.model.layer_transition_crystal_metrics()
+        self.assertEqual(metrics["physical_transitions"], 1)
+        self.assertEqual(metrics["transition_rows"], 4)
+        self.assertEqual(metrics["exact_kv_state_updates"], 4)
+        self.assertEqual(metrics["skipped_q4_matrix_calls"], 5)
+        self.assertEqual(metrics["packed_weight_bytes_avoided"], avoided_bytes)
 
 
 if __name__ == "__main__":

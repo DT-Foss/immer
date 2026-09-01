@@ -89,9 +89,11 @@ def _layer_transition_crystal_evidence(
         "fallbacks": 1,
         "max_error_radius": 0.25,
         "packed_weight_bytes_avoided": 16_384,
+        "packed_weight_bytes_per_transition": 8192,
         "physical_transitions": 2,
         "replacements": 2,
         "skipped_q4_matrix_calls": 10,
+        "transition_rows": 2,
     }
     if request_overrides:
         request.update(request_overrides)
@@ -100,8 +102,9 @@ def _layer_transition_crystal_evidence(
     return {
         **evidence,
         "max_error_radius": 0.25,
+        "packed_weight_bytes_per_transition": 8192,
         "request": request,
-        "schema": "immer.qwen3.8-layer-transition-crystal-evidence/v1",
+        "schema": "immer.qwen3.8-layer-transition-crystal-evidence/v2",
     }
 
 
@@ -604,6 +607,7 @@ class InferenceActionReceiptTests(unittest.TestCase):
             ("skipped_q4_matrix_calls", 0),
             ("packed_weight_bytes_avoided", 0),
             ("exact_kv_state_updates", 0),
+            ("transition_rows", 0),
         ):
             with self.subTest(field=field, invalid=invalid):
                 result = Result(
@@ -622,6 +626,73 @@ class InferenceActionReceiptTests(unittest.TestCase):
                     "layer_transition_crystal",
                     executed_actions_from_result(result, economics),
                 )
+
+        k8 = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "layer_transition_crystal": _layer_transition_crystal_evidence(
+                    request_overrides={
+                        "attempts": 8,
+                        "exact_kv_state_updates": 8,
+                        "fallbacks": 0,
+                        "packed_weight_bytes_avoided": 8192,
+                        "physical_transitions": 1,
+                        "replacements": 8,
+                        "skipped_q4_matrix_calls": 5,
+                        "transition_rows": 8,
+                    }
+                )
+            },
+        )
+        self.assertIn(
+            "layer_transition_crystal",
+            executed_actions_from_result(k8, economics),
+        )
+        overcounted_k8 = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "layer_transition_crystal": _layer_transition_crystal_evidence(
+                    request_overrides={
+                        "attempts": 8,
+                        "exact_kv_state_updates": 8,
+                        "fallbacks": 0,
+                        "packed_weight_bytes_avoided": 16_384,
+                        "physical_transitions": 1,
+                        "replacements": 8,
+                        "skipped_q4_matrix_calls": 5,
+                        "transition_rows": 8,
+                    }
+                )
+            },
+        )
+        self.assertNotIn(
+            "layer_transition_crystal",
+            executed_actions_from_result(overcounted_k8, economics),
+        )
+
+        legacy = _layer_transition_crystal_evidence()
+        legacy["schema"] = "immer.qwen3.8-layer-transition-crystal-evidence/v1"
+        legacy.pop("packed_weight_bytes_per_transition")
+        legacy_request = legacy["request"]
+        assert isinstance(legacy_request, dict)
+        legacy_request.pop("packed_weight_bytes_per_transition")
+        legacy_request.pop("transition_rows")
+        self.assertIn(
+            "layer_transition_crystal",
+            executed_actions_from_result(
+                Result(
+                    ExecutionStatus.OK,
+                    "qwen3.8.causal-chat",
+                    output="answer",
+                    evidence={"layer_transition_crystal": legacy},
+                ),
+                economics,
+            ),
+        )
 
         for settlement in (
             {"attempts": 0, "fallbacks": 0, "replacements": 0},

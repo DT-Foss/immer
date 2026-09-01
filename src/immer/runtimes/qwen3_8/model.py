@@ -567,6 +567,7 @@ class StreamedQwen38:
         self.layer_transition_crystal_enabled = False
         self.layer_transition_crystal_max_error_radius = 0.0
         self._layer_transition_crystal_hits = 0
+        self._layer_transition_crystal_rows = 0
         self._layer_transition_crystal_exact_kv_state_updates = 0
         self._layer_transition_crystal_skipped_q4_matrix_calls = 0
         self._layer_transition_crystal_packed_weight_bytes_avoided = 0
@@ -1103,11 +1104,12 @@ class StreamedQwen38:
                 self._layer_transition_crystal_packed_weight_bytes_avoided
             ),
             "physical_transitions": self._layer_transition_crystal_hits,
+            "transition_rows": self._layer_transition_crystal_rows,
             "q4_sha256": None if identity is None else identity.q4_sha256,
             "replacements": (
                 0 if bank_metrics is None else int(bank_metrics["replacements"])
             ),
-            "schema": "immer.qwen3.8-layer-transition-crystal-metrics/v1",
+            "schema": "immer.qwen3.8-layer-transition-crystal-metrics/v2",
             "skipped_q4_matrix_calls": (
                 self._layer_transition_crystal_skipped_q4_matrix_calls
             ),
@@ -3545,6 +3547,133 @@ class StreamedQwen38:
         rows = self._mlp_token_rows(hidden, layer=layer)
         return rows[0], rows[1]
 
+    def _layer_transition_crystal_forward_rows(
+        self,
+        hidden: tuple[torch.Tensor, ...],
+        *,
+        layer: int,
+        state: LayerState | None,
+        start_pos: int,
+        native_prefix_sinkhorn_operator_observer: (
+            NativePrefixSinkhornOperatorObserver | None
+        ),
+    ) -> (
+        tuple[
+            tuple[torch.Tensor, ...],
+            AttentionState,
+            _LayerPrefixTrace,
+        ]
+        | None
+    ):
+        """Replace one K2-K16 final-layer wave and retain every exact KV prefix."""
+
+        bank = self.layer_transition_crystal_bank
+        width = len(hidden)
+        if (
+            bank is None
+            or not self.layer_transition_crystal_enabled
+            or not 2 <= width <= self.MAX_CONTINUATION_BLOCK_WIDTH
+            or layer != TARGET_LAYER_INDEX
+            or layer != self.config.n_layers - 1
+            or self.layer_boundary_observer is not None
+            or native_prefix_sinkhorn_operator_observer is not None
+            or any(
+                tuple(row.shape) != (1, 1, self.config.dim)
+                or row.dtype != torch.bfloat16
+                for row in hidden
+            )
+        ):
+            return None
+        if not self.config.is_full_attention(layer):
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal target is not full attention"
+            )
+        if state is not None and not isinstance(state, AttentionState):
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal received a non-K/V state"
+            )
+        if state is not None and state.crsa_log_usage is not None:
+            return None
+        replacements = bank.replace_many(
+            hidden,
+            max_error_radius=self.layer_transition_crystal_max_error_radius,
+        )
+        if replacements is None:
+            return None
+        outputs = tuple(row.output for row in replacements)
+        if any(
+            tuple(output.shape) != (1, 1, self.config.dim)
+            or output.dtype != self.pager.compute_dtype
+            or not self._on_pager_device(output)
+            or not bool(torch.isfinite(output).all().item())
+            for output in outputs
+        ):
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal emitted an invalid hidden row"
+            )
+        avoided_bytes = self._layer_transition_avoided_q4_bytes()
+        if any(
+            row.logical_weight_bytes_replaced != avoided_bytes for row in replacements
+        ):
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal byte claim changed after attachment"
+            )
+
+        prefix = f"model.language_model.layers.{layer}"
+        base = f"{prefix}.self_attn"
+        mixed_input = self._norm_token_rows(
+            hidden,
+            f"{prefix}.input_layernorm.weight",
+        )
+        projected_key, projected_value = self._linear_group_token_rows(
+            mixed_input,
+            (f"{base}.k_proj", f"{base}.v_proj"),
+        )
+        k_norm_weight = self._control(f"{base}.k_norm.weight")
+        next_state = state
+        try:
+            for offset, (key_row, value_row) in enumerate(
+                zip(projected_key, projected_value, strict=True)
+            ):
+                position = torch.full(
+                    (1, 1),
+                    start_pos + offset,
+                    dtype=torch.long,
+                    device=key_row.device,
+                )
+                next_state = full_attention_kv_state(
+                    key_row,
+                    value_row,
+                    k_norm_weight=k_norm_weight,
+                    num_key_value_heads=self.config.n_kv_heads,
+                    head_dim=self.config.head_dim,
+                    position_ids=position,
+                    state=next_state,
+                    rope_theta=self.config.rope_theta,
+                    rotary_dim=self.config.rotary_dim,
+                    mrope_section=self.config.mrope_section,
+                    mrope_interleaved=self.config.mrope_interleaved,
+                    rms_norm_eps=self.config.rms_norm_eps,
+                )
+        finally:
+            del mixed_input, projected_key, projected_value, k_norm_weight
+        if not isinstance(next_state, AttentionState):  # pragma: no cover
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal produced no exact K/V state"
+            )
+        self._layer_transition_crystal_hits += 1
+        self._layer_transition_crystal_rows += width
+        self._layer_transition_crystal_exact_kv_state_updates += width
+        self._layer_transition_crystal_skipped_q4_matrix_calls += len(
+            self._layer_transition_q4_names()
+        )
+        self._layer_transition_crystal_packed_weight_bytes_avoided += avoided_bytes
+        return (
+            outputs,
+            next_state,
+            _LayerPrefixTrace(attention_log_usage=(None,) * width),
+        )
+
     def _forward_layer_token_rows(
         self,
         hidden: tuple[torch.Tensor, ...],
@@ -3564,6 +3693,17 @@ class StreamedQwen38:
         """Apply one layer tokenwise while reading every checkpoint tensor once."""
 
         prefix = f"model.language_model.layers.{layer}"
+        crystal = self._layer_transition_crystal_forward_rows(
+            hidden,
+            layer=layer,
+            state=state,
+            start_pos=start_pos,
+            native_prefix_sinkhorn_operator_observer=(
+                native_prefix_sinkhorn_operator_observer
+            ),
+        )
+        if crystal is not None:
+            return crystal
         residual = hidden
         mixed_input = self._norm_token_rows(
             hidden,
@@ -3627,6 +3767,18 @@ class StreamedQwen38:
         """Preserve the original K=2 seam over generic weight-once helpers."""
 
         prefix = f"model.language_model.layers.{layer}"
+        crystal = self._layer_transition_crystal_forward_rows(
+            hidden,
+            layer=layer,
+            state=state,
+            start_pos=start_pos,
+            native_prefix_sinkhorn_operator_observer=(
+                native_prefix_sinkhorn_operator_observer
+            ),
+        )
+        if crystal is not None:
+            rows, next_state, prefix_trace = crystal
+            return (rows[0], rows[1]), next_state, prefix_trace
         residual = hidden
         mixed_input = self._norm_k2_pair(
             hidden,
@@ -3768,6 +3920,7 @@ class StreamedQwen38:
             del mixed_input, projected_key, projected_value, k_norm_weight
 
         self._layer_transition_crystal_hits += 1
+        self._layer_transition_crystal_rows += 1
         self._layer_transition_crystal_exact_kv_state_updates += 1
         self._layer_transition_crystal_skipped_q4_matrix_calls += len(
             self._layer_transition_q4_names()
