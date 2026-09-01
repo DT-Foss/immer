@@ -96,6 +96,15 @@ from .layer_mlp_registry import (
     LayerMlpO1MountRegistry,
     read_layer_mlp_o1_registry_manifest,
 )
+from .layer_contextual_continuation import (
+    DEFAULT_LAYER_CONTEXTUAL_MAX_RECEIPTS,
+    DEFAULT_LAYER_CONTEXTUAL_SKETCH_DIM,
+    LAYER_CONTEXTUAL_CONTINUATION_METRICS_SCHEMA,
+    LAYER_CONTEXTUAL_PROJECTION_ABI,
+    LAYER_CONTEXTUAL_STAGE,
+    LayerContextualContinuationBank,
+    LayerContextualContinuationIdentity,
+)
 from .layer_transition_crystal import LayerTransitionProjectionIdentity
 from .mlp_page_markov import (
     MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS,
@@ -188,6 +197,31 @@ _QWEN38_COMPONENT_TIMING_BOUNDARIES = {
 }
 DEFAULT_LAYER_MLP_O1_PROJECTION_SEED = (
     "2b188a99b4b36f51bd910866e6d9a007fd02ec7256d6596fc87eb76f0444eccf"
+)
+DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_LAYERS = (18, 27, 36, 45, 54)
+DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_PROJECTION_SEED = 0
+DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_MAX_CELLS = 4096
+LAYER_CONTEXTUAL_CONTINUATION_EVIDENCE_SCHEMA = (
+    "immer.qwen3.8-layer-contextual-continuation-evidence/v2"
+)
+LAYER_CONTEXTUAL_CONTINUATION_REQUEST_SCHEMA = (
+    "immer.qwen3.8-layer-contextual-continuation-request/v2"
+)
+_LAYER_CONTEXTUAL_CONTINUATION_RUNTIME_SCHEMA = (
+    "immer.qwen3.8-layer-contextual-continuation-runtime/v2"
+)
+_LAYER_CONTEXTUAL_BANK_WORK_COUNTERS = (
+    "crystal_queries",
+    "crystal_query_hits",
+    "crystal_option_calls",
+    "crystal_captures",
+    "crystal_failures",
+)
+_LAYER_CONTEXTUAL_SELECTED_COUNTERS = (
+    "crystal_proposed_tokens",
+    "crystal_verified_tokens",
+    "crystal_accepted_tokens",
+    "crystal_mismatches",
 )
 
 
@@ -284,6 +318,20 @@ def _digest(value: object) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _layer_contextual_continuation_runtime_sha256() -> str:
+    """Pin the path-free tracker/projection/provider contract used at runtime."""
+
+    return _digest(
+        {
+            "markov_provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
+            "projection_abi": LAYER_CONTEXTUAL_PROJECTION_ABI,
+            "schema": _LAYER_CONTEXTUAL_CONTINUATION_RUNTIME_SCHEMA,
+            "stage": LAYER_CONTEXTUAL_STAGE,
+            "tracker": "streamed-qwen-boundary-transaction-snapshot/v2",
+        }
+    )
 
 
 def _transport_neutral_digest(value: object) -> str:
@@ -1344,6 +1392,24 @@ class _OwnedRuntime:
             self.model.reset_state(release=True)
         except Exception as exc:  # release the remaining owners regardless
             failures.append(exc)
+        detach_layer_contextual_continuation = getattr(
+            self.model,
+            "attach_layer_contextual_continuation",
+            None,
+        )
+        if (
+            getattr(
+                self.model,
+                "layer_contextual_continuation_identity",
+                None,
+            )
+            is not None
+            and callable(detach_layer_contextual_continuation)
+        ):
+            try:
+                detach_layer_contextual_continuation(None)
+            except Exception as exc:
+                failures.append(exc)
         detach_attention_crystal = getattr(
             self.model,
             "attach_attention_output_crystal_bank",
@@ -1876,6 +1942,22 @@ class Qwen38CausalChat:
         markov_atlas_path: str | Path | None = None,
         markov_o1_retention_path: str | Path | None = None,
         contextual_continuation_state_path: str | Path | None = None,
+        layer_contextual_continuation_state_path: str | Path | None = None,
+        layer_contextual_continuation_layers: Sequence[int] = (
+            DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_LAYERS
+        ),
+        layer_contextual_continuation_sketch_dim: int = (
+            DEFAULT_LAYER_CONTEXTUAL_SKETCH_DIM
+        ),
+        layer_contextual_continuation_projection_seed: int = (
+            DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_PROJECTION_SEED
+        ),
+        layer_contextual_continuation_max_cells: int = (
+            DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_MAX_CELLS
+        ),
+        layer_contextual_continuation_max_receipts: int = (
+            DEFAULT_LAYER_CONTEXTUAL_MAX_RECEIPTS
+        ),
         attention_output_crystal_state_path: str | Path | None = None,
         layer_transition_crystal_state_path: str | Path | None = None,
         layer_transition_crystal_atlas_path: str | Path | None = None,
@@ -2072,6 +2154,72 @@ class Qwen38CausalChat:
             raise TypeError(
                 "contextual_continuation_state_path must be a local path or None"
             )
+        if layer_contextual_continuation_state_path is not None and not isinstance(
+            layer_contextual_continuation_state_path,
+            (str, Path),
+        ):
+            raise TypeError(
+                "layer_contextual_continuation_state_path must be a local path "
+                "or None"
+            )
+        if isinstance(layer_contextual_continuation_layers, (str, bytes)):
+            raise TypeError(
+                "layer_contextual_continuation_layers must be an integer sequence"
+            )
+        try:
+            normalized_layer_contextual_continuation_layers = tuple(
+                layer_contextual_continuation_layers
+            )
+        except TypeError as exc:
+            raise TypeError(
+                "layer_contextual_continuation_layers must be an integer sequence"
+            ) from exc
+        if (
+            not normalized_layer_contextual_continuation_layers
+            or normalized_layer_contextual_continuation_layers
+            != tuple(sorted(set(normalized_layer_contextual_continuation_layers)))
+            or any(
+                isinstance(layer, bool)
+                or not isinstance(layer, int)
+                or not 0 <= layer <= 63
+                for layer in normalized_layer_contextual_continuation_layers
+            )
+        ):
+            raise ValueError(
+                "layer_contextual_continuation_layers must be sorted unique "
+                "integers in [0, 63]"
+            )
+        layer_contextual_continuation_sketch_dim = _positive_int(
+            layer_contextual_continuation_sketch_dim,
+            "layer_contextual_continuation_sketch_dim",
+        )
+        if layer_contextual_continuation_sketch_dim > 4096:
+            raise ValueError(
+                "layer_contextual_continuation_sketch_dim cannot exceed 4096"
+            )
+        if (
+            isinstance(layer_contextual_continuation_projection_seed, bool)
+            or not isinstance(layer_contextual_continuation_projection_seed, int)
+            or not 0 <= layer_contextual_continuation_projection_seed < 1 << 64
+        ):
+            raise ValueError(
+                "layer_contextual_continuation_projection_seed must be a uint64"
+            )
+        layer_contextual_continuation_max_cells = _positive_int(
+            layer_contextual_continuation_max_cells,
+            "layer_contextual_continuation_max_cells",
+        )
+        layer_contextual_continuation_max_receipts = _positive_int(
+            layer_contextual_continuation_max_receipts,
+            "layer_contextual_continuation_max_receipts",
+        )
+        if (
+            layer_contextual_continuation_max_cells > 65_536
+            or layer_contextual_continuation_max_receipts > 65_536
+        ):
+            raise ValueError(
+                "layer contextual continuation capacities cannot exceed 65536"
+            )
         if attention_output_crystal_state_path is not None and not isinstance(
             attention_output_crystal_state_path,
             (str, Path),
@@ -2230,6 +2378,7 @@ class Qwen38CausalChat:
                 markov_atlas_path is not None
                 or markov_o1_retention_path is not None
                 or contextual_continuation_state_path is not None
+                or layer_contextual_continuation_state_path is not None
             ):
                 draft_mode = "markov"
         if draft_mode == "qwen35" and draft_bundle_path is None:
@@ -2269,6 +2418,17 @@ class Qwen38CausalChat:
             )
         if contextual_continuation_state_path is not None and q4_root is None:
             raise ValueError("contextual continuation Crystals require Q4 execution")
+        if (
+            draft_mode not in {"hybrid", "markov"}
+            and layer_contextual_continuation_state_path is not None
+        ):
+            raise ValueError(
+                "layer contextual continuation requires Markov or hybrid drafting"
+            )
+        if layer_contextual_continuation_state_path is not None and q4_root is None:
+            raise ValueError(
+                "layer contextual continuation requires Q4 execution"
+            )
         if attention_output_crystal_state_path is not None and q4_root is None:
             raise ValueError("attention-output Crystals require Q4 execution")
         if attention_output_crystal_state_path is not None and compute_dtype not in {
@@ -2605,6 +2765,28 @@ class Qwen38CausalChat:
             if contextual_continuation_state_path is None
             else Path(contextual_continuation_state_path).expanduser().absolute()
         )
+        self._layer_contextual_continuation_state_path = (
+            None
+            if layer_contextual_continuation_state_path is None
+            else Path(layer_contextual_continuation_state_path)
+            .expanduser()
+            .absolute()
+        )
+        self._layer_contextual_continuation_layers = (
+            normalized_layer_contextual_continuation_layers
+        )
+        self._layer_contextual_continuation_sketch_dim = (
+            layer_contextual_continuation_sketch_dim
+        )
+        self._layer_contextual_continuation_projection_seed = (
+            layer_contextual_continuation_projection_seed
+        )
+        self._layer_contextual_continuation_max_cells = (
+            layer_contextual_continuation_max_cells
+        )
+        self._layer_contextual_continuation_max_receipts = (
+            layer_contextual_continuation_max_receipts
+        )
         self._attention_output_crystal_state_path = (
             None
             if attention_output_crystal_state_path is None
@@ -2751,6 +2933,9 @@ class Qwen38CausalChat:
         self._markov_atlas: MarkovTokenAtlas | None = None
         self._markov_o1_retention: O1MarkovRetention | None = None
         self._contextual_continuation_bank: ContextualContinuationBank | None = None
+        self._layer_contextual_continuation_bank: (
+            LayerContextualContinuationBank | None
+        ) = None
         self._compatible_contextual_continuation_identity_sha256s: tuple[str, ...] = ()
         self._attention_output_crystal_bank: AttentionOutputCrystalBank | None = None
         self._layer_transition_crystal_bank: LayerTransitionCrystalBank | None = None
@@ -2992,6 +3177,30 @@ class Qwen38CausalChat:
                     ),
                     "key": "known-token+normalized-rademacher-q8-256/v1",
                     "maximum_tail_tokens": 15,
+                    "target_verifier": "qwen-k1-k4-k8-k16",
+                }
+            if self._layer_contextual_continuation_state_path is not None:
+                layer_bank = self._layer_contextual_continuation_bank
+                policy["layer_contextual_continuation_crystal"] = {
+                    "identity": (
+                        None
+                        if layer_bank is None
+                        else layer_bank.identity.to_record()
+                    ),
+                    "identity_sha256": (
+                        None
+                        if layer_bank is None
+                        else layer_bank.identity.identity_sha256
+                    ),
+                    "layers": list(self._layer_contextual_continuation_layers),
+                    "max_cells": self._layer_contextual_continuation_max_cells,
+                    "max_receipts": self._layer_contextual_continuation_max_receipts,
+                    "projection": {
+                        "abi": LAYER_CONTEXTUAL_PROJECTION_ABI,
+                        "seed": self._layer_contextual_continuation_projection_seed,
+                        "sketch_dim": self._layer_contextual_continuation_sketch_dim,
+                    },
+                    "stage": LAYER_CONTEXTUAL_STAGE,
                     "target_verifier": "qwen-k1-k4-k8-k16",
                 }
         elif self._draft_mode is not None:
@@ -3452,6 +3661,27 @@ class Qwen38CausalChat:
                 ),
                 "key_abi": "known-token+normalized-rademacher-q8-256/v1",
                 "maximum_tail_tokens": 15,
+            }
+        if (
+            self._draft_mode in {"hybrid", "markov"}
+            and self._layer_contextual_continuation_state_path is not None
+        ):
+            layer_bank = self._layer_contextual_continuation_bank
+            provider["layer_contextual_continuation_crystal"] = {
+                "identity_sha256": (
+                    None
+                    if layer_bank is None
+                    else layer_bank.identity.identity_sha256
+                ),
+                "layers": list(self._layer_contextual_continuation_layers),
+                "max_cells": self._layer_contextual_continuation_max_cells,
+                "max_receipts": self._layer_contextual_continuation_max_receipts,
+                "projection_abi": LAYER_CONTEXTUAL_PROJECTION_ABI,
+                "projection_seed": (
+                    self._layer_contextual_continuation_projection_seed
+                ),
+                "sketch_dim": self._layer_contextual_continuation_sketch_dim,
+                "stage": LAYER_CONTEXTUAL_STAGE,
             }
         provider["joint_runtime_reward"] = {
             "draft_feedback_schema": DRAFT_WINDOW_FEEDBACK_SCHEMA,
@@ -4040,6 +4270,17 @@ class Qwen38CausalChat:
             and effective_draft_mode in {"hybrid", "mtp"}
             else None
         )
+        layer_contextual_bank = self._layer_contextual_continuation_bank
+        layer_contextual_current_transaction = (
+            None
+            if layer_contextual_bank is None
+            else runtime.model.current_layer_contextual_continuation_transaction
+        )
+        layer_contextual_transactions_since = (
+            None
+            if layer_contextual_bank is None
+            else runtime.model.layer_contextual_continuation_transactions_since
+        )
         if effective_draft_mode == "qwen35":
             draft = self._load_draft_locked(runtime)
             provider: Any = Qwen35K4DraftProvider(
@@ -4060,6 +4301,13 @@ class Qwen38CausalChat:
                 if retention is None
                 else retention.remember,
                 contextual_continuation_bank=self._contextual_continuation_bank,
+                layer_contextual_continuation_bank=layer_contextual_bank,
+                layer_contextual_current_transaction=(
+                    layer_contextual_current_transaction
+                ),
+                layer_contextual_transactions_since=(
+                    layer_contextual_transactions_since
+                ),
             )
         elif effective_draft_mode == "mtp":
             provider = Qwen35MtpDraftProvider(
@@ -4083,6 +4331,13 @@ class Qwen38CausalChat:
                 if retention is None
                 else retention.remember,
                 contextual_continuation_bank=self._contextual_continuation_bank,
+                layer_contextual_continuation_bank=layer_contextual_bank,
+                layer_contextual_current_transaction=(
+                    layer_contextual_current_transaction
+                ),
+                layer_contextual_transactions_since=(
+                    layer_contextual_transactions_since
+                ),
             )
 
             def mtp_factory() -> Qwen35MtpDraftProvider:
@@ -5653,6 +5908,339 @@ class Qwen38CausalChat:
         runtime.layer_mlp_o1_pool = pool
         return None, pool, atlas, compute_graph, accumulators
 
+    def _open_layer_contextual_continuation_bank(
+        self,
+        runtime: _OwnedRuntime,
+        *,
+        tokenizer_sha256: str,
+    ) -> LayerContextualContinuationBank | None:
+        configured = self._layer_contextual_continuation_state_path
+        if configured is None:
+            return None
+        if self._draft_mode not in {"hybrid", "markov"}:
+            raise Qwen38ChatError(
+                "layer contextual continuation requires Markov or hybrid drafting"
+            )
+        model = runtime.model
+        model_pin = getattr(
+            model,
+            "layer_contextual_continuation_model_sha256",
+            None,
+        )
+        q4_pin = getattr(
+            model,
+            "layer_contextual_continuation_q4_sha256",
+            None,
+        )
+        attach_identity = getattr(
+            model,
+            "attach_layer_contextual_continuation",
+            None,
+        )
+        current_transaction = getattr(
+            model,
+            "current_layer_contextual_continuation_transaction",
+            None,
+        )
+        transactions_since = getattr(
+            model,
+            "layer_contextual_continuation_transactions_since",
+            None,
+        )
+        if not all(
+            callable(value)
+            for value in (
+                model_pin,
+                q4_pin,
+                attach_identity,
+                current_transaction,
+                transactions_since,
+            )
+        ):
+            raise TypeError(
+                "runtime model lacks the layer contextual continuation contract"
+            )
+        live_model_sha256 = model_pin()
+        live_q4_sha256 = q4_pin()
+        if not _is_sha256(live_model_sha256) or not _is_sha256(live_q4_sha256):
+            raise Qwen38ChatError(
+                "runtime model returned invalid layer contextual continuation pins"
+            )
+        if not _is_sha256(tokenizer_sha256):
+            raise Qwen38ChatError(
+                "runtime tokenizer receipt is invalid for layer continuation"
+            )
+        identity = LayerContextualContinuationIdentity(
+            runtime_sha256=_layer_contextual_continuation_runtime_sha256(),
+            model_sha256=live_model_sha256,
+            q4_sha256=live_q4_sha256,
+            tokenizer_sha256=tokenizer_sha256,
+            hidden_dim=_positive_int(
+                getattr(model.config, "dim", None),
+                "layer contextual continuation hidden width",
+            ),
+            layers=self._layer_contextual_continuation_layers,
+            projection_seed=self._layer_contextual_continuation_projection_seed,
+            sketch_dim=self._layer_contextual_continuation_sketch_dim,
+        )
+        suffix = configured.suffix or ".json"
+        state_path = configured.with_name(
+            f"{configured.stem}.layer-context-"
+            f"{identity.identity_sha256[:16]}{suffix}"
+        )
+        bank = LayerContextualContinuationBank(
+            state_path,
+            identity,
+            max_cells=self._layer_contextual_continuation_max_cells,
+            max_receipts=self._layer_contextual_continuation_max_receipts,
+        )
+        attach_identity(identity)
+        attached = getattr(
+            model,
+            "layer_contextual_continuation_identity",
+            identity,
+        )
+        if attached != identity:
+            raise Qwen38ChatError(
+                "runtime model did not retain the layer continuation identity"
+            )
+        return bank
+
+    def _layer_contextual_continuation_metrics(
+        self,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Read bank metrics without allowing runtime accounting to alter output."""
+
+        bank = self._layer_contextual_continuation_bank
+        if bank is None:
+            return None, None
+        try:
+            raw = bank.metrics()
+            document = raw.to_dict()
+            if not isinstance(document, dict):
+                raise TypeError("layer continuation metrics are not a dictionary")
+            if document.get("schema") != LAYER_CONTEXTUAL_CONTINUATION_METRICS_SCHEMA:
+                raise ValueError("layer continuation metrics schema is invalid")
+            if document.get("identity_sha256") != bank.identity.identity_sha256:
+                raise ValueError("layer continuation metrics identity is invalid")
+            return document, None
+        except Exception as exc:
+            return None, f"{type(exc).__module__}.{type(exc).__qualname__}"
+
+    def _layer_contextual_continuation_evidence(
+        self,
+        metrics: Mapping[str, Any] | None,
+        accounting_error: str | None,
+    ) -> dict[str, Any] | None:
+        bank = self._layer_contextual_continuation_bank
+        if bank is None:
+            return None
+        identity = bank.identity
+        evidence: dict[str, Any] = {
+            "accounting_error": accounting_error,
+            "identity": identity.to_record(),
+            "identity_sha256": identity.identity_sha256,
+            "metrics": None if metrics is None else dict(metrics),
+            "schema": LAYER_CONTEXTUAL_CONTINUATION_EVIDENCE_SCHEMA,
+            "status": "ok" if accounting_error is None else "accounting-error",
+        }
+        return evidence
+
+    def _layer_contextual_continuation_request_delta(
+        self,
+        before: Mapping[str, Any] | None,
+        after: Mapping[str, Any] | None,
+        *,
+        before_error: str | None,
+        after_error: str | None,
+    ) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "accounting_error": before_error or after_error,
+            "bank_work": {
+                "accounting_error": before_error or after_error,
+                "layers": {},
+                "status": "ok",
+            },
+            "layers": {},
+            "schema": LAYER_CONTEXTUAL_CONTINUATION_REQUEST_SCHEMA,
+            "selected": None,
+            "status": "ok",
+        }
+        for field in _LAYER_CONTEXTUAL_SELECTED_COUNTERS:
+            request[field] = 0
+        bank_work = request["bank_work"]
+        assert isinstance(bank_work, dict)
+        try:
+            if before is None or after is None:
+                raise ValueError("layer continuation bank metrics are unavailable")
+            for field in _LAYER_CONTEXTUAL_BANK_WORK_COUNTERS:
+                previous = before.get(field)
+                current = after.get(field)
+                if (
+                    isinstance(previous, bool)
+                    or not isinstance(previous, int)
+                    or isinstance(current, bool)
+                    or not isinstance(current, int)
+                    or current < previous
+                ):
+                    raise ValueError("layer continuation counter moved backwards")
+                bank_work[field] = current - previous
+            for field in ("evictions", "receipt_count", "settlements"):
+                previous = before.get(field)
+                current = after.get(field)
+                if (
+                    isinstance(previous, bool)
+                    or not isinstance(previous, int)
+                    or isinstance(current, bool)
+                    or not isinstance(current, int)
+                    or current < previous
+                ):
+                    raise ValueError("layer continuation counter moved backwards")
+                bank_work[field] = current - previous
+            for field in ("clock", "crystal_bank_cells", "crystal_bank_support"):
+                value = after.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError("layer continuation inventory is invalid")
+                bank_work[field] = value
+            before_layers = before.get("layers")
+            after_layers = after.get("layers")
+            if not isinstance(before_layers, Mapping) or not isinstance(
+                after_layers,
+                Mapping,
+            ):
+                raise TypeError("layer continuation layer metrics are invalid")
+            if set(before_layers) != set(after_layers):
+                raise ValueError("layer continuation metric layers changed")
+            layer_deltas: dict[str, dict[str, int]] = {}
+            for layer in sorted(after_layers, key=lambda value: int(value)):
+                previous_row = before_layers[layer]
+                current_row = after_layers[layer]
+                if not isinstance(previous_row, Mapping) or not isinstance(
+                    current_row,
+                    Mapping,
+                ):
+                    raise TypeError("layer continuation metric row is invalid")
+                layer_deltas[str(layer)] = {}
+                for field in _LAYER_CONTEXTUAL_BANK_WORK_COUNTERS:
+                    previous = previous_row.get(field)
+                    current = current_row.get(field)
+                    if (
+                        isinstance(previous, bool)
+                        or not isinstance(previous, int)
+                        or isinstance(current, bool)
+                        or not isinstance(current, int)
+                        or current < previous
+                    ):
+                        raise ValueError(
+                            "layer continuation layer counter moved backwards"
+                        )
+                    layer_deltas[str(layer)][field] = current - previous
+                for field in ("crystal_bank_cells", "crystal_bank_support"):
+                    value = current_row.get(field)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                    ):
+                        raise ValueError(
+                            "layer continuation layer inventory is invalid"
+                        )
+                    layer_deltas[str(layer)][field] = value
+            bank_work["layers"] = layer_deltas
+        except Exception as exc:
+            error = f"{type(exc).__module__}.{type(exc).__qualname__}"
+            bank_work.update(
+                {
+                    "accounting_error": before_error or after_error or error,
+                    "layers": {},
+                    "status": "accounting-error",
+                }
+            )
+            request["accounting_error"] = before_error or after_error or error
+            request["status"] = "accounting-error"
+
+        try:
+            draft = self._last_draft_evidence
+            provider = None if draft is None else draft.get("provider")
+            if provider is not None and not isinstance(provider, Mapping):
+                raise TypeError("draft provider evidence is invalid")
+            markov = provider
+            if isinstance(provider, Mapping) and "markov" in provider:
+                markov = provider.get("markov")
+            if markov is not None and not isinstance(markov, Mapping):
+                raise TypeError("Markov provider evidence is invalid")
+            trace = (
+                None
+                if not isinstance(markov, Mapping)
+                else markov.get("layer_context_crystal")
+            )
+            if trace is not None and not isinstance(trace, Mapping):
+                raise TypeError("layer continuation provider trace is invalid")
+            selected = None if trace is None else trace.get("selected")
+            if selected is not None and not isinstance(selected, Mapping):
+                raise TypeError("layer continuation selection is invalid")
+            selected_layer = None if selected is None else selected.get("layer")
+            trace_layers = {} if trace is None else trace.get("layers", {})
+            if not isinstance(trace_layers, Mapping):
+                raise TypeError("layer continuation provider layers are invalid")
+            if selected_layer is not None and (
+                isinstance(selected_layer, bool)
+                or not isinstance(selected_layer, int)
+                or str(selected_layer) not in trace_layers
+            ):
+                raise ValueError("layer continuation selected layer is invalid")
+            for field in _LAYER_CONTEXTUAL_SELECTED_COUNTERS:
+                value = 0 if trace is None else trace.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError("layer continuation selected counter is invalid")
+                request[field] = value
+            request_layers: dict[str, dict[str, Any]] = {}
+            known_layers = (
+                sorted(trace_layers, key=lambda value: int(value))
+                if trace_layers
+                else sorted(
+                    bank_work.get("layers", {}),
+                    key=lambda value: int(value),
+                )
+            )
+            for layer in known_layers:
+                is_selected = selected_layer is not None and int(layer) == selected_layer
+                trace_row = trace_layers.get(str(layer), {})
+                if not isinstance(trace_row, Mapping):
+                    raise TypeError("layer continuation layer metrics are invalid")
+                selected_counters: dict[str, int] = {}
+                for field in _LAYER_CONTEXTUAL_SELECTED_COUNTERS:
+                    value = trace_row.get(field, 0)
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value < 0
+                    ):
+                        raise ValueError(
+                            "layer continuation layer counter is invalid"
+                        )
+                    selected_counters[field] = value
+                request_layers[str(layer)] = {
+                    "selected": is_selected,
+                    **selected_counters,
+                }
+            request["layers"] = request_layers
+            if selected is not None:
+                token_ids = selected.get("token_ids", ())
+                if not isinstance(token_ids, Sequence):
+                    raise TypeError("layer continuation selected tokens are invalid")
+                request["selected"] = {
+                    "cell_sha256": selected.get("cell_sha256"),
+                    "layer": selected_layer,
+                    "proposed_tokens": len(token_ids),
+                    "transaction_sha256": selected.get("transaction_sha256"),
+                }
+        except Exception as exc:
+            error = f"{type(exc).__module__}.{type(exc).__qualname__}"
+            request["accounting_error"] = error
+            request["status"] = "accounting-error"
+        return request
+
     def _base_evidence(self) -> dict[str, Any]:
         evidence: dict[str, Any] = {
             "execution": "local-authenticated-causal-bundle/v1",
@@ -5730,6 +6318,16 @@ class Qwen38CausalChat:
             evidence["contextual_continuation"] = (
                 self._contextual_continuation_bank.metrics().to_dict()
             )
+        if self._layer_contextual_continuation_bank is not None:
+            layer_metrics, accounting_error = (
+                self._layer_contextual_continuation_metrics()
+            )
+            layer_evidence = self._layer_contextual_continuation_evidence(
+                layer_metrics,
+                accounting_error,
+            )
+            assert layer_evidence is not None
+            evidence["layer_contextual_continuation"] = layer_evidence
         if self._attention_output_crystal_bank is not None:
             identity = self._attention_output_crystal_bank.identity
             evidence["attention_output_crystal"] = {
@@ -6023,6 +6621,12 @@ class Qwen38CausalChat:
                     state_path,
                     contextual_identity,
                 )
+            layer_contextual_continuation_bank = (
+                self._open_layer_contextual_continuation_bank(
+                    runtime,
+                    tokenizer_sha256=str(tokenizer_sha256),
+                )
+            )
             attention_output_crystal_bank = None
             if self._attention_output_crystal_state_path is not None:
                 runtime_math_identity = getattr(
@@ -6330,6 +6934,20 @@ class Qwen38CausalChat:
                     )
         except Exception as exc:
             self._load_error = f"{type(exc).__name__}: {exc}"
+            if self._layer_contextual_continuation_state_path is not None:
+                detach = getattr(
+                    getattr(runtime, "model", None),
+                    "attach_layer_contextual_continuation",
+                    None,
+                )
+                if callable(detach):
+                    try:
+                        detach(None)
+                    except Exception as detach_exc:
+                        self._load_error += (
+                            "; tracker detach: "
+                            f"{type(detach_exc).__name__}: {detach_exc}"
+                        )
             close = getattr(runtime, "close", None)
             if callable(close):
                 try:
@@ -6345,6 +6963,9 @@ class Qwen38CausalChat:
         self._markov_atlas = markov_atlas
         self._markov_o1_retention = markov_o1_retention
         self._contextual_continuation_bank = contextual_continuation_bank
+        self._layer_contextual_continuation_bank = (
+            layer_contextual_continuation_bank
+        )
         self._compatible_contextual_continuation_identity_sha256s = (
             compatible_contextual_identities
         )
@@ -6973,6 +7594,10 @@ class Qwen38CausalChat:
         )
         layer_mlp_crystal_before = self._layer_mlp_crystal_metrics(runtime)
         mlp_page_coordinate_before = self._mlp_page_coordinate_metrics()
+        (
+            layer_contextual_continuation_before,
+            layer_contextual_continuation_before_error,
+        ) = self._layer_contextual_continuation_metrics()
         layer_mlp_o1_worker = self._layer_mlp_o1_worker
         layer_mlp_o1_pool = self._layer_mlp_o1_pool
         layer_mlp_o1_selected = (
@@ -7159,6 +7784,10 @@ class Qwen38CausalChat:
                     f"{type(exc).__module__}.{type(exc).__qualname__}: {exc}"
                 )
         mlp_page_after = None if mlp_page_router is None else mlp_page_router.metrics()
+        (
+            layer_contextual_continuation_after,
+            layer_contextual_continuation_after_error,
+        ) = self._layer_contextual_continuation_metrics()
         physical_read_after = _linux_process_read_bytes()
         process_usage_after = _process_usage_snapshot()
         generated_ids = _token_ids(raw_generated, "generated output")
@@ -7344,6 +7973,25 @@ class Qwen38CausalChat:
                 **_process_usage_delta(process_usage_before, process_usage_after),
             },
         }
+        if self._layer_contextual_continuation_bank is not None:
+            layer_contextual_evidence = (
+                self._layer_contextual_continuation_evidence(
+                    layer_contextual_continuation_after,
+                    layer_contextual_continuation_after_error,
+                )
+            )
+            assert layer_contextual_evidence is not None
+            layer_contextual_evidence["request"] = (
+                self._layer_contextual_continuation_request_delta(
+                    layer_contextual_continuation_before,
+                    layer_contextual_continuation_after,
+                    before_error=(layer_contextual_continuation_before_error),
+                    after_error=(layer_contextual_continuation_after_error),
+                )
+            )
+            evidence["layer_contextual_continuation"] = (
+                layer_contextual_evidence
+            )
         if layer_mlp_o1_request is not None:
             collection = dict(evidence["layer_mlp_o1_collection"])
             collection["request"] = layer_mlp_o1_request
@@ -8201,6 +8849,9 @@ class Qwen38CausalChat:
 
             runtime = self._runtime
             draft_runtime = self._draft_runtime
+            detach_layer_contextual_continuation = (
+                self._layer_contextual_continuation_bank is not None
+            )
             if runtime is not None and self._pending_page_runtime_reward is not None:
                 page_router = getattr(runtime, "mlp_page_router", None)
                 abort_reward = getattr(
@@ -8222,6 +8873,7 @@ class Qwen38CausalChat:
             self._markov_atlas = None
             self._markov_o1_retention = None
             self._contextual_continuation_bank = None
+            self._layer_contextual_continuation_bank = None
             self._compatible_contextual_continuation_identity_sha256s = ()
             self._attention_output_crystal_bank = None
             self._layer_transition_crystal_bank = None
@@ -8240,6 +8892,23 @@ class Qwen38CausalChat:
             self._clear_conversation_binding()
             self._closed = True
             if runtime is not None:
+                if (
+                    detach_layer_contextual_continuation
+                    and not isinstance(runtime, _OwnedRuntime)
+                ):
+                    detach = getattr(
+                        getattr(runtime, "model", None),
+                        "attach_layer_contextual_continuation",
+                        None,
+                    )
+                    if callable(detach):
+                        try:
+                            detach(None)
+                        except Exception as exc:
+                            record_close_error(
+                                "tracker detach: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
                 try:
                     runtime.close()
                 except Exception as exc:

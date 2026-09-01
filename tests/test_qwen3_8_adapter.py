@@ -39,6 +39,10 @@ from immer.runtimes.ooe.result_cells import (
 from immer.runtimes.ooe.compute_crystals import ComputeCrystal, ComputeCrystalBank
 from immer.runtimes.ooe.compute_graph import ComputeOperatorGraph, OperatorEdge
 from immer.runtimes.qwen3_8.adapter import (
+    DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_LAYERS,
+    DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_PROJECTION_SEED,
+    LAYER_CONTEXTUAL_CONTINUATION_EVIDENCE_SCHEMA,
+    LAYER_CONTEXTUAL_CONTINUATION_REQUEST_SCHEMA,
     LAYER_MLP_CRYSTAL_EVIDENCE_SCHEMA,
     LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA,
     QWEN38_CHAT_HISTORY_METADATA,
@@ -86,6 +90,13 @@ from immer.runtimes.qwen3_8.layer_mlp_o1 import (
 from immer.runtimes.qwen3_8.layer_mlp_o1_runtime import (
     Layer63MlpO1AsyncWorker,
     LayerMlpO1AsyncPool,
+)
+from immer.runtimes.qwen3_8.layer_contextual_continuation import (
+    DEFAULT_LAYER_CONTEXTUAL_SKETCH_DIM,
+    LAYER_CONTEXTUAL_CONTINUATION_METRICS_SCHEMA,
+    LAYER_CONTEXTUAL_PROJECTION_ABI,
+    LAYER_CONTEXTUAL_STAGE,
+    LayerContextualContinuationBank,
 )
 from immer.runtimes.qwen3_8.layer_mlp_registry import (
     publish_layer_mlp_o1_registry,
@@ -452,6 +463,33 @@ class _Model:
     def set_delta_head_router(self, router):
         self.delta_head_router = router
         self.delta_head_router_calls.append(router)
+
+
+class _LayerContextualModel(_Model):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config.dim = 8
+        self.config.n_layers = 64
+        self.layer_contextual_continuation_identity = None
+        self.layer_contextual_attach_calls = []
+
+    @staticmethod
+    def layer_contextual_continuation_model_sha256() -> str:
+        return "2" * 64
+
+    @staticmethod
+    def layer_contextual_continuation_q4_sha256() -> str:
+        return "3" * 64
+
+    def attach_layer_contextual_continuation(self, identity) -> None:
+        self.layer_contextual_continuation_identity = identity
+        self.layer_contextual_attach_calls.append(identity)
+
+    def current_layer_contextual_continuation_transaction(self):
+        return None
+
+    def layer_contextual_continuation_transactions_since(self, _boundary=-1):
+        return ()
 
 
 class _StreamingModel(_Model):
@@ -1493,6 +1531,341 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(state_path.suffix, ".json")
         self.assertIs(chat._contextual_continuation_bank.identity, identity)
         chat.close()
+
+    def test_layer_contextual_bank_attaches_canonical_path_free_identity(self) -> None:
+        model = _LayerContextualModel()
+        runtime = _Runtime(model=model)
+        with tempfile.TemporaryDirectory() as temporary:
+            configured = Path(temporary) / "layer-context.json"
+            chat = _chat(
+                runtime,
+                draft_mode="markov",
+                q4_root="/q4",
+                layer_contextual_continuation_state_path=configured,
+                layer_contextual_continuation_max_cells=32,
+                layer_contextual_continuation_max_receipts=64,
+            )
+
+            chat._load_locked()
+
+            bank = chat._layer_contextual_continuation_bank
+            self.assertIsInstance(bank, LayerContextualContinuationBank)
+            assert bank is not None
+            identity = bank.identity
+            self.assertEqual(identity.model_sha256, "2" * 64)
+            self.assertEqual(identity.q4_sha256, "3" * 64)
+            self.assertEqual(identity.tokenizer_sha256, _DIGEST)
+            self.assertEqual(
+                identity.layers,
+                DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_LAYERS,
+            )
+            self.assertEqual(identity.sketch_dim, DEFAULT_LAYER_CONTEXTUAL_SKETCH_DIM)
+            self.assertEqual(
+                identity.projection_seed,
+                DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_PROJECTION_SEED,
+            )
+            self.assertEqual(identity.projection_abi, LAYER_CONTEXTUAL_PROJECTION_ABI)
+            self.assertEqual(identity.stage, LAYER_CONTEXTUAL_STAGE)
+            self.assertNotEqual(bank.state_path, configured)
+            self.assertIn(identity.identity_sha256[:16], bank.state_path.name)
+            self.assertNotIn(str(configured), json.dumps(identity.to_record()))
+            self.assertIs(model.layer_contextual_attach_calls[0], identity)
+
+            chat.close()
+
+        self.assertIsNone(model.layer_contextual_attach_calls[-1])
+
+    def test_layer_contextual_tracker_is_absent_without_markov(self) -> None:
+        model = _LayerContextualModel()
+        chat = _chat(_Runtime(model=model), q4_root="/q4")
+
+        chat._load_locked()
+        chat.close()
+
+        self.assertIsNone(chat._layer_contextual_continuation_bank)
+        self.assertEqual(model.layer_contextual_attach_calls, [])
+        with self.assertRaisesRegex(ValueError, "Markov or hybrid"):
+            _chat(
+                _Runtime(model=_LayerContextualModel()),
+                draft_mode="mtp",
+                q4_root="/q4",
+                layer_contextual_continuation_state_path="/state/layer.json",
+            )
+
+    def test_layer_contextual_bank_and_model_callables_reach_markov_provider(
+        self,
+    ) -> None:
+        model = _LayerContextualModel()
+        runtime = _Runtime(model=model)
+        provider = SimpleNamespace(
+            close=Mock(),
+            metrics=Mock(
+                return_value=SimpleNamespace(
+                    source_body_bytes=0,
+                    linear_calls=0,
+                    to_dict=lambda: {},
+                )
+            ),
+        )
+        row = SimpleNamespace(
+            accepted_prefix_length=0,
+            emitted_token_ids=(7, 8),
+            forward_passes=1,
+            proposed_token_ids=(),
+            provider_proposed_token_ids=(),
+            round_index=0,
+            round_policy=None,
+            target_token_ids=(7, 8),
+            window_size=4,
+        )
+        generated = SimpleNamespace(
+            token_ids=(7, 8),
+            evidence=SimpleNamespace(
+                accepted_draft_tokens=0,
+                adaptive_windows=True,
+                final_state_committed=False,
+                forward_passes=1,
+                generated_token_ids=(7, 8),
+                linear_calls=1,
+                prefill_forward_passes=0,
+                prompt_token_ids=(11, 12),
+                rounds=(row,),
+                schema="fixture.layer-context-generation/v1",
+                seconds=0.1,
+                source_body_bytes=1,
+                state_bytes=0,
+                stopped_on_eos=False,
+                used_window_sizes=(4,),
+                window_size=4,
+            ),
+        )
+        decoder = SimpleNamespace(generate_rolling=Mock(return_value=generated))
+        with tempfile.TemporaryDirectory() as temporary:
+            chat = _chat(
+                runtime,
+                draft_mode="markov",
+                draft_window=4,
+                max_new_tokens=4,
+                q4_root="/q4",
+                layer_contextual_continuation_state_path=(
+                    Path(temporary) / "layer.json"
+                ),
+            )
+            chat._load_locked()
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter."
+                    "FingerprintRollingK4DraftProvider",
+                    return_value=provider,
+                ) as constructor,
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+                    return_value=decoder,
+                ),
+            ):
+                chat._generate_locked(
+                    runtime,
+                    (11, 12),
+                    {
+                        "eos_token_ids": (IM_END_TOKEN_ID,),
+                        "head_block_rows": 17,
+                        "max_new_tokens": 4,
+                        "prefill_tokenwise": False,
+                    },
+                )
+
+            options = constructor.call_args.kwargs
+            self.assertIs(
+                options["layer_contextual_continuation_bank"],
+                chat._layer_contextual_continuation_bank,
+            )
+            self.assertIs(
+                options["layer_contextual_current_transaction"].__self__,
+                model,
+            )
+            self.assertIs(
+                options["layer_contextual_transactions_since"].__self__,
+                model,
+            )
+            self.assertEqual(model.calls, [])
+            decoder.generate_rolling.assert_called_once()
+            chat.close()
+
+    def test_layer_contextual_attach_precedes_anchor_and_evidence_is_path_free(
+        self,
+    ) -> None:
+        model = _AnchorModel()
+        model.generated = (7,)
+        model.config.dim = 8
+        model.layer_contextual_continuation_identity = None
+        model.layer_contextual_attach_calls = []
+        model.layer_contextual_continuation_model_sha256 = lambda: "2" * 64
+        model.layer_contextual_continuation_q4_sha256 = lambda: "3" * 64
+
+        def attach(identity) -> None:
+            model.layer_contextual_continuation_identity = identity
+            model.layer_contextual_attach_calls.append(identity)
+
+        model.attach_layer_contextual_continuation = attach
+        model.current_layer_contextual_continuation_transaction = lambda: None
+        model.layer_contextual_continuation_transactions_since = (
+            lambda _boundary=-1: ()
+        )
+        anchor_generate = model.generate_greedy
+
+        def generate(prompt, **kwargs):
+            generated, evidence = anchor_generate(prompt, **kwargs)
+            return generated, {**evidence, "forward_passes": 0}
+
+        model.generate_greedy = generate
+        cache = _anchor_cache()
+        restore = cache.restore_deepest.side_effect
+
+        def assert_attached(target, token_ids):
+            self.assertIsNotNone(target.layer_contextual_continuation_identity)
+            return restore(target, token_ids)
+
+        cache.restore_deepest.side_effect = assert_attached
+        with tempfile.TemporaryDirectory() as temporary:
+            configured = Path(temporary) / "private-layer-bank.json"
+            chat = _chat(
+                _Runtime(model=model),
+                anchor_cache=cache,
+                draft_mode="markov",
+                max_new_tokens=1,
+                q4_root="/q4",
+                layer_contextual_continuation_state_path=configured,
+            )
+
+            result = chat.handle(Request("chat", "hello"))
+
+            self.assertTrue(result.ok, result.reason)
+            layer = result.evidence["layer_contextual_continuation"]
+            self.assertEqual(layer["schema"], LAYER_CONTEXTUAL_CONTINUATION_EVIDENCE_SCHEMA)
+            self.assertEqual(
+                layer["metrics"]["schema"],
+                LAYER_CONTEXTUAL_CONTINUATION_METRICS_SCHEMA,
+            )
+            self.assertEqual(
+                layer["request"]["schema"],
+                LAYER_CONTEXTUAL_CONTINUATION_REQUEST_SCHEMA,
+            )
+            self.assertEqual(
+                sorted(int(value) for value in layer["request"]["layers"]),
+                list(DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_LAYERS),
+            )
+            serialized = json.dumps(layer, sort_keys=True)
+            self.assertNotIn(str(configured), serialized)
+            self.assertNotIn("hello", serialized)
+            self.assertNotIn("keys", serialized)
+            self.assertNotIn("hidden_states", serialized)
+            self.assertNotIn('"text"', serialized)
+            self.assertEqual(result.evidence["generation"]["forward_passes"], 0)
+            chat.close()
+
+    def test_layer_contextual_persistent_corruption_fails_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            configured = Path(temporary) / "layer.json"
+            first = _chat(
+                _Runtime(model=_LayerContextualModel()),
+                draft_mode="markov",
+                q4_root="/q4",
+                layer_contextual_continuation_state_path=configured,
+            )
+            first._load_locked()
+            bank = first._layer_contextual_continuation_bank
+            assert bank is not None
+            bank.state_path.write_bytes(b"not an authenticated bank")
+            first.close()
+            second = _chat(
+                _Runtime(model=_LayerContextualModel()),
+                draft_mode="markov",
+                q4_root="/q4",
+                layer_contextual_continuation_state_path=configured,
+            )
+
+            with self.assertRaisesRegex(Qwen38ChatError, "Integrity|canonical|JSON"):
+                second._load_locked()
+
+            self.assertFalse(second.loaded)
+            second.close()
+
+    def test_layer_contextual_request_separates_bank_work_from_selected_tail(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            chat = _chat(
+                _Runtime(model=_LayerContextualModel()),
+                draft_mode="markov",
+                q4_root="/q4",
+                layer_contextual_continuation_state_path=(
+                    Path(temporary) / "layer.json"
+                ),
+                layer_contextual_continuation_layers=(18, 27),
+            )
+            chat._load_locked()
+            metrics, error = chat._layer_contextual_continuation_metrics()
+            assert metrics is not None
+            bank = chat._layer_contextual_continuation_bank
+            assert bank is not None
+            per_layer = {
+                "18": {
+                    "crystal_accepted_tokens": 3,
+                    "crystal_mismatches": 0,
+                    "crystal_proposed_tokens": 3,
+                    "crystal_verified_tokens": 3,
+                },
+                "27": {
+                    "crystal_accepted_tokens": 1,
+                    "crystal_mismatches": 1,
+                    "crystal_proposed_tokens": 3,
+                    "crystal_verified_tokens": 2,
+                },
+            }
+            chat._last_draft_evidence = {
+                "provider": {
+                    "layer_context_crystal": {
+                        "identity_sha256": bank.identity.identity_sha256,
+                        "layers": per_layer,
+                        "crystal_accepted_tokens": 4,
+                        "crystal_mismatches": 1,
+                        "crystal_proposed_tokens": 6,
+                        "crystal_verified_tokens": 5,
+                        "schema": (
+                            "immer.qwen3.8-layer-context-crystal-provider-trace/v1"
+                        ),
+                        "selected": {
+                            "cell_sha256": "4" * 64,
+                            "layer": 27,
+                            "token_ids": [7, 8, 9],
+                            "transaction_sha256": "5" * 64,
+                        },
+                    }
+                }
+            }
+
+            request = chat._layer_contextual_continuation_request_delta(
+                metrics,
+                metrics,
+                before_error=error,
+                after_error=error,
+            )
+
+            self.assertEqual(request["crystal_proposed_tokens"], 6)
+            self.assertEqual(request["crystal_verified_tokens"], 5)
+            self.assertEqual(request["crystal_accepted_tokens"], 4)
+            self.assertEqual(request["crystal_mismatches"], 1)
+            self.assertEqual(
+                sum(
+                    row["crystal_accepted_tokens"]
+                    for row in request["layers"].values()
+                ),
+                4,
+            )
+            self.assertEqual(request["selected"]["proposed_tokens"], 3)
+            self.assertEqual(request["bank_work"]["crystal_queries"], 0)
+            self.assertNotIn("crystal_proposed_tokens", request["bank_work"])
+            chat.close()
 
     def test_draft_window_migrates_from_authenticated_previous_context_bank(
         self,

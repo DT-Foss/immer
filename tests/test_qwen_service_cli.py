@@ -4,12 +4,13 @@ from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 
-from immer.cli import main
+from immer.cli import _qwen38_service_profile, main
 from immer.contracts import ExecutionStatus, Result
 from immer.runtimes.qwen3_8.service import (
     QwenServiceRequest,
@@ -367,6 +368,108 @@ class QwenServiceCliTests(unittest.TestCase):
         options = constructor.call_args.kwargs
         self.assertEqual(options["layer_mlp_o1_layers"], (0, 63))
         self.assertEqual(options["layer_mlp_o1_state_path"], str(state))
+
+    def test_layer_contextual_service_profile_is_path_free_and_pins_capacity(
+        self,
+    ) -> None:
+        server_args = SimpleNamespace(
+            layer_contextual_continuation_max_cells=4096,
+            layer_contextual_continuation_max_receipts=65_536,
+            layer_contextual_continuation_state=Path("/server/private.json"),
+        )
+        client_args = SimpleNamespace(
+            layer_contextual_continuation_max_cells=4096,
+            layer_contextual_continuation_max_receipts=65_536,
+            layer_contextual_continuation_state=Path("/client/private.json"),
+        )
+        common = {
+            "bundle_path": Path("/models/qwen"),
+            "tokenizer_path": Path("/models/qwen/tokenizer.json"),
+            "q4_root": Path("/models/qwen/q4"),
+            "fast_mlp_root": None,
+            "warm_root": None,
+            "draft_mode": "markov",
+            "markov_draft_state": None,
+            "mtp_draft_state": None,
+            "markov_atlas_path": None,
+            "markov_o1_retention_path": None,
+            "mlp_page_state_path": None,
+            "draft_window_state_path": None,
+            "runtime_code_revision": "a" * 64,
+        }
+
+        server = _qwen38_service_profile(args=server_args, **common)
+        client = _qwen38_service_profile(args=client_args, **common)
+        client_args.layer_contextual_continuation_max_cells = 2048
+        changed_capacity = _qwen38_service_profile(args=client_args, **common)
+        client_args.layer_contextual_continuation_state = None
+        disabled = _qwen38_service_profile(args=client_args, **common)
+
+        self.assertEqual(server, client)
+        self.assertNotEqual(client, changed_capacity)
+        self.assertNotEqual(changed_capacity, disabled)
+
+    def test_service_forwards_layer_contextual_state_and_capacities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            q4 = root / "q4"
+            q4.mkdir()
+            state = root / "layer-context.json"
+
+            def construct(*_args, **options):
+                return _ServiceQwen(options["text_snapshot_sink"])
+
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    side_effect=construct,
+                ) as constructor,
+                patch(
+                    "immer.runtimes.qwen3_8.encoding.Qwen38Tokenizer",
+                    return_value=_Tokenizer(),
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.service.UnixQwenServiceServer",
+                    _InlineServer,
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "--service",
+                        "--raw-qwen",
+                        "--qwen38-causal-bundle",
+                        str(root / "qwen.causal"),
+                        "--qwen38-tokenizer",
+                        str(root / "tokenizer.json"),
+                        "--qwen38-q4",
+                        str(q4),
+                        "--draft-mode",
+                        "markov",
+                        "--layer-contextual-continuation-state",
+                        str(state),
+                        "--layer-contextual-continuation-max-cells",
+                        "17",
+                        "--layer-contextual-continuation-max-receipts",
+                        "19",
+                        "--socket",
+                        str(root / "qwen.sock"),
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(
+            options["layer_contextual_continuation_state_path"],
+            str(state),
+        )
+        self.assertEqual(options["layer_contextual_continuation_max_cells"], 17)
+        self.assertEqual(
+            options["layer_contextual_continuation_max_receipts"],
+            19,
+        )
 
 
 if __name__ == "__main__":

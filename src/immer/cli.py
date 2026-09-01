@@ -147,6 +147,9 @@ _QWEN38_DEPLOYMENT_Q4_RESIDENT_BUDGET_MB = 13_312
 _QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-contextual-continuation-v1.json"
 )
+_QWEN38_DEPLOYMENT_LAYER_CONTEXTUAL_CONTINUATION_STATE = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-layer-contextual-continuation-v2.json"
+)
 _QWEN38_DEPLOYMENT_ATTENTION_OUTPUT_CRYSTAL_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-attention-output-crystal-v1.json"
 )
@@ -274,6 +277,60 @@ def _authenticate_layer_transition_crystal_compute_graph(
     except Exception as exc:
         raise ValueError(f"{option} is unavailable or unauthenticated") from exc
     raise ValueError(f"{subject} bank belongs to a foreign Compute graph authority")
+
+
+def _qwen38_layer_contextual_continuation_policy(
+    args: argparse.Namespace,
+) -> dict[str, object] | None:
+    """Return the canonical path-free v2 layer-continuation configuration."""
+
+    configured = getattr(args, "layer_contextual_continuation_state", None)
+    if configured is None:
+        return None
+    from .runtimes.qwen3_8.adapter import (
+        DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_LAYERS,
+        DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_PROJECTION_SEED,
+        _layer_contextual_continuation_runtime_sha256,
+    )
+    from .runtimes.qwen3_8.layer_contextual_continuation import (
+        DEFAULT_LAYER_CONTEXTUAL_SKETCH_DIM,
+        LAYER_CONTEXTUAL_CONTINUATION_IDENTITY_SCHEMA,
+        LAYER_CONTEXTUAL_PROJECTION_ABI,
+        LAYER_CONTEXTUAL_STAGE,
+    )
+
+    max_cells = getattr(args, "layer_contextual_continuation_max_cells", 4096)
+    max_receipts = getattr(
+        args,
+        "layer_contextual_continuation_max_receipts",
+        65_536,
+    )
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= 65_536
+        for value in (max_cells, max_receipts)
+    ):
+        raise ValueError(
+            "layer contextual continuation capacities must lie in [1, 65536]"
+        )
+    return {
+        "enabled": True,
+        "identity": {
+            "identity_schema": LAYER_CONTEXTUAL_CONTINUATION_IDENTITY_SCHEMA,
+            "layers": list(DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_LAYERS),
+            "projection": {
+                "abi": LAYER_CONTEXTUAL_PROJECTION_ABI,
+                "seed": DEFAULT_LAYER_CONTEXTUAL_CONTINUATION_PROJECTION_SEED,
+                "sketch_dim": DEFAULT_LAYER_CONTEXTUAL_SKETCH_DIM,
+            },
+            "runtime_sha256": _layer_contextual_continuation_runtime_sha256(),
+            "stage": LAYER_CONTEXTUAL_STAGE,
+        },
+        "max_cells": max_cells,
+        "max_receipts": max_receipts,
+        "schema": "immer.qwen3.8-layer-contextual-continuation-policy/v2",
+    }
 
 
 def _qwen38_layer_transition_crystal_policy(
@@ -957,6 +1014,9 @@ def _qwen38_service_profile(
 
     profile = {
         "attention_output_crystal": (attention_output_crystal_state_path is not None),
+        "layer_contextual_continuation": (
+            _qwen38_layer_contextual_continuation_policy(args)
+        ),
         "layer_mlp_crystal": _qwen38_layer_mlp_crystal_policy(args),
         "layer_mlp_o1": _qwen38_layer_mlp_o1_policy(args),
         "layer_transition_crystal": (_qwen38_layer_transition_crystal_policy(args)),
@@ -1122,6 +1182,9 @@ def _qwen38_growing_warm_profile(
             }
         ),
         "layer_transition_crystal": (_qwen38_layer_transition_crystal_policy(args)),
+        "layer_contextual_continuation": (
+            _qwen38_layer_contextual_continuation_policy(args)
+        ),
         "layer_mlp_crystal": _qwen38_layer_mlp_crystal_policy(args),
         "layer_mlp_o1": _qwen38_layer_mlp_o1_policy(args),
         "mlp_page_coordinate": (
@@ -2275,6 +2338,58 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 "contextual continuation Crystals require Q4 Markov or hybrid drafting"
             )
         args.context_crystal_state = context_crystal_state_path
+        disable_layer_contextual_continuation = bool(
+            getattr(args, "no_layer_contextual_continuation", False)
+        )
+        if disable_layer_contextual_continuation and getattr(
+            args,
+            "layer_contextual_continuation_state",
+            None,
+        ) is not None:
+            raise ValueError(
+                "--layer-contextual-continuation-state and "
+                "--no-layer-contextual-continuation are mutually exclusive"
+            )
+        layer_contextual_continuation_state_path = (
+            None
+            if disable_layer_contextual_continuation
+            else _chat_path(
+                getattr(args, "layer_contextual_continuation_state", None),
+                "IMMER_QWEN38_LAYER_CONTEXTUAL_CONTINUATION_STATE",
+            )
+        )
+        if (
+            not disable_layer_contextual_continuation
+            and layer_contextual_continuation_state_path is None
+            and draft_mode in {"hybrid", "markov"}
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+            and q4_root is not None
+        ):
+            layer_contextual_continuation_state_path = (
+                _QWEN38_DEPLOYMENT_LAYER_CONTEXTUAL_CONTINUATION_STATE
+            )
+        if layer_contextual_continuation_state_path is not None and (
+            draft_mode not in {"hybrid", "markov"} or q4_root is None
+        ):
+            raise ValueError(
+                "layer contextual continuation requires Q4 Markov or hybrid "
+                "drafting"
+            )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 1 <= value <= 65_536
+            for value in (
+                args.layer_contextual_continuation_max_cells,
+                args.layer_contextual_continuation_max_receipts,
+            )
+        ):
+            raise ValueError(
+                "layer contextual continuation capacities must lie in [1, 65536]"
+            )
+        args.layer_contextual_continuation_state = (
+            layer_contextual_continuation_state_path
+        )
         disable_attention_output_crystal = bool(
             getattr(args, "no_attention_output_crystal", False)
         )
@@ -3149,6 +3264,17 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 None
                 if context_crystal_state_path is None
                 else str(context_crystal_state_path)
+            ),
+            layer_contextual_continuation_state_path=(
+                None
+                if layer_contextual_continuation_state_path is None
+                else str(layer_contextual_continuation_state_path)
+            ),
+            layer_contextual_continuation_max_cells=(
+                args.layer_contextual_continuation_max_cells
+            ),
+            layer_contextual_continuation_max_receipts=(
+                args.layer_contextual_continuation_max_receipts
             ),
             attention_output_crystal_state_path=(
                 None
@@ -4315,6 +4441,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-context-crystal",
         action="store_true",
         help="disable the deployed target-hidden continuation Crystal bank",
+    )
+    chat.add_argument(
+        "--layer-contextual-continuation-state",
+        "--layer-context-crystal-state",
+        dest="layer_contextual_continuation_state",
+        help=(
+            "persistent multi-layer Q8 continuation bank for target-verified "
+            "Markov drafting"
+        ),
+    )
+    chat.add_argument(
+        "--no-layer-contextual-continuation",
+        action="store_true",
+        help="disable the deployed multi-layer continuation bank",
+    )
+    chat.add_argument(
+        "--layer-contextual-continuation-max-cells",
+        "--layer-context-crystal-max-cells",
+        dest="layer_contextual_continuation_max_cells",
+        type=int,
+        default=4096,
+        metavar="N",
+        help="maximum persistent multi-layer continuation cells (default: 4096)",
+    )
+    chat.add_argument(
+        "--layer-contextual-continuation-max-receipts",
+        "--layer-context-crystal-max-receipts",
+        dest="layer_contextual_continuation_max_receipts",
+        type=int,
+        default=65_536,
+        metavar="N",
+        help=(
+            "maximum retry-safe multi-layer settlement receipts "
+            "(default: 65536)"
+        ),
     )
     chat.add_argument(
         "--attention-output-crystal-state",
