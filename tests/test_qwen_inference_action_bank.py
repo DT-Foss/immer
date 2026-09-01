@@ -175,6 +175,64 @@ class InferenceActionReceiptTests(unittest.TestCase):
             ),
         )
 
+    def test_executed_delta_head_work_is_recorded_as_coordinate_action(self) -> None:
+        economics = _economics("delta-head")
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "delta_head_router": {
+                    "schema": "immer.qwen3.8-packed-delta-head-router/v1",
+                    "request": {
+                        "calls": 2,
+                        "logical_bytes_saved": 4_096,
+                        "rows": 3,
+                    },
+                }
+            },
+        )
+        actions = executed_actions_from_result(result, economics)
+        self.assertEqual(
+            actions,
+            (
+                "dynamic_mlp_pages",
+                "mlp_head_coordinate",
+                "qwen_target",
+                "target_verified_draft",
+            ),
+        )
+
+    def test_delta_head_identity_without_saved_request_work_is_not_an_action(
+        self,
+    ) -> None:
+        economics = _economics("delta-head-inactive")
+        for missing_work in ("calls", "rows", "logical_bytes_saved"):
+            with self.subTest(missing_work=missing_work):
+                request = {
+                    "calls": 2,
+                    "logical_bytes_saved": 4_096,
+                    "rows": 3,
+                }
+                request[missing_work] = 0
+                result = Result(
+                    ExecutionStatus.OK,
+                    "qwen3.8.causal-chat",
+                    output="answer",
+                    evidence={
+                        "delta_head_router": {
+                            "schema": (
+                                "immer.qwen3.8-packed-delta-head-router/v1"
+                            ),
+                            "request": request,
+                        }
+                    },
+                )
+                self.assertNotIn(
+                    "mlp_head_coordinate",
+                    executed_actions_from_result(result, economics),
+                )
+
 
 class InferenceActionBankTests(unittest.TestCase):
     def test_observe_restart_duplicate_and_ranking(self) -> None:

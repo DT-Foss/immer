@@ -343,6 +343,40 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
     prefix_sinkhorn = evidence.get("prefix_sinkhorn")
     if isinstance(prefix_sinkhorn, dict):
         summary["prefix_sinkhorn"] = prefix_sinkhorn
+    delta_head_router = evidence.get("delta_head_router")
+    if isinstance(delta_head_router, dict):
+        compact_delta_head = {
+            key: delta_head_router[key]
+            for key in (
+                "head_dim",
+                "layers",
+                "max_selected_heads",
+                "q4_manifest_sha256",
+                "route_policy",
+                "schema",
+                "state_persistent",
+                "value_heads",
+                "width_actions",
+            )
+            if key in delta_head_router
+        }
+        request = delta_head_router.get("request")
+        if isinstance(request, dict):
+            compact_delta_head["request"] = {
+                key: request[key]
+                for key in (
+                    "calls",
+                    "full_equivalent_bytes",
+                    "logical_bytes_saved",
+                    "rows",
+                    "selected_blocks",
+                    "selected_heads",
+                    "sinkhorn_projections",
+                    "transitions",
+                )
+                if key in request
+            }
+        summary["delta_head_router"] = compact_delta_head
     draft = evidence.get("draft")
     if isinstance(draft, dict):
         compact_draft = {

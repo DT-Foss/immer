@@ -106,6 +106,7 @@ def executed_actions_from_result(
     anchor = execution.get("anchor_cache")
     conversation = execution.get("conversation")
     prefix_sinkhorn = execution.get("prefix_sinkhorn")
+    delta_head_router = execution.get("delta_head_router")
     battery_hit = (
         isinstance(anchor, Mapping) and anchor.get("status") == "hit"
     ) or (
@@ -119,6 +120,15 @@ def executed_actions_from_result(
         actions = tuple(sorted({*actions, "continuation_battery"}))
     if isinstance(prefix_sinkhorn, Mapping) and prefix_sinkhorn.get("active") is True:
         actions = tuple(sorted({*actions, "prefix_sinkhorn"}))
+    if isinstance(delta_head_router, Mapping):
+        request = delta_head_router.get("request")
+        if isinstance(request, Mapping) and all(
+            isinstance(request.get(field), int)
+            and not isinstance(request.get(field), bool)
+            and request.get(field, 0) > 0
+            for field in ("calls", "rows", "logical_bytes_saved")
+        ):
+            actions = tuple(sorted({*actions, "mlp_head_coordinate"}))
     return actions
 
 

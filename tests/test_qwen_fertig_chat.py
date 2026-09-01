@@ -371,6 +371,64 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertEqual(economics.saved_pages, 11)
         self.assertEqual(economics.process_peak_rss_bytes, 1024)
 
+    def test_qwen_receipt_keeps_compact_delta_head_execution(self) -> None:
+        base = _qwen_ok("ordinary answer")
+        qwen_result = Result(
+            base.status,
+            base.component,
+            output=base.output,
+            evidence={
+                **dict(base.evidence),
+                "delta_head_router": {
+                    "bank_root": "/private/q4",
+                    "head_dim": 128,
+                    "layers": [0, 1],
+                    "max_selected_heads": 40,
+                    "q4_manifest_sha256": "a" * 64,
+                    "route_policy": "mean-square+sinkhorn-first-order/v1",
+                    "schema": "immer.qwen3.8-packed-delta-head-router/v1",
+                    "state_path": "/private/delta-head.json",
+                    "state_persistent": True,
+                    "value_heads": 48,
+                    "width_actions": [24, 32, 40],
+                    "request": {
+                        "calls": 2,
+                        "full_equivalent_bytes": 600,
+                        "logical_bytes_saved": 200,
+                        "rows": 3,
+                        "schema": "immer.qwen3.8-delta-head-request/v1",
+                        "selected_blocks": 384,
+                        "selected_heads": 96,
+                        "sinkhorn_projections": 1,
+                        "transitions": 2,
+                        "width_32": 2,
+                    },
+                },
+            },
+        )
+        qwen = _Qwen(qwen_result)
+        with _patched_solver(
+            None,
+            _verification(
+                CandidateVerificationStatus.ABSTAINED,
+                candidate=None,
+                expected=None,
+            ),
+        ) as (fertig, _, _):
+            result = QwenFertigChat(qwen, fertig).handle(
+                Request("chat", MATH_QUESTION)
+            )
+
+        compact = _receipt(result)["qwen"]["delta_head_router"]
+        self.assertEqual(compact["layers"], [0, 1])
+        self.assertEqual(compact["width_actions"], [24, 32, 40])
+        self.assertEqual(compact["request"]["calls"], 2)
+        self.assertEqual(compact["request"]["rows"], 3)
+        self.assertEqual(compact["request"]["logical_bytes_saved"], 200)
+        self.assertNotIn("bank_root", compact)
+        self.assertNotIn("state_path", compact)
+        self.assertNotIn("width_32", compact["request"])
+
     def test_real_formula_and_rref_certificates_short_circuit_without_qwen(
         self,
     ) -> None:

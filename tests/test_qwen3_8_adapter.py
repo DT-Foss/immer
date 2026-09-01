@@ -742,6 +742,15 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 delta_head_router=None,
             )
             router = SimpleNamespace(close=Mock())
+            delta_router = SimpleNamespace(
+                close=Mock(),
+                snapshot_identity=Mock(
+                    return_value={
+                        "layers": [0],
+                        "schema": "fixture.delta-head/v1",
+                    }
+                ),
+            )
             with (
                 patch(
                     "immer.runtimes.qwen3_8.adapter.CausalWeightMount",
@@ -753,7 +762,13 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 ),
                 patch(
                     "immer.runtimes.qwen3_8.adapter.Qwen38Config.from_file",
-                    return_value=SimpleNamespace(n_layers=2, intermediate_size=128),
+                    return_value=SimpleNamespace(
+                        n_layers=2,
+                        intermediate_size=128,
+                        linear_num_value_heads=48,
+                        linear_value_head_dim=128,
+                        is_full_attention=lambda layer: layer == 1,
+                    ),
                 ),
                 patch(
                     "immer.runtimes.qwen3_8.adapter.Q4Bank.load",
@@ -771,6 +786,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     "immer.runtimes.qwen3_8.adapter.MlpPageMarkov",
                     return_value=router,
                 ) as page_constructor,
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.PackedDeltaHeadRouter",
+                    return_value=delta_router,
+                ) as delta_constructor,
                 patch(
                     "immer.runtimes.qwen3_8.adapter.Qwen38Tokenizer",
                     return_value=SimpleNamespace(),
@@ -793,6 +812,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     q4_root=root / "q4",
                     mlp_page_state_path=root / "pages.json",
                     mlp_page_route_width=2,
+                    delta_head_state_path=root / "delta.json",
+                    delta_head_active_layers=(0,),
                 )
 
             options = page_constructor.call_args.kwargs
@@ -801,6 +822,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
             self.assertEqual(options["n_layers"], 2)
             self.assertEqual(options["page_count"], 2)
             self.assertEqual(options["route_width"], 2)
+            delta_options = delta_constructor.call_args.kwargs
+            self.assertEqual(delta_options["active_layers"], (0,))
+            self.assertEqual(delta_options["state_path"], root / "delta.json")
+            self.assertIs(runtime.delta_head_router, delta_router)
             runtime.close()
             mount.close.assert_called_once_with()
 
@@ -1308,6 +1333,29 @@ class Qwen38CausalChatTests(unittest.TestCase):
         )
         self.assertEqual(component._device, "cpu")
         component.close()
+
+        component = Qwen38CausalChat(
+            "unused.causal",
+            "unused-tokenizer.json",
+            q4_root="/models/qwen-q4",
+            mlp_page_state_path="/state/mlp-pages.json",
+            delta_head_state_path="/state/delta-head.json",
+            delta_head_active_layers=(0, 2, 4),
+        )
+        self.assertIsNone(component._fast_mlp_paths)
+        self.assertEqual(component._delta_head_active_layers, (0, 2, 4))
+        component.close()
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires delta_head_state_path",
+        ):
+            Qwen38CausalChat(
+                "unused.causal",
+                "unused-tokenizer.json",
+                q4_root="/models/qwen-q4",
+                delta_head_active_layers=(0, 2),
+            )
 
         component = Qwen38CausalChat(
             "unused.causal",
@@ -2359,6 +2407,25 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(adapter_key, cli_key)
         chat.close()
 
+    def test_delta_head_runtime_does_not_publish_baseline_semantic_replay(
+        self,
+    ) -> None:
+        chat = _chat(
+            _Runtime(),
+            q4_root="/q4",
+            delta_head_state_path="/state/delta-head.json",
+            result_cell_code_revision=_DIGEST,
+        )
+
+        self.assertIsNone(
+            chat._result_cell_semantic_replay_receipt(
+                question="hello",
+                rendered_prompt="rendered hello",
+                prompt_ids=(11, 12),
+            )
+        )
+        chat.close()
+
     def test_authenticated_exact_anchor_bypasses_prefill_with_identical_output(
         self,
     ) -> None:
@@ -3051,10 +3118,35 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     markov_o1_retention_path=None,
                     runtime_code_revision="a" * 64,
                 )
+            args.delta_head_online_state = "/state/delta-head.json"
+            args.delta_head_layers = (0, 2, 4)
+            delta_enabled = _qwen38_growing_warm_profile(
+                args,
+                tokenizer_path=tokenizer,
+                q4_root=q4,
+                fast_mlp_root=None,
+                draft_mode="hybrid",
+                markov_atlas_path=None,
+                markov_o1_retention_path=None,
+                runtime_code_revision="a" * 64,
+            )
+            args.delta_head_layers = (0, 2)
+            delta_other_layers = _qwen38_growing_warm_profile(
+                args,
+                tokenizer_path=tokenizer,
+                q4_root=q4,
+                fast_mlp_root=None,
+                draft_mode="hybrid",
+                markov_atlas_path=None,
+                markov_o1_retention_path=None,
+                runtime_code_revision="a" * 64,
+            )
 
         self.assertNotEqual(current, changed)
         self.assertNotEqual(current, changed_mtp)
         self.assertNotEqual(current, changed_hybrid)
+        self.assertNotEqual(current, delta_enabled)
+        self.assertNotEqual(delta_enabled, delta_other_layers)
 
     def test_growing_warm_profile_supports_dynamic_q4_page_results(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4327,6 +4419,39 @@ class Qwen38CausalChatTests(unittest.TestCase):
             options["delta_head_state_path"],
             "/state/qwen-delta-head.json",
         )
+
+    def test_cli_wires_delta_heads_without_legacy_fast_mlp(self) -> None:
+        qwen = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--qwen38-q4",
+                        "/models/qwen-q4",
+                        "--delta-head-online-state",
+                        "/state/qwen-delta-head.json",
+                        "--delta-head-layers",
+                        "0,2,4",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertIsNone(options["fast_mlp_root"])
+        self.assertEqual(
+            options["delta_head_state_path"],
+            "/state/qwen-delta-head.json",
+        )
+        self.assertEqual(options["delta_head_active_layers"], (0, 2, 4))
 
     def test_cli_wires_native_prefix_sinkhorn_into_the_qwen_runtime(self) -> None:
         qwen = _chat(_Runtime())

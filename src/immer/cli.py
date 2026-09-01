@@ -314,6 +314,7 @@ def _qwen38_service_profile(
 
     argument_names = (
         "compute_dtype",
+        "delta_head_layers",
         "delta_head_online_state",
         "device",
         "draft_bundle",
@@ -524,6 +525,20 @@ def _qwen38_growing_warm_profile(
             else _QWEN38_MTP_DRAFT_ABI
             if draft_mode == "mtp"
             else None
+        ),
+        "delta_head_router": (
+            None
+            if getattr(args, "delta_head_online_state", None) is None
+            else {
+                "active_layers": (
+                    "all-linear-attention"
+                    if getattr(args, "delta_head_layers", None) is None
+                    else list(args.delta_head_layers)
+                ),
+                "max_selected_heads": 40,
+                "policy": "mean-square+sinkhorn-first-order/v1",
+                "width_actions": [24, 32, 40],
+            }
         ),
         "markov_provider_abi": (
             _QWEN38_MARKOV_DRAFT_ABI
@@ -1643,6 +1658,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             if args.raw_qwen
             or warm_profile_sha256 is None
             or bool(getattr(args, "prefix_sinkhorn", False))
+            or getattr(args, "delta_head_online_state", None) is not None
             else _qwen38_output_semantics(
                 args,
                 tokenizer_path=tokenizer_path,
@@ -2088,6 +2104,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             fast_mlp_active_layers=fast_mlp_layers,
             fast_mlp_selected_block_count=fast_mlp_blocks,
             delta_head_state_path=args.delta_head_online_state,
+            delta_head_active_layers=args.delta_head_layers,
             result_cell_code_revision=(
                 None
                 if warm_mount is None or warm_profile_sha256 is None
@@ -3246,6 +3263,14 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--delta-head-online-state",
         help="persistent Markov-Sinkhorn state for packed DeltaNet head routing",
+    )
+    chat.add_argument(
+        "--delta-head-layers",
+        type=_sorted_layer_list,
+        help=(
+            "linear-attention layers using packed DeltaNet head coordinates; "
+            "defaults to every DeltaNet layer"
+        ),
     )
     chat.add_argument(
         "--prefix-sinkhorn",

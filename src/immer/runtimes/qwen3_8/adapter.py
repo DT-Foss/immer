@@ -817,6 +817,7 @@ def _open_local_runtime(
     mlp_page_state_path: Path | None = None,
     mlp_page_route_width: int = 192,
     delta_head_state_path: Path | None = None,
+    delta_head_active_layers: Sequence[int] | None = None,
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
     exact_head_max_bytes: int = 128 * 1024**2,
@@ -959,19 +960,46 @@ def _open_local_runtime(
                 },
                 lookahead_prefetch=q4_bank.prefetch_mlp_pages,
             )
-        if (
-            q4_bank is not None
-            and delta_head_state_path is not None
-            and fast_mlp_mount is not None
-        ):
-            configured_delta_layers = fast_mlp_active_layers
+        if q4_bank is not None and delta_head_state_path is not None:
+            configured_delta_layers = delta_head_active_layers
+            borrowed_fast_layers = False
+            if configured_delta_layers is None and fast_mlp_mount is not None:
+                borrowed_fast_layers = True
+                configured_delta_layers = fast_mlp_active_layers
+                if configured_delta_layers is None:
+                    configured_delta_layers = tuple(
+                        fast_mlp_mount.executor.active_layers
+                    )
             if configured_delta_layers is None:
-                configured_delta_layers = tuple(fast_mlp_mount.executor.active_layers)
-            delta_layers = tuple(
-                layer
-                for layer in configured_delta_layers
-                if 0 <= layer < config.n_layers and not config.is_full_attention(layer)
-            )
+                delta_layers = tuple(
+                    layer
+                    for layer in range(config.n_layers)
+                    if not config.is_full_attention(layer)
+                )
+            else:
+                invalid_delta_layers = tuple(
+                    layer
+                    for layer in configured_delta_layers
+                    if layer >= config.n_layers
+                )
+                if invalid_delta_layers:
+                    raise Qwen38ChatError(
+                        "Delta head routing layer exceeds decoder depth"
+                    )
+                full_attention_layers = tuple(
+                    layer
+                    for layer in configured_delta_layers
+                    if config.is_full_attention(layer)
+                )
+                if full_attention_layers and not borrowed_fast_layers:
+                    raise Qwen38ChatError(
+                        "Delta head routing requires linear-attention layers"
+                    )
+                delta_layers = tuple(
+                    layer
+                    for layer in configured_delta_layers
+                    if not config.is_full_attention(layer)
+                )
             if delta_layers:
                 delta_head_router = PackedDeltaHeadRouter(
                     q4_bank,
@@ -1109,6 +1137,7 @@ def _open_official_runtime(
     mlp_page_state_path: Path | None = None,
     mlp_page_route_width: int = 192,
     delta_head_state_path: Path | None = None,
+    delta_head_active_layers: Sequence[int] | None = None,
     exact_head_root: Path | None = None,
     exact_head_block_rows: int | None = None,
     exact_head_max_bytes: int = 128 * 1024**2,
@@ -1142,6 +1171,7 @@ def _open_official_runtime(
         mlp_page_state_path=mlp_page_state_path,
         mlp_page_route_width=mlp_page_route_width,
         delta_head_state_path=delta_head_state_path,
+        delta_head_active_layers=delta_head_active_layers,
         exact_head_root=exact_head_root,
         exact_head_block_rows=exact_head_block_rows,
         exact_head_max_bytes=exact_head_max_bytes,
@@ -1201,6 +1231,7 @@ class Qwen38CausalChat:
         mlp_page_state_path: str | Path | None = None,
         mlp_page_route_width: int = 192,
         delta_head_state_path: str | Path | None = None,
+        delta_head_active_layers: Sequence[int] | None = None,
         range_markov_state_path: str | Path | None = None,
         range_prefetch_max_bytes: int = 64 * 1024**2,
         range_prefetch_min_support: int = 2,
@@ -1428,6 +1459,28 @@ class Qwen38CausalChat:
             (str, Path),
         ):
             raise TypeError("delta_head_state_path must be a local path or None")
+        if delta_head_active_layers is not None:
+            try:
+                delta_head_active_layers = tuple(delta_head_active_layers)
+            except TypeError as exc:
+                raise TypeError(
+                    "delta_head_active_layers must be an integer sequence"
+                ) from exc
+            if (
+                not delta_head_active_layers
+                or delta_head_active_layers
+                != tuple(sorted(set(delta_head_active_layers)))
+                or any(
+                    isinstance(layer, bool)
+                    or not isinstance(layer, int)
+                    or layer < 0
+                    for layer in delta_head_active_layers
+                )
+            ):
+                raise ValueError(
+                    "delta_head_active_layers must be sorted unique "
+                    "non-negative integers"
+                )
         if fast_mlp_active_layers is not None:
             try:
                 fast_mlp_active_layers = tuple(fast_mlp_active_layers)
@@ -1454,7 +1507,6 @@ class Qwen38CausalChat:
                 fast_mlp_active_layers,
                 fast_mlp_selected_block_count,
                 fast_mlp_online_state_path,
-                delta_head_state_path,
             )
         ):
             raise ValueError("fast-MLP options require fast_mlp_root")
@@ -1464,6 +1516,10 @@ class Qwen38CausalChat:
             raise ValueError("fast_mlp_selected_block_count requires Q4 execution")
         if delta_head_state_path is not None and q4_root is None:
             raise ValueError("delta_head_state_path requires Q4 execution")
+        if delta_head_active_layers is not None and delta_head_state_path is None:
+            raise ValueError(
+                "delta_head_active_layers requires delta_head_state_path"
+            )
         if mlp_page_state_path is not None:
             if q4_root is None:
                 raise ValueError("mlp_page_state_path requires Q4 execution")
@@ -1577,6 +1633,7 @@ class Qwen38CausalChat:
             if delta_head_state_path is None
             else Path(delta_head_state_path).expanduser().absolute()
         )
+        self._delta_head_active_layers = delta_head_active_layers
         self._range_markov_state_path = (
             None
             if range_markov_state_path is None
@@ -1873,8 +1930,26 @@ class Qwen38CausalChat:
                     if key in receipt:
                         policy["fast_mlp"]["artifacts"][key] = receipt[key]
         if self._delta_head_state_path is not None:
+            runtime = self._runtime
+            receipt = (
+                None
+                if runtime is None
+                else getattr(runtime, "delta_head_receipt", None)
+            )
+            active_layers: object
+            if isinstance(receipt, Mapping) and isinstance(
+                receipt.get("layers"),
+                list,
+            ):
+                active_layers = receipt["layers"]
+            elif self._delta_head_active_layers is not None:
+                active_layers = list(self._delta_head_active_layers)
+            elif self._fast_mlp_paths is not None:
+                active_layers = "fast-mlp-active-layers"
+            else:
+                active_layers = "all-linear-attention"
             policy["delta_head_router"] = {
-                "active_layers": list(self._fast_mlp_active_layers or ()),
+                "active_layers": active_layers,
                 "max_selected_heads": 40,
                 "policy": "mean-square+sinkhorn-first-order/v1",
                 "persistent": True,
@@ -2108,7 +2183,11 @@ class Qwen38CausalChat:
         rendered_prompt: str,
         prompt_ids: tuple[int, ...],
     ) -> dict[str, object] | None:
-        if self._result_cell_code_revision is None or self._q4_root is None:
+        if (
+            self._result_cell_code_revision is None
+            or self._q4_root is None
+            or self._delta_head_state_path is not None
+        ):
             return None
         from .cartography_probe import prompt_token_sha256
         from .output_semantics import (
@@ -2253,6 +2332,7 @@ class Qwen38CausalChat:
             mlp_page_state_path=self._mlp_page_state_path,
             mlp_page_route_width=self._mlp_page_route_width,
             delta_head_state_path=self._delta_head_state_path,
+            delta_head_active_layers=self._delta_head_active_layers,
             exact_head_root=self._exact_head_root,
             exact_head_block_rows=self._head_block_rows,
             exact_head_max_bytes=self._exact_head_max_bytes,
