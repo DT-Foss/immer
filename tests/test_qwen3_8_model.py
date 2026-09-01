@@ -1492,6 +1492,19 @@ class Qwen38ModelTests(unittest.TestCase):
             )
             self.assertEqual(direct_evidence.context_mode, "decode")
             self.assertEqual(bank.metrics().hit_count, direct_before + 1)
+
+            publications_before = bank.metrics().publish_transactions
+            generated, generation_evidence = model.generate_greedy(
+                [[1, 4]],
+                max_new_tokens=3,
+                retain_final_state=False,
+            )
+            self.assertEqual(len(generated), 3)
+            self.assertEqual(generation_evidence.forward_passes, 3)
+            self.assertEqual(
+                bank.metrics().publish_transactions,
+                publications_before + 1,
+            )
         finally:
             model.reset_state(release=True)
             pager.close()

@@ -4783,8 +4783,11 @@ class StreamedQwen38:
             and self.attention_output_crystal_bank is not None
             and self.delta_probe is None
         ):
-            transaction = self.attention_output_crystal_bank.begin_transaction()
-            self._active_attention_output_crystal_transaction = transaction
+            transaction = self._active_attention_output_crystal_transaction
+            owns_transaction = transaction is None
+            if transaction is None:
+                transaction = self.attention_output_crystal_bank.begin_transaction()
+                self._active_attention_output_crystal_transaction = transaction
             try:
                 hidden, evidence = self.hidden_stateful(
                     ids,
@@ -4792,14 +4795,17 @@ class StreamedQwen38:
                     progress=progress,
                 )
             except Exception:
-                self._rollback_attention_output_crystal_transaction(transaction)
+                if owns_transaction:
+                    self._rollback_attention_output_crystal_transaction(transaction)
                 raise
             finally:
-                self._active_attention_output_crystal_transaction = None
-            self._commit_attention_output_crystal_transaction(
-                transaction,
-                accepted_end_position=self._next_position,
-            )
+                if owns_transaction:
+                    self._active_attention_output_crystal_transaction = None
+            if owns_transaction:
+                self._commit_attention_output_crystal_transaction(
+                    transaction,
+                    accepted_end_position=self._next_position,
+                )
             return hidden, evidence
         return self.hidden_stateful(
             ids, start_pos=self._next_position, progress=progress
@@ -4930,39 +4936,68 @@ class StreamedQwen38:
         stopped_on_eos = False
         forward_count = len(forwards)
         first_token_seconds: float | None = None
-        for step in range(max_new_tokens):
-            values, token_ids = self.pager.topk_logits(
-                hidden[:, -1],
-                k=1,
-                name=self.output_head_name,
-                block_rows=head_block_rows,
-                progress=head_progress,
-            )
-            token_id = int(token_ids[0, 0].item())
-            generated.append(token_id)
-            if first_token_seconds is None:
-                first_token_seconds = time.perf_counter() - started
-            if progress is not None:
-                progress(
-                    {
-                        "event": "generated_token",
-                        "step": step,
-                        "token_id": token_id,
-                        "logit": float(values[0, 0].item()),
-                    }
+        generation_crystal_transaction: AttentionOutputCrystalTransaction | None = None
+        if (
+            self.attention_output_crystal_enabled
+            and self.attention_output_crystal_bank is not None
+            and self.delta_probe is None
+        ):
+            if self._active_attention_output_crystal_transaction is not None:
+                raise Qwen38RuntimeError(
+                    "greedy generation found an active attention-output transaction"
                 )
-            stopped = token_id in eos
-            final_output = stopped or step + 1 == max_new_tokens
-            # Stateful callers retain the historical contract.  One-shot chat
-            # callers release the model immediately and therefore must not
-            # stream the complete checkpoint once more for a state they throw
-            # away without reading its logits.
-            if retain_final_state or not final_output:
-                hidden, _evidence = self.decode([[token_id]], progress=progress)
-                forward_count += 1
-            if stopped:
-                stopped_on_eos = True
-                break
+            generation_crystal_transaction = (
+                self.attention_output_crystal_bank.begin_transaction()
+            )
+            self._active_attention_output_crystal_transaction = (
+                generation_crystal_transaction
+            )
+        try:
+            for step in range(max_new_tokens):
+                values, token_ids = self.pager.topk_logits(
+                    hidden[:, -1],
+                    k=1,
+                    name=self.output_head_name,
+                    block_rows=head_block_rows,
+                    progress=head_progress,
+                )
+                token_id = int(token_ids[0, 0].item())
+                generated.append(token_id)
+                if first_token_seconds is None:
+                    first_token_seconds = time.perf_counter() - started
+                if progress is not None:
+                    progress(
+                        {
+                            "event": "generated_token",
+                            "step": step,
+                            "token_id": token_id,
+                            "logit": float(values[0, 0].item()),
+                        }
+                    )
+                stopped = token_id in eos
+                final_output = stopped or step + 1 == max_new_tokens
+                # Stateful callers retain the historical contract.  One-shot chat
+                # callers release the model immediately and therefore must not
+                # stream the complete checkpoint once more for a state they throw
+                # away without reading its logits.
+                if retain_final_state or not final_output:
+                    hidden, _evidence = self.decode([[token_id]], progress=progress)
+                    forward_count += 1
+                if stopped:
+                    stopped_on_eos = True
+                    break
+        except Exception:
+            self._rollback_attention_output_crystal_transaction(
+                generation_crystal_transaction
+            )
+            raise
+        finally:
+            if generation_crystal_transaction is not None:
+                self._active_attention_output_crystal_transaction = None
+        self._commit_attention_output_crystal_transaction(
+            generation_crystal_transaction,
+            accepted_end_position=self._next_position,
+        )
 
         prompt_ids = tuple(
             int(value) for value in prompt[0].detach().to("cpu").tolist()

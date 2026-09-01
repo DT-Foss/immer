@@ -2289,7 +2289,10 @@ class AttentionOutputCrystalBank:
             return self.metrics()
 
         with _exclusive_state_lock(self.state_path):
-            self._reload(required=self._file_signature is not None)
+            # The process already owns a fully verified immutable generation.
+            # Reparse megabytes of base64 payload only when another process
+            # actually replaced the file while we were computing.
+            self._refresh_if_changed()
             state = self._state
             clock = _bounded_add(state.clock, 1)
             cells = {cell.key.key_sha256: cell for cell in state.cells}
