@@ -97,7 +97,7 @@ from .hybrid_draft import (
     QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA,
     Qwen38MarkovMtpDraftProvider,
 )
-from .pager import Qwen38WeightPager
+from .pager import Qwen38WeightPager, _process_rss_bytes
 from .q4 import Q4Bank
 from .q4_delta_router import PackedDeltaHeadRouter
 from .q4_fast_mlp import (
@@ -732,6 +732,45 @@ def _process_peak_rss_bytes() -> int | None:
     return value if sys.platform == "darwin" else value * 1024
 
 
+def _process_usage_snapshot() -> dict[str, int | float] | None:
+    """Read process CPU/fault counters around one generation request."""
+
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+    except (OSError, ValueError):
+        return None
+    values: dict[str, int | float] = {
+        "major_page_faults": int(usage.ru_majflt),
+        "minor_page_faults": int(usage.ru_minflt),
+        "system_cpu_seconds": float(usage.ru_stime),
+        "user_cpu_seconds": float(usage.ru_utime),
+    }
+    if any(value < 0 for value in values.values()):
+        return None
+    return values
+
+
+def _process_usage_delta(
+    before: Mapping[str, int | float] | None,
+    after: Mapping[str, int | float] | None,
+) -> dict[str, int | float | None]:
+    fields = (
+        "major_page_faults",
+        "minor_page_faults",
+        "system_cpu_seconds",
+        "user_cpu_seconds",
+    )
+    if before is None or after is None:
+        return {field: None for field in fields}
+    return {
+        field: max(
+            0.0 if isinstance(after[field], float) else 0,
+            after[field] - before[field],
+        )
+        for field in fields
+    }
+
+
 def _anchor_model_state(model: object) -> tuple[int, bool, int, int | None]:
     """Return the native state fields that make cache miss/hit mutation explicit."""
 
@@ -1071,6 +1110,7 @@ def _open_local_runtime(
     range_prefetch_hint_cooldown: int = 2,
     q4_root: Path | None = None,
     q4_threads: int | None = None,
+    q4_resident_budget_bytes: int = 0,
     native_head_crsa: Qwen38NativeHeadCrsa | None = None,
 ) -> _OwnedRuntime:
     """Open one pinned local causal model; no remote source exists here."""
@@ -1115,6 +1155,7 @@ def _open_local_runtime(
                 inventory_fingerprint=fingerprint,
                 threads=q4_threads,
                 max_prefetch_bytes=max(1, max_resident_bytes // 2),
+                resident_budget_bytes=q4_resident_budget_bytes,
             )
         pager = Qwen38WeightPager(
             mount.source,
@@ -1393,6 +1434,7 @@ def _open_official_runtime(
     range_prefetch_hint_cooldown: int = 2,
     q4_root: Path | None = None,
     q4_threads: int | None = None,
+    q4_resident_budget_bytes: int = 0,
     native_head_crsa: Qwen38NativeHeadCrsa | None = None,
 ) -> _OwnedRuntime:
     return _open_local_runtime(
@@ -1427,6 +1469,7 @@ def _open_official_runtime(
         range_prefetch_hint_cooldown=range_prefetch_hint_cooldown,
         q4_root=q4_root,
         q4_threads=q4_threads,
+        q4_resident_budget_bytes=q4_resident_budget_bytes,
         native_head_crsa=native_head_crsa,
     )
 
@@ -1491,6 +1534,7 @@ class Qwen38CausalChat:
         range_prefetch_hint_cooldown: int = 2,
         q4_root: str | Path | None = None,
         q4_threads: int | None = None,
+        q4_resident_budget_bytes: int = 0,
         native_head_crsa: Qwen38NativeHeadCrsa | None = None,
         text_snapshot_sink: Callable[[str], None] | None = None,
     ) -> None:
@@ -1510,6 +1554,14 @@ class Qwen38CausalChat:
             raise TypeError("q4_root must be a local path or None")
         if q4_threads is not None:
             q4_threads = _positive_int(q4_threads, "q4_threads")
+        if (
+            isinstance(q4_resident_budget_bytes, bool)
+            or not isinstance(q4_resident_budget_bytes, int)
+            or q4_resident_budget_bytes < 0
+        ):
+            raise ValueError("q4_resident_budget_bytes must be non-negative")
+        if q4_resident_budget_bytes and q4_root is None:
+            raise ValueError("q4_resident_budget_bytes requires q4_root")
         if text_snapshot_sink is not None and not callable(text_snapshot_sink):
             raise TypeError("text_snapshot_sink must be callable or None")
         if native_head_crsa is not None and not isinstance(
@@ -1952,6 +2004,7 @@ class Qwen38CausalChat:
             None if q4_root is None else Path(q4_root).expanduser().absolute()
         )
         self._q4_threads = q4_threads
+        self._q4_resident_budget_bytes = q4_resident_budget_bytes
         self._text_snapshot_sink = text_snapshot_sink
         self._native_head_crsa = native_head_crsa
         self._anchor_cache = anchor_cache
@@ -2911,6 +2964,7 @@ class Qwen38CausalChat:
             range_prefetch_hint_cooldown=self._range_prefetch_hint_cooldown,
             q4_root=self._q4_root,
             q4_threads=self._q4_threads,
+            q4_resident_budget_bytes=self._q4_resident_budget_bytes,
             native_head_crsa=self._native_head_crsa,
         )
 
@@ -5026,6 +5080,7 @@ class Qwen38CausalChat:
             if isinstance(sequence, int) and not isinstance(sequence, bool):
                 retention_before_sequence = sequence
         physical_read_before = _linux_process_read_bytes()
+        process_usage_before = _process_usage_snapshot()
         prefix_sinkhorn_before = self._prefix_sinkhorn_metrics(runtime)
         attention_output_crystal_before = self._attention_output_crystal_metrics()
         layer_transition_crystal_before = self._layer_transition_crystal_metrics(
@@ -5103,6 +5158,7 @@ class Qwen38CausalChat:
                 )
         mlp_page_after = None if mlp_page_router is None else mlp_page_router.metrics()
         physical_read_after = _linux_process_read_bytes()
+        process_usage_after = _process_usage_snapshot()
         generated_ids = _token_ids(raw_generated, "generated output")
         if len(generated_ids) > self._max_new_tokens:
             raise Qwen38ChatError("generated output exceeds its token budget")
@@ -5153,12 +5209,14 @@ class Qwen38CausalChat:
             "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
             "runtime_metrics": {
                 "generation_wall_seconds": request_seconds,
+                "process_current_rss_bytes": _process_rss_bytes(),
                 "physical_read_bytes": (
                     None
                     if physical_read_before is None or physical_read_after is None
                     else max(0, physical_read_after - physical_read_before)
                 ),
                 "process_peak_rss_bytes": _process_peak_rss_bytes(),
+                **_process_usage_delta(process_usage_before, process_usage_after),
             },
         }
         q4_request: dict[str, int] = {}
@@ -5214,6 +5272,12 @@ class Qwen38CausalChat:
                 "native_topk_discard_bytes",
                 "native_topk_rows",
                 "output_bytes",
+                "resident_eviction_bytes",
+                "resident_evictions",
+                "resident_hits",
+                "resident_misses",
+                "resident_prefetch_admissions",
+                "resident_row_discard_skips",
                 "selected_input_blocks",
                 "selected_input_coordinates",
                 "selected_output_rows",
@@ -5229,7 +5293,14 @@ class Qwen38CausalChat:
                 "request": q4_request,
                 "runtime": {
                     key: q4_after[key]
-                    for key in ("page_mlp_prefetch_max_bytes",)
+                    for key in (
+                        "page_mlp_prefetch_max_bytes",
+                        "resident_budget_bytes",
+                        "resident_budget_overage_bytes",
+                        "resident_payload_bytes",
+                        "resident_peak_payload_bytes",
+                        "resident_tensors",
+                    )
                     if key in q4_after
                 },
             }

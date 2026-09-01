@@ -10,6 +10,7 @@ reads packed mmap pages directly.
 from __future__ import annotations
 
 import ctypes
+from collections import OrderedDict
 import hashlib
 import json
 import math
@@ -35,7 +36,7 @@ Q4_BANK_SCHEMA = "immer.qwen3.8-causal-q4-bank/v1"
 Q4_BUILD_STATE_SCHEMA = "immer.qwen3.8-causal-q4-build-state/v1"
 Q4_VERIFY_CACHE_SCHEMA = "immer.qwen3.8-causal-q4-verify-cache/v1"
 Q4_VERIFY_CACHE_NAME = ".verify-cache-v1.json"
-Q4_NATIVE_ABI = 5
+Q4_NATIVE_ABI = 6
 DEFAULT_Q4_PREFETCH_MAX_BYTES = 128 * 1024**2
 Q4_BANK_CODEC_ABI = 2
 Q4_0 = "q4_0"
@@ -306,6 +307,7 @@ class Q4NativeKernel:
             void,
             void,
             void,
+            integer,
             integer,
         )
         self.library.immer_q4_topk_bf16_f32.restype = integer
@@ -821,6 +823,13 @@ class Q4BankMetrics:
     head_calls: int = 0
     logical_weight_bytes: int = 0
     output_bytes: int = 0
+    resident_hits: int = 0
+    resident_misses: int = 0
+    resident_evictions: int = 0
+    resident_eviction_bytes: int = 0
+    resident_row_discard_skips: int = 0
+    resident_prefetch_admissions: int = 0
+    resident_peak_payload_bytes: int = 0
 
 
 class Q4Bank:
@@ -834,6 +843,7 @@ class Q4Bank:
         entries: Mapping[str, Q4TensorEntry],
         threads: int,
         max_prefetch_bytes: int = DEFAULT_Q4_PREFETCH_MAX_BYTES,
+        resident_budget_bytes: int = 0,
     ) -> None:
         if (
             isinstance(max_prefetch_bytes, bool)
@@ -841,17 +851,26 @@ class Q4Bank:
             or max_prefetch_bytes <= 0
         ):
             raise ValueError("max_prefetch_bytes must be a positive integer")
+        if (
+            isinstance(resident_budget_bytes, bool)
+            or not isinstance(resident_budget_bytes, int)
+            or resident_budget_bytes < 0
+        ):
+            raise ValueError("resident_budget_bytes must be a non-negative integer")
         self.root = root
         self.manifest = dict(manifest)
         self.entries = dict(entries)
         self.threads = threads
         self.max_prefetch_bytes = max_prefetch_bytes
+        self.resident_budget_bytes = resident_budget_bytes
         self.native = _native_library()
         self._mapped: dict[str, _MappedTensor] = {}
         self._mapped_once: set[str] = set()
         self._touched: set[str] = set()
         self._prefetch_leases: dict[str, int] = {}
         self._release_clock = 0
+        self._resident_lru: OrderedDict[str, None] = OrderedDict()
+        self._resident_payload_bytes = 0
         self._stats = Q4BankMetrics()
         self._lock = threading.RLock()
         self._closed = False
@@ -867,6 +886,7 @@ class Q4Bank:
         inventory_fingerprint: str,
         threads: int | None = None,
         max_prefetch_bytes: int = DEFAULT_Q4_PREFETCH_MAX_BYTES,
+        resident_budget_bytes: int = 0,
     ) -> "Q4Bank":
         source = Path(root).expanduser().resolve()
         document = _strict_document(source / "manifest.json", schema=Q4_BANK_SCHEMA)
@@ -901,6 +921,7 @@ class Q4Bank:
             entries=entries,
             threads=threads,
             max_prefetch_bytes=max_prefetch_bytes,
+            resident_budget_bytes=resident_budget_bytes,
         )
 
     @property
@@ -915,6 +936,12 @@ class Q4Bank:
 
     def has(self, name: str) -> bool:
         return name in self.entries
+
+    def _resident_admits(self, entry: Q4TensorEntry) -> bool:
+        return (
+            self.resident_budget_bytes > 0
+            and entry.payload_bytes <= self.resident_budget_bytes
+        )
 
     def _mapping(
         self,
@@ -942,6 +969,18 @@ class Q4Bank:
             if self._prefetch_leases.pop(name, None) is not None:
                 self._stats.page_mlp_prefetch_consumed_leases += 1
             self._touched.add(name)
+            if self._resident_admits(entry):
+                if name in self._resident_lru:
+                    self._stats.resident_hits += 1
+                    self._resident_lru.move_to_end(name)
+                else:
+                    self._stats.resident_misses += 1
+                    self._resident_lru[name] = None
+                    self._resident_payload_bytes += entry.payload_bytes
+                    self._stats.resident_peak_payload_bytes = max(
+                        self._stats.resident_peak_payload_bytes,
+                        self._resident_payload_bytes,
+                    )
         return entry, mapped
 
     def discard_rows(self, name: str, start_row: int, row_count: int) -> None:
@@ -965,6 +1004,9 @@ class Q4Bank:
             ):
                 raise ValueError("Q4 discard row interval is invalid")
             if mapped is None:
+                return
+            if name in self._resident_lru:
+                self._stats.resident_row_discard_skips += 1
                 return
             offset = start_row * entry.row_bytes
             length = row_count * entry.row_bytes
@@ -997,8 +1039,7 @@ class Q4Bank:
             pages = tuple(page_ids)
             base = f"model.language_model.layers.{layer}.mlp"
             names = tuple(
-                f"{base}.{role}_proj.weight"
-                for role in ("gate", "up", "down")
+                f"{base}.{role}_proj.weight" for role in ("gate", "up", "down")
             )
             entries = tuple(self.entries.get(name) for name in names)
             if any(entry is None for entry in entries):
@@ -1079,9 +1120,7 @@ class Q4Bank:
                     )
                 ]
                 advised_bytes = down_entry.payload_bytes + sum(
-                    stop - start
-                    for rows in candidate_intervals
-                    for start, stop in rows
+                    stop - start for rows in candidate_intervals for start, stop in rows
                 )
                 if advised_bytes > effective_max_bytes:
                     break
@@ -1092,8 +1131,8 @@ class Q4Bank:
                 return False
             if len(bounded_pages) != len(pages):
                 self._stats.page_mlp_prefetch_budget_trims += 1
-                self._stats.page_mlp_prefetch_trimmed_pages += (
-                    len(pages) - len(bounded_pages)
+                self._stats.page_mlp_prefetch_trimmed_pages += len(pages) - len(
+                    bounded_pages
                 )
             pages = tuple(bounded_pages)
             self._stats.page_mlp_prefetch_selected_pages += len(pages)
@@ -1101,10 +1140,7 @@ class Q4Bank:
                 self._stats.page_mlp_prefetch_unsupported += 1
                 return False
             try:
-                mapped_rows = tuple(
-                    self._mapping(name, touch=False)
-                    for name in names
-                )
+                mapped_rows = tuple(self._mapping(name, touch=False) for name in names)
             except Q4BankError:
                 self._stats.page_mlp_prefetch_failures += 1
                 return False
@@ -1147,8 +1183,20 @@ class Q4Bank:
             # before layer zero of the next token. Two boundaries retain both
             # cases while stale or abandoned advice still expires promptly.
             expiry = self._release_clock + 2
-            for name in leased_names:
+            for name in sorted(leased_names):
                 self._prefetch_leases[name] = expiry
+                entry = self.entries[name]
+                if self._resident_admits(entry):
+                    if name in self._resident_lru:
+                        self._resident_lru.move_to_end(name)
+                    else:
+                        self._resident_lru[name] = None
+                        self._resident_payload_bytes += entry.payload_bytes
+                        self._stats.resident_prefetch_admissions += 1
+                        self._stats.resident_peak_payload_bytes = max(
+                            self._stats.resident_peak_payload_bytes,
+                            self._resident_payload_bytes,
+                        )
             if accepted:
                 self._stats.page_mlp_prefetch_pages += len(pages)
             return accepted
@@ -1175,6 +1223,51 @@ class Q4Bank:
             for name in stale:
                 self._prefetch_leases.pop(name, None)
             active_prefetch = set(self._prefetch_leases)
+            if self.resident_budget_bytes > 0:
+                untracked = ((self._touched - active_prefetch) | stale) - set(
+                    self._resident_lru
+                )
+                for name in sorted(untracked):
+                    mapped = self._mapped.get(name)
+                    if mapped is None:
+                        continue
+                    entry = self.entries[name]
+                    if mapped.discard():
+                        self._stats.mapping_discard_calls += 1
+                        self._stats.mapping_discard_bytes += entry.payload_bytes
+                    else:
+                        self._mapped.pop(name).close()
+                        self._stats.mapping_discard_fallback_closes += 1
+                        self._stats.mapping_discard_calls += 1
+                        self._stats.mapping_discard_bytes += entry.payload_bytes
+                self._touched.clear()
+                while self._resident_payload_bytes > self.resident_budget_bytes:
+                    victim = next(
+                        (
+                            name
+                            for name in self._resident_lru
+                            if name not in active_prefetch
+                        ),
+                        None,
+                    )
+                    if victim is None:
+                        break
+                    self._resident_lru.pop(victim, None)
+                    entry = self.entries[victim]
+                    self._resident_payload_bytes -= entry.payload_bytes
+                    mapped = self._mapped.get(victim)
+                    if mapped is not None:
+                        if mapped.discard():
+                            self._stats.mapping_discard_calls += 1
+                            self._stats.mapping_discard_bytes += entry.payload_bytes
+                        else:
+                            self._mapped.pop(victim).close()
+                            self._stats.mapping_discard_fallback_closes += 1
+                            self._stats.mapping_discard_calls += 1
+                            self._stats.mapping_discard_bytes += entry.payload_bytes
+                    self._stats.resident_evictions += 1
+                    self._stats.resident_eviction_bytes += entry.payload_bytes
+                return
             names = tuple((self._touched - active_prefetch) | stale)
             self._touched.clear()
             for name in names:
@@ -1293,6 +1386,7 @@ class Q4Bank:
                 self.native._pointer(top_ids),
                 ctypes.byref(discarded_bytes),
                 ctypes.byref(discard_calls),
+                int(not self._resident_admits(entry)),
                 self.threads,
             )
             if code == 2:
@@ -1501,17 +1595,12 @@ class Q4Bank:
                 self._stats.full_mlp_page_trace_rows += input_rows
                 self._stats.full_mlp_page_trace_candidates += input_rows * page_count
                 self._stats.full_mlp_page_trace_selected += input_rows * page_topk
-                if (
-                    page_ids is None
-                    or page_scores is None
-                    or page_total_scores is None
-                ):
+                if page_ids is None or page_scores is None or page_total_scores is None:
                     raise AssertionError("activation-page outputs were not allocated")
                 self._stats.output_bytes += (
                     page_ids.numel() * page_ids.element_size()
                     + page_scores.numel() * page_scores.element_size()
-                    + page_total_scores.numel()
-                    * page_total_scores.element_size()
+                    + page_total_scores.numel() * page_total_scores.element_size()
                 )
                 return (
                     result,
@@ -1575,12 +1664,13 @@ class Q4Bank:
                 raise ValueError("Q4 page MLP page dimensions are invalid")
             input_rows = values.numel() // values.shape[-1]
             selected_pages = pages.shape[-1]
-            compute_pages = pages.reshape(input_rows, selected_pages).to(
-                dtype=torch.int64
-            ).contiguous()
+            compute_pages = (
+                pages.reshape(input_rows, selected_pages)
+                .to(dtype=torch.int64)
+                .contiguous()
+            )
             if bool(
-                torch.any(compute_pages < 0)
-                or torch.any(compute_pages >= page_count)
+                torch.any(compute_pages < 0) or torch.any(compute_pages >= page_count)
             ):
                 raise ValueError("Q4 page MLP page IDs are out of range")
             ordered = torch.sort(compute_pages, dim=1).values
@@ -1632,9 +1722,7 @@ class Q4Bank:
             selected_down_blocks = selected_neurons // Q4_BLOCK_SIZE
             row_down_blocks = (page_neurons // Q4_BLOCK_SIZE).sum(dim=1)
             total_down_blocks = gate_entry.shape[0] // Q4_BLOCK_SIZE
-            dense_down_rows = int(
-                ((row_down_blocks * 2) >= total_down_blocks).sum()
-            )
+            dense_down_rows = int(((row_down_blocks * 2) >= total_down_blocks).sum())
             unique_page_starts = torch.unique(compute_pages) * 64
             unique_neurons = int(
                 torch.clamp(
@@ -2417,12 +2505,17 @@ class Q4Bank:
             return {
                 **asdict(self._stats),
                 **self.identity,
-                "page_mlp_prefetch_active_leases": len(
-                    self._prefetch_leases
-                ),
+                "page_mlp_prefetch_active_leases": len(self._prefetch_leases),
                 "tensor_count": len(self.entries),
                 "payload_bytes": sum(x.payload_bytes for x in self.entries.values()),
                 "page_mlp_prefetch_max_bytes": self.max_prefetch_bytes,
+                "resident_budget_bytes": self.resident_budget_bytes,
+                "resident_payload_bytes": self._resident_payload_bytes,
+                "resident_budget_overage_bytes": max(
+                    0,
+                    self._resident_payload_bytes - self.resident_budget_bytes,
+                ),
+                "resident_tensors": len(self._resident_lru),
                 "threads": self.threads,
                 "native_library": str(self.native.path),
                 "native_build_seconds": self.native.build_seconds,
@@ -2438,6 +2531,8 @@ class Q4Bank:
             self._mapped.clear()
             self._touched.clear()
             self._prefetch_leases.clear()
+            self._resident_lru.clear()
+            self._resident_payload_bytes = 0
             self._closed = True
 
 

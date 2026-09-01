@@ -184,7 +184,10 @@ class Qwen38WeightPager:
     WEIGHT_CACHE_POLICY = "one-shot-qwen35-direct-fill/v4"
     HEAD_SCORE_POLICY = "cpu-bf16-explicit-fp32-accumulate-rne/v1"
     LEGACY_HEAD_SCORE_POLICY = "backend-bf16-linear/v1"
+    # Preserve the established identity for the default eager-discard path.
+    # Residency is output-neutral, but it gets a distinct execution-policy pin.
     Q4_WEIGHT_CACHE_POLICY = "causal-mmap-q4_0-q8_0/v1"
+    Q4_RESIDENT_WEIGHT_CACHE_POLICY = "causal-mmap-q4_0-q8_0-resident-lru/v2"
 
     def __init__(
         self,
@@ -260,9 +263,7 @@ class Qwen38WeightPager:
             if exact_head_index is not None and not bool(
                 getattr(exact_head_index, "supports_q4", False)
             ):
-                raise ValueError(
-                    "Q4 execution requires a Q4-compatible exact head"
-                )
+                raise ValueError("Q4 execution requires a Q4-compatible exact head")
             if not all(
                 callable(getattr(q4_bank, method, None))
                 for method in (
@@ -297,7 +298,11 @@ class Qwen38WeightPager:
         self.exact_head_index = exact_head_index
         self.q4_bank = q4_bank
         if q4_bank is not None:
-            self.WEIGHT_CACHE_POLICY = self.Q4_WEIGHT_CACHE_POLICY
+            self.WEIGHT_CACHE_POLICY = (
+                self.Q4_RESIDENT_WEIGHT_CACHE_POLICY
+                if int(getattr(q4_bank, "resident_budget_bytes", 0)) > 0
+                else self.Q4_WEIGHT_CACHE_POLICY
+            )
         self.source_identity = validate_source_identity(
             getattr(source, "repo_id", None),
             getattr(source, "revision", None),
@@ -328,9 +333,7 @@ class Qwen38WeightPager:
                 and self.q4_bank is not None
                 and not bool(getattr(index, "supports_q4", False))
             ):
-                raise ValueError(
-                    "Q4 execution requires a Q4-compatible exact head"
-                )
+                raise ValueError("Q4 execution requires a Q4-compatible exact head")
             self.exact_head_index = index
 
     @property
@@ -1178,9 +1181,7 @@ class Qwen38WeightPager:
                     value.to(device=self.device, dtype=self.compute_dtype)
                 )
             shapes = tuple(tuple(value.shape) for value in compute_inputs)
-            counts = tuple(
-                value.numel() // value.shape[-1] for value in compute_inputs
-            )
+            counts = tuple(value.numel() // value.shape[-1] for value in compute_inputs)
             combined = self.torch.cat(
                 tuple(value.reshape(-1, input_width) for value in compute_inputs),
                 dim=0,
@@ -1191,8 +1192,8 @@ class Qwen38WeightPager:
                 output_dtype=output_dtype,
             )
             if not packed:
-                self._stats.linear_calls += (
-                    (len(compute_inputs) - 1) * len(weight_names)
+                self._stats.linear_calls += (len(compute_inputs) - 1) * len(
+                    weight_names
                 )
             outputs = []
             for result, layout in zip(grouped, layouts, strict=True):
@@ -1649,11 +1650,7 @@ class Qwen38WeightPager:
                 raise Qwen38PagerError("hidden width disagrees with LM head")
             q4_bank = self.q4_bank
             index = self.exact_head_index
-            if (
-                q4_bank is not None
-                and index is not None
-                and progress is None
-            ):
+            if q4_bank is not None and index is not None and progress is None:
                 indexed = index.topk_logits(
                     self,
                     compute_hidden,
@@ -2029,11 +2026,9 @@ class Qwen38WeightPager:
                     release_touched(force_prefetch=True)
             self._collect_locked("forced")
         elif self.q4_bank is not None:
-            # Every model layer is already an execution boundary. Drop the
-            # read-only packed pages touched by that layer so 64 layers never
-            # accumulate into one model-sized RSS. The mappings and arithmetic
-            # remain unchanged; subsequent layers/tokens fault the same local
-            # bytes back through the OS page cache.
+            # The Q4 bank enforces its configured eager-discard or resident-LRU
+            # policy at every execution boundary. Both retain identical mmap
+            # bytes and arithmetic; only page residency differs.
             release_touched = getattr(self.q4_bank, "release_touched", None)
             if callable(release_touched):
                 release_touched()

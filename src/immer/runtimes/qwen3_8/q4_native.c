@@ -39,7 +39,7 @@
 #define IMMER_EXPORT __attribute__((visibility("default")))
 #endif
 
-#define IMMER_Q4_ABI 5u
+#define IMMER_Q4_ABI 6u
 #define IMMER_QK 32
 #define IMMER_MLP_PAGE_NEURONS 64
 #define IMMER_FORMAT_Q4_0 4
@@ -928,6 +928,7 @@ IMMER_EXPORT int immer_q4_topk_bf16_f32(
     int64_t *top_ids,
     int64_t *discarded_bytes_out,
     int64_t *discard_calls_out,
+    int discard_consumed,
     int threads
 ) {
     int64_t packed_blocks;
@@ -938,6 +939,7 @@ IMMER_EXPORT int immer_q4_topk_bf16_f32(
         || input_rows <= 0 || input_cols <= 0 || output_rows <= 0
         || k <= 0 || k > output_rows || k > 256
         || block_rows <= 0 || threads <= 0
+        || (discard_consumed != 0 && discard_consumed != 1)
         || !immer_checked_row_layout(
             format, input_cols, &packed_blocks, &row_bytes
         )
@@ -1064,14 +1066,16 @@ IMMER_EXPORT int immer_q4_topk_bf16_f32(
                             }
                         }
                     }
-                    const size_t consumed = (size_t) count * row_bytes;
-                    const int64_t discarded = immer_discard_read_pages(
-                        weights + (size_t) start * row_bytes,
-                        consumed
-                    );
-                    if (discarded > 0) {
-                        *discarded_bytes_out += discarded;
-                        *discard_calls_out += 1;
+                    if (discard_consumed) {
+                        const size_t consumed = (size_t) count * row_bytes;
+                        const int64_t discarded = immer_discard_read_pages(
+                            weights + (size_t) start * row_bytes,
+                            consumed
+                        );
+                        if (discarded > 0) {
+                            *discarded_bytes_out += discarded;
+                            *discard_calls_out += 1;
+                        }
                     }
                 }
             }

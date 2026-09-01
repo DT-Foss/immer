@@ -143,6 +143,7 @@ _QWEN38_DEPLOYMENT_INFERENCE_ECONOMICS = (
 )
 _QWEN38_DEPLOYMENT_SERVICE_SOCKET = _QWEN38_DEPLOYMENT_STATE / "qwen3.8-service.sock"
 _QWEN38_DEPLOYMENT_ANCHOR_CACHE = _QWEN38_DEPLOYMENT_STATE / "qwen-chat-prefix-anchors"
+_QWEN38_DEPLOYMENT_Q4_RESIDENT_BUDGET_MB = 16_384
 _QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-contextual-continuation-v1.json"
 )
@@ -548,6 +549,7 @@ def _qwen38_service_profile(
         "no_attention_output_crystal",
         "prefix_sinkhorn",
         "q4_threads",
+        "q4_resident_budget_mb",
         "qwen38_anchor_cache",
         "range_markov_state",
         "range_prefetch_beam_horizon",
@@ -1047,6 +1049,13 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
     direct = bool(getattr(args, "direct", False))
     message = getattr(args, "message", None)
     max_requests = getattr(args, "max_requests", None)
+    q4_resident_budget_mb = getattr(args, "q4_resident_budget_mb", None)
+    if q4_resident_budget_mb is not None and (
+        isinstance(q4_resident_budget_mb, bool)
+        or not isinstance(q4_resident_budget_mb, int)
+        or q4_resident_budget_mb < 0
+    ):
+        raise ValueError("--q4-resident-budget-mb must be non-negative")
     output_mode = getattr(args, "output", None) or ("json" if jsonl else "text")
     stream_enabled = (
         not service
@@ -1701,6 +1710,15 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         bundle_path, tokenizer_path, q4_root, fast_mlp_root = (
             _resolve_qwen38_chat_paths(args)
         )
+        if q4_resident_budget_mb is None:
+            q4_resident_budget_mb = (
+                _QWEN38_DEPLOYMENT_Q4_RESIDENT_BUDGET_MB
+                if bundle_path == _QWEN38_DEPLOYMENT_ROOT and q4_root is not None
+                else 0
+            )
+        args.q4_resident_budget_mb = q4_resident_budget_mb
+        if args.q4_resident_budget_mb and q4_root is None:
+            raise ValueError("--q4-resident-budget-mb requires local Q4 execution")
         service_socket = _resolve_qwen38_service_socket(args, bundle_path)
         args.service_socket = service_socket
         draft_mode, markov_draft_state, mtp_draft_state = _resolve_qwen38_markov_draft(
@@ -2488,6 +2506,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             exact_head_max_bytes=int(args.exact_head_max_mb * 1024**2),
             q4_root=None if q4_root is None else str(q4_root),
             q4_threads=args.q4_threads,
+            q4_resident_budget_bytes=int(args.q4_resident_budget_mb * 1024**2),
             anchor_cache=anchor_cache,
             draft_bundle_path=args.draft_bundle,
             draft_mode=draft_mode,
@@ -3579,6 +3598,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--q4-threads",
         type=int,
         help="CPU worker count for the native Q4/Q8 kernel (default: up to 16)",
+    )
+    chat.add_argument(
+        "--q4-resident-budget-mb",
+        type=int,
+        default=None,
+        metavar="MIB",
+        help=(
+            "retain packed Q4/Q8 tensor pages across layer/token boundaries "
+            "under a whole-tensor LRU budget; canonical deployment: 16384, "
+            "other layouts: 0, explicit 0 keeps eager MADV_DONTNEED"
+        ),
     )
     chat.add_argument(
         "--draft-bundle",

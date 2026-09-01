@@ -2104,6 +2104,13 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 return {
                     "page_mlp_rows": 0 if before else 1,
                     "page_mlp_selected_pages": selected,
+                    "resident_budget_bytes": 17_179_869_184,
+                    "resident_budget_overage_bytes": 0,
+                    "resident_hits": 0 if before else 5,
+                    "resident_misses": 0 if before else 2,
+                    "resident_payload_bytes": 0 if before else 16_398_909_440,
+                    "resident_peak_payload_bytes": 16_398_909_440,
+                    "resident_tensors": 0 if before else 498,
                 }
 
         class PageRouter:
@@ -2192,6 +2199,18 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(
             result.evidence["mlp_page_route"]["request"]["physical_pages_saved"],
             224,
+        )
+        self.assertEqual(result.evidence["q4"]["request"]["resident_hits"], 5)
+        self.assertEqual(result.evidence["q4"]["request"]["resident_misses"], 2)
+        self.assertEqual(
+            result.evidence["q4"]["runtime"],
+            {
+                "resident_budget_bytes": 17_179_869_184,
+                "resident_budget_overage_bytes": 0,
+                "resident_payload_bytes": 16_398_909_440,
+                "resident_peak_payload_bytes": 16_398_909_440,
+                "resident_tensors": 498,
+            },
         )
         self.assertEqual(q4.calls, 2)
         self.assertGreaterEqual(retention.calls, 3)
@@ -2447,6 +2466,22 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(component._device, "cpu")
         component.close()
 
+        with self.assertRaisesRegex(ValueError, "requires q4_root"):
+            Qwen38CausalChat(
+                "unused.causal",
+                "unused-tokenizer.json",
+                q4_resident_budget_bytes=1024,
+            )
+        for invalid_budget in (True, -1, 1.5):
+            with self.subTest(invalid_budget=invalid_budget):
+                with self.assertRaises(ValueError):
+                    Qwen38CausalChat(
+                        "unused.causal",
+                        "unused-tokenizer.json",
+                        q4_root="/models/qwen-q4",
+                        q4_resident_budget_bytes=invalid_budget,
+                    )
+
         component = Qwen38CausalChat(
             "unused.causal",
             "unused-tokenizer.json",
@@ -2639,6 +2674,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(len(generation["token_trace_sha256"]), 64)
         self.assertNotIn("prompt_token_ids", generation)
         self.assertNotIn("generated_token_ids", generation)
+        runtime_metrics = result.evidence["runtime_metrics"]
+        self.assertIn("major_page_faults", runtime_metrics)
+        self.assertIn("minor_page_faults", runtime_metrics)
+        self.assertIn("process_current_rss_bytes", runtime_metrics)
+        self.assertIn("system_cpu_seconds", runtime_metrics)
+        self.assertIn("user_cpu_seconds", runtime_metrics)
         self.assertNotIn("result_cell_binding_receipt", result.evidence)
         self.assertEqual(
             result.evidence["conversation"],
@@ -4837,6 +4878,76 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(enabled_a, enabled_b)
         self.assertNotEqual(enabled_a, disabled)
 
+    def test_q4_residency_changes_service_profile_not_replay_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            q4 = root / "q4"
+            q4.mkdir()
+            (q4 / "manifest.json").write_bytes(b"manifest")
+            tokenizer = root / "tokenizer.json"
+            tokenizer.write_bytes(b"tokenizer")
+            args = SimpleNamespace(
+                compute_dtype="auto",
+                device="auto",
+                draft_window=8,
+                head_block_rows=2048,
+                max_context_tokens=2048,
+                max_new_tokens=64,
+                max_prompt_tokens=1024,
+                mlp_page_width=192,
+                q4_resident_budget_mb=0,
+                q4_threads=None,
+                qwen38_anchor_cache=None,
+                system_prompt="",
+            )
+            warm_common = {
+                "args": args,
+                "tokenizer_path": tokenizer,
+                "q4_root": q4,
+                "fast_mlp_root": None,
+                "draft_mode": None,
+                "markov_atlas_path": None,
+                "markov_o1_retention_path": None,
+                "runtime_code_revision": "a" * 64,
+            }
+            service_common = {
+                "args": args,
+                "bundle_path": root / "bundle",
+                "tokenizer_path": tokenizer,
+                "q4_root": q4,
+                "fast_mlp_root": None,
+                "warm_root": None,
+                "draft_mode": None,
+                "markov_draft_state": None,
+                "mtp_draft_state": None,
+                "markov_atlas_path": None,
+                "markov_o1_retention_path": None,
+                "mlp_page_state_path": None,
+                "draft_window_state_path": None,
+                "runtime_code_revision": "a" * 64,
+            }
+            warm_eager = _qwen38_growing_warm_profile(**warm_common)
+            service_eager = _qwen38_service_profile(**service_common)
+            semantics_eager = _qwen38_output_semantics(
+                args,
+                tokenizer_path=tokenizer,
+                q4_root=q4,
+                mlp_page_state_path=None,
+            )
+            args.q4_resident_budget_mb = 16384
+            warm_resident = _qwen38_growing_warm_profile(**warm_common)
+            service_resident = _qwen38_service_profile(**service_common)
+            semantics_resident = _qwen38_output_semantics(
+                args,
+                tokenizer_path=tokenizer,
+                q4_root=q4,
+                mlp_page_state_path=None,
+            )
+
+        self.assertEqual(warm_eager, warm_resident)
+        self.assertNotEqual(service_eager, service_resident)
+        self.assertEqual(semantics_eager, semantics_resident)
+
     def test_layer_transition_profiles_bind_identity_budget_not_state_path(
         self,
     ) -> None:
@@ -5415,6 +5526,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(code, 0)
         options = constructor.call_args.kwargs
         self.assertEqual(options["q4_root"], str(q4))
+        self.assertEqual(
+            options["q4_resident_budget_bytes"],
+            16_384 * 1024**2,
+        )
         self.assertEqual(options["draft_mode"], "hybrid")
         self.assertEqual(options["markov_draft_state_path"], str(markov_state))
         self.assertEqual(options["mtp_draft_state_path"], str(mtp_state))
@@ -5460,12 +5575,15 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "--no-mlp-page-coordinate",
                         "--no-context-crystal",
                         "--no-attention-output-crystal",
+                        "--q4-resident-budget-mb",
+                        "0",
                     ]
                 )
 
         self.assertEqual(code, 0)
         options = constructor.call_args.kwargs
         self.assertEqual(options["q4_root"], str(q4))
+        self.assertEqual(options["q4_resident_budget_bytes"], 0)
         self.assertIsNone(options["mlp_page_state_path"])
         self.assertIsNone(options["mlp_page_coordinate_state_path"])
         self.assertIsNone(options["contextual_continuation_state_path"])
@@ -6289,6 +6407,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "/models/qwen-q4",
                         "--q4-threads",
                         "12",
+                        "--q4-resident-budget-mb",
+                        "12288",
                         "--fast-mlp",
                         "/state/qwen-fast-all64",
                         "--fast-mlp-policy",
@@ -6302,6 +6422,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         options = constructor.call_args.kwargs
         self.assertEqual(options["q4_root"], "/models/qwen-q4")
         self.assertEqual(options["q4_threads"], 12)
+        self.assertEqual(options["q4_resident_budget_bytes"], 12288 * 1024**2)
         self.assertEqual(options["fast_mlp_root"], "/state/qwen-fast-all64")
         self.assertEqual(
             options["fast_mlp_active_layers"],
@@ -6312,6 +6433,28 @@ class Qwen38CausalChatTests(unittest.TestCase):
             options["delta_head_state_path"],
             "/state/qwen-delta-head.json",
         )
+
+    def test_cli_rejects_q4_residency_without_local_q4_execution(self) -> None:
+        stderr = io.StringIO()
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            redirect_stderr(stderr),
+        ):
+            code = main(
+                [
+                    "chat",
+                    "hello",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                    "--q4-resident-budget-mb",
+                    "16384",
+                ]
+            )
+
+        self.assertEqual(code, 2)
+        self.assertIn("requires local Q4 execution", stderr.getvalue())
 
     def test_cli_wires_and_can_explicitly_disable_attention_output_crystals(
         self,

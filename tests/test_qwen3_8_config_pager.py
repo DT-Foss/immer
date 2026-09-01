@@ -456,11 +456,7 @@ class Qwen38PagerTests(unittest.TestCase):
         from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
 
         source = _RawBF16IntoSource(
-            {
-                "dense.weight": np.asarray(
-                    [[1.0, 2.0], [3.0, 4.0]], dtype=np.float32
-                )
-            }
+            {"dense.weight": np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)}
         )
         pager = Qwen38WeightPager(
             source,
@@ -493,11 +489,7 @@ class Qwen38PagerTests(unittest.TestCase):
         from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
 
         source = _RawBF16IntoSource(
-            {
-                "dense.weight": np.asarray(
-                    [[1.0, 2.0], [3.0, 4.0]], dtype=np.float32
-                )
-            }
+            {"dense.weight": np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)}
         )
         pager = Qwen38WeightPager(
             source,
@@ -1034,6 +1026,10 @@ class Qwen38PagerTests(unittest.TestCase):
             device="cpu",
             q4_bank=q4,
         )
+        self.assertEqual(
+            pager.WEIGHT_CACHE_POLICY,
+            pager.Q4_WEIGHT_CACHE_POLICY,
+        )
         with mock.patch(
             "immer.runtimes.qwen3_8.pager.gc.collect",
             return_value=0,
@@ -1046,6 +1042,27 @@ class Qwen38PagerTests(unittest.TestCase):
             [mock.call(), mock.call(force_prefetch=True)],
         )
         pager.close()
+
+        resident_q4 = SimpleNamespace(
+            has=mock.Mock(return_value=True),
+            linear=mock.Mock(),
+            linear_group=mock.Mock(),
+            rows=mock.Mock(),
+            metrics=mock.Mock(return_value={}),
+            close=mock.Mock(),
+            release_touched=mock.Mock(),
+            resident_budget_bytes=1024,
+        )
+        resident_pager = Qwen38WeightPager(
+            self._source(),
+            device="cpu",
+            q4_bank=resident_q4,
+        )
+        self.assertEqual(
+            resident_pager.WEIGHT_CACHE_POLICY,
+            resident_pager.Q4_RESIDENT_WEIGHT_CACHE_POLICY,
+        )
+        resident_pager.close()
 
     def test_darwin_default_limit_uses_current_not_historical_peak_rss(self) -> None:
         from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
