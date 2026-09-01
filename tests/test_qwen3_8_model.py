@@ -1477,7 +1477,12 @@ class Qwen38ModelTests(unittest.TestCase):
             model.reset_state()
             model.prefill([[1, 4]])
             direct_before = bank.metrics().hit_count
-            direct_hidden, direct_evidence = model.decode([[9]])
+            with mock.patch.object(
+                model,
+                "stage_continuation_block",
+                side_effect=AssertionError("direct K1 must retain the fused path"),
+            ):
+                direct_hidden, direct_evidence = model.decode([[9]])
             self.assertEqual(tuple(direct_hidden.shape), (1, 1, self.config.dim))
             torch.testing.assert_close(
                 direct_hidden,

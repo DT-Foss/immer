@@ -1735,6 +1735,55 @@ class StreamedQwen38:
         native_head_crsa_tokenwise_usage: bool = False,
     ) -> tuple[torch.Tensor, AttentionState]:
         base = f"model.language_model.layers.{layer}.self_attn"
+        transaction = self._active_attention_output_crystal_transaction
+        bank = (
+            self.attention_output_crystal_bank
+            if transaction is not None and self.attention_output_crystal_enabled
+            else None
+        )
+        if transaction is not None and bank is None:
+            raise Qwen38RuntimeError(
+                "attention-output Crystal transaction attachment is inconsistent"
+            )
+        crystal_key = None
+        if bank is not None:
+            if (
+                tuple(hidden.shape) != (1, 1, self.config.dim)
+                or token_mask is not None
+            ):
+                raise Qwen38RuntimeError(
+                    "direct attention-output Crystal execution requires K1 decode"
+                )
+            crystal_key = bank.make_key(
+                layer,
+                start_pos,
+                hidden,
+                self._attention_state_sha256(layer, state),
+            )
+            if self.native_prefix_sinkhorn_operator_observer is None:
+                hit = bank.peek(crystal_key, device=hidden.device)
+                if hit is not None:
+                    output, next_state, evidence = (
+                        self._replay_attention_output_crystal_hit(
+                            hit,
+                            layer=layer,
+                            absolute_position=start_pos,
+                            state=state,
+                        )
+                    )
+                    if evidence is not None and native_head_crsa_observer is not None:
+                        native_head_crsa_observer(evidence)
+                    assert transaction is not None
+                    transaction.stage_hit(
+                        start_pos,
+                        hit,
+                        skipped_projection_calls=4,
+                        logical_projection_bytes_saved=(
+                            self._full_attention_logical_projection_bytes()
+                        ),
+                    )
+                    return output, next_state
+
         projected_query_gate, projected_key, projected_value = self.pager.linear_group(
             hidden,
             (f"{base}.q_proj", f"{base}.k_proj", f"{base}.v_proj"),
@@ -1751,6 +1800,13 @@ class StreamedQwen38:
             .unsqueeze(0)
             .expand(hidden.shape[0], -1)
         )
+        captured_native_evidence: list[NativeHeadCrsaEvidence] = []
+
+        def observe_native(evidence: NativeHeadCrsaEvidence) -> None:
+            captured_native_evidence.append(evidence)
+            if native_head_crsa_observer is not None:
+                native_head_crsa_observer(evidence)
+
         try:
             native_head_crsa = (
                 self.native_head_crsa
@@ -1772,7 +1828,7 @@ class StreamedQwen38:
                 attention_mask=token_mask,
                 native_head_crsa=native_head_crsa,
                 native_head_crsa_observer=(
-                    native_head_crsa_observer if native_head_crsa is not None else None
+                    observe_native if native_head_crsa is not None else None
                 ),
                 native_prefix_sinkhorn_operator_observer=(
                     self.native_prefix_sinkhorn_operator_observer
@@ -1789,7 +1845,31 @@ class StreamedQwen38:
         finally:
             del projected_query_gate, projected_key, projected_value
             del q_norm_weight, k_norm_weight
-        return self.pager.linear(mixed, f"{base}.o_proj"), next_state
+        projected = self.pager.linear(mixed, f"{base}.o_proj")
+        if bank is not None:
+            assert transaction is not None and crystal_key is not None
+            if len(captured_native_evidence) > 1:
+                raise Qwen38RuntimeError(
+                    "one direct attention row emitted multiple native receipts"
+                )
+            staged = bank.stage(
+                crystal_key,
+                post_o_proj=projected,
+                appended_rope_key=next_state.key[:, :, -1:].detach(),
+                appended_value=next_state.value[:, :, -1:].detach(),
+                next_crsa_usage=next_state.crsa_log_usage,
+                crsa_evidence=(
+                    None
+                    if not captured_native_evidence
+                    else captured_native_evidence[0]
+                ),
+                logical_projection_bytes=(
+                    self._full_attention_logical_projection_bytes()
+                ),
+                skipped_projection_calls=4,
+            )
+            transaction.stage_capture(start_pos, staged)
+        return projected, next_state
 
     def _linear_attention(
         self,
@@ -4703,8 +4783,24 @@ class StreamedQwen38:
             and self.attention_output_crystal_bank is not None
             and self.delta_probe is None
         ):
-            stage = self.stage_continuation_block(ids, progress=progress)
-            return self.commit_continuation_block(stage)
+            transaction = self.attention_output_crystal_bank.begin_transaction()
+            self._active_attention_output_crystal_transaction = transaction
+            try:
+                hidden, evidence = self.hidden_stateful(
+                    ids,
+                    start_pos=self._next_position,
+                    progress=progress,
+                )
+            except Exception:
+                self._rollback_attention_output_crystal_transaction(transaction)
+                raise
+            finally:
+                self._active_attention_output_crystal_transaction = None
+            self._commit_attention_output_crystal_transaction(
+                transaction,
+                accepted_end_position=self._next_position,
+            )
+            return hidden, evidence
         return self.hidden_stateful(
             ids, start_pos=self._next_position, progress=progress
         )
