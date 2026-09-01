@@ -2575,6 +2575,27 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIn("forward count is inconsistent", result.reason)
         self.assertEqual(model.reset_calls, [True])
 
+    def test_anchor_accounting_accepts_speculative_replay_forwards(self) -> None:
+        from immer.runtimes.qwen3_8.adapter import _anchor_hit_evidence
+
+        evidence = _anchor_hit_evidence(
+            _RESTORED_ANCHOR,
+            prompt_tokens=2,
+            generation={
+                "forward_passes": 3,
+                "generated_tokens": 5,
+                "linear_calls": 990,
+                "source_body_bytes": 123_456,
+            },
+            restore_seconds=0.25,
+            n_layers=64,
+            final_state_committed=False,
+        )
+
+        self.assertEqual(evidence["forward_passes_executed"], 3)
+        self.assertEqual(evidence["forward_passes_saved"], 1)
+        self.assertEqual(evidence["forward_passes_baseline"], 4)
+
     def test_anchor_miss_preserves_the_existing_generation_path(self) -> None:
         model = _AnchorModel()
         result = _chat(

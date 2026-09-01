@@ -650,15 +650,23 @@ def _anchor_hit_evidence(
     if not isinstance(final_state_committed, bool):
         raise TypeError("final_state_committed must be a boolean")
     final_commit = int(final_state_committed)
-    forward_baseline = generation["generated_tokens"] + final_commit
     forward_executed = generation["forward_passes"]
     suffix_tokens = prompt_tokens - prefix_tokens
     prefill_sweeps_executed = int(suffix_tokens > 0)
-    expected_forwards = (
-        generation["generated_tokens"] + prefill_sweeps_executed - (1 - final_commit)
+    processed_generation_tokens = max(
+        0,
+        generation["generated_tokens"] - (1 - final_commit),
     )
-    if forward_executed != expected_forwards:
+    minimum_generation_forwards = (
+        processed_generation_tokens
+        + StreamedQwen38.MAX_CONTINUATION_BLOCK_WIDTH
+        - 1
+    ) // StreamedQwen38.MAX_CONTINUATION_BLOCK_WIDTH
+    minimum_forwards = prefill_sweeps_executed + minimum_generation_forwards
+    if forward_executed < minimum_forwards:
         raise Qwen38ChatError("anchor generation forward count is inconsistent")
+    forward_passes_saved = 1 - prefill_sweeps_executed
+    forward_baseline = forward_executed + forward_passes_saved
     snapshot_artifact_bytes = (
         receipt["snapshot_manifest_bytes"]
         + receipt["snapshot_payload_bytes"]
@@ -679,7 +687,7 @@ def _anchor_hit_evidence(
         "snapshot_bytes_read": 2 * snapshot_artifact_bytes,
         "forward_passes_baseline": forward_baseline,
         "forward_passes_executed": forward_executed,
-        "forward_passes_saved": forward_baseline - forward_executed,
+        "forward_passes_saved": forward_passes_saved,
         "prefill_weight_sweeps_baseline": 1,
         "prefill_weight_sweeps_executed": prefill_sweeps_executed,
         "prefill_weight_sweeps_saved": 1 - prefill_sweeps_executed,
