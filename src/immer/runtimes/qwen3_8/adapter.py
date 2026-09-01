@@ -3604,8 +3604,18 @@ class Qwen38CausalChat:
                 and isinstance(mlp_page_before.get(key, 0), int)
                 and not isinstance(mlp_page_before.get(key, 0), bool)
             }
+            page_count = int(getattr(mlp_page_router, "page_count"))
+            full_page_actions = page_count * max(
+                0,
+                q4_request.get("page_mlp_rows", 0),
+            )
+            mlp_page_request["physical_pages_saved"] = max(
+                0,
+                full_page_actions
+                - max(0, q4_request.get("page_mlp_selected_pages", 0)),
+            )
             evidence["mlp_page_route"] = {
-                "page_count": int(getattr(mlp_page_router, "page_count")),
+                "page_count": page_count,
                 "persistence_error": mlp_page_persistence_error,
                 "request": mlp_page_request,
                 "route_width": int(getattr(mlp_page_router, "route_width")),
@@ -3684,14 +3694,15 @@ class Qwen38CausalChat:
                 if self._last_draft_evidence is None
                 else int(self._last_draft_evidence["accepted_draft_tokens"])
             )
+            saved_page_actions = max(
+                mlp_page_request.get("adaptive_width_pages_saved", 0),
+                mlp_page_request.get("physical_pages_saved", 0),
+            )
             runtime_reward = _joint_runtime_reward(
                 accepted_draft_tokens=accepted,
                 generated_tokens=len(generated_ids),
                 selected_pages=q4_request.get("page_mlp_selected_pages", 0),
-                saved_pages=mlp_page_request.get(
-                    "adaptive_width_pages_saved",
-                    0,
-                ),
+                saved_pages=saved_page_actions,
                 target_forwards=int(receipt["forward_passes"]),
                 o1_priority=o1_priority,
                 successful=bool(output),
@@ -3704,10 +3715,7 @@ class Qwen38CausalChat:
                             "page_mlp_selected_pages",
                             0,
                         ),
-                        "page_actions_saved": mlp_page_request.get(
-                            "adaptive_width_pages_saved",
-                            0,
-                        ),
+                        "page_actions_saved": saved_page_actions,
                         "runtime_reward": runtime_reward,
                     }
                 )
@@ -3729,10 +3737,7 @@ class Qwen38CausalChat:
                 "accepted_draft_tokens": accepted,
                 "o1_priority": o1_priority,
                 "page_actions": q4_request.get("page_mlp_selected_pages", 0),
-                "page_actions_saved": mlp_page_request.get(
-                    "adaptive_width_pages_saved",
-                    0,
-                ),
+                "page_actions_saved": saved_page_actions,
                 "receipt_sha256": reward_receipt,
                 "reward": runtime_reward,
                 "router_updates": None,

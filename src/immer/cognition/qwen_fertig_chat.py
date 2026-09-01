@@ -482,6 +482,7 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                     for key in (
                         "logical_weight_bytes",
                         "page_mlp_prefetch_bytes",
+                        "page_mlp_rows",
                         "page_mlp_selected_pages",
                         "page_mlp_weight_bytes",
                     )
@@ -505,6 +506,7 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                         "dynamic_route_calls",
                         "dynamic_route_changes",
                         "exact_rows",
+                        "physical_pages_saved",
                     )
                     if key in request
                 }

@@ -48,13 +48,14 @@ def _raw_result(output: str = "answer") -> Result:
                 "route_width": 192,
                 "request": {
                     "adaptive_width_pages_saved": 11,
-                    "exact_rows": 2,
+                    "exact_rows": 17,
                 },
             },
             "q4": {
                 "request": {
                     "logical_weight_bytes": 400,
                     "page_mlp_prefetch_bytes": 50,
+                    "page_mlp_rows": 2,
                     "page_mlp_selected_pages": 384,
                     "page_mlp_weight_bytes": 200,
                 },

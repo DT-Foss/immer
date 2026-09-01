@@ -385,9 +385,12 @@ def receipt_from_result(
     warm_hit = result.ok and _authenticated_warm_execution(result, route)
     selected_pages = _uint(q4_request.get("page_mlp_selected_pages"))
     full_page_actions = _uint(page.get("page_count")) * _uint(
-        page_request.get("exact_rows")
+        q4_request.get("page_mlp_rows")
     )
-    route_saved_pages = max(0, full_page_actions - selected_pages)
+    route_saved_pages = max(
+        _uint(page_request.get("physical_pages_saved")),
+        max(0, full_page_actions - selected_pages),
+    )
     receipt = InferenceEconomicsReceipt(
         request_sha256=(
             request_digest

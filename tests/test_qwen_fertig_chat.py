@@ -293,6 +293,7 @@ class QwenFertigChatTests(unittest.TestCase):
                     "request": {
                         "logical_weight_bytes": 400,
                         "page_mlp_prefetch_bytes": 50,
+                        "page_mlp_rows": 1,
                         "page_mlp_selected_pages": 17,
                         "page_mlp_weight_bytes": 200,
                     },
@@ -349,6 +350,7 @@ class QwenFertigChatTests(unittest.TestCase):
             qwen_receipt["q4"]["request"]["page_mlp_weight_bytes"],
             200,
         )
+        self.assertEqual(qwen_receipt["q4"]["request"]["page_mlp_rows"], 1)
         self.assertEqual(
             qwen_receipt["mlp_page_route"]["request"][
                 "adaptive_width_pages_saved"

@@ -958,9 +958,13 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 self.calls = 0
 
             def metrics(self):
-                selected = 20 if self.calls == 0 else 68
+                before = self.calls == 0
+                selected = 20 if before else 68
                 self.calls += 1
-                return {"page_mlp_selected_pages": selected}
+                return {
+                    "page_mlp_rows": 0 if before else 1,
+                    "page_mlp_selected_pages": selected,
+                }
 
         class PageRouter:
             page_count = 272
@@ -1022,7 +1026,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertTrue(result.ok, result.reason)
         expected = (
-            3.0 * (32 / (48 + 32))
+            3.0 * (224 / (48 + 224))
             + math.tanh(math.log1p(9.0) / 4.0)
             - math.log1p(3) / 2.0
         )
@@ -1030,7 +1034,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(reward["schema"], "immer.qwen3.8-joint-runtime-reward/v1")
         self.assertEqual(reward["accepted_draft_tokens"], 0)
         self.assertEqual(reward["page_actions"], 48)
-        self.assertEqual(reward["page_actions_saved"], 32)
+        self.assertEqual(reward["page_actions_saved"], 224)
         self.assertEqual(reward["o1_priority"], 9.0)
         self.assertAlmostEqual(reward["reward"], expected)
         self.assertEqual(reward["router_updates"], 1)
@@ -1045,6 +1049,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(router.events[2][0], "settle")
         self.assertEqual(router.events[2][1], reward["receipt_sha256"])
         self.assertAlmostEqual(router.events[2][2], expected)
+        self.assertEqual(
+            result.evidence["mlp_page_route"]["request"][
+                "physical_pages_saved"
+            ],
+            224,
+        )
         self.assertEqual(q4.calls, 2)
         self.assertGreaterEqual(retention.calls, 3)
         chat.close()
