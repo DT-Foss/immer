@@ -73,10 +73,12 @@ class _Markov:
         self.provider_feedback = []
         self._provider_observations = {
             "markov": [0] * 16,
+            "qwen35": [0] * 16,
             "mtp": [0] * 16,
         }
         self._provider_hits = {
             "markov": [0] * 16,
+            "qwen35": [0] * 16,
             "mtp": [0] * 16,
         }
         self._proposal_index = 0
@@ -296,7 +298,216 @@ class _Mtp:
         self.closed = True
 
 
+@dataclass(frozen=True)
+class _Qwen35Metrics:
+    source_body_bytes: int = 8192
+    linear_calls: int = 17
+    pending: bool = False
+    closed: bool = False
+
+    def to_dict(self):
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
+class _Qwen35:
+    target_state_isolation = "no-target-state-access/v1"
+
+    def __init__(self, tokens=(17, 18, 19)) -> None:
+        self.tokens = tokens
+        self.propose_calls = []
+        self.reconcile_calls = []
+        self.advance_calls = []
+        self.final_calls = []
+        self.pending = False
+        self.closed = False
+
+    def propose_after(self, history, known_token):
+        self.propose_calls.append((history, known_token))
+        self.pending = True
+        return self.tokens
+
+    def reconcile_prefix(self, history):
+        if not self.pending:
+            raise AssertionError("reconcile without qwen35 proposal")
+        self.pending = False
+        self.reconcile_calls.append(history)
+
+    def advance_confirmed_prefix(self, history):
+        if self.pending:
+            raise AssertionError("advance with pending qwen35 proposal")
+        self.advance_calls.append(history)
+
+    def observe_final(self, history):
+        if self.pending:
+            raise AssertionError("final with pending qwen35 proposal")
+        self.final_calls.append(history)
+
+    def metrics(self):
+        return _Qwen35Metrics(pending=self.pending, closed=self.closed)
+
+    def close(self):
+        self.closed = True
+
+
 class Qwen38HybridDraftTests(unittest.TestCase):
+    def test_unknown_qwen35_explores_before_mtp_and_pads_only_with_zero_confidence(
+        self,
+    ) -> None:
+        markov = _Markov(0.01, tokens=tuple(range(30, 45)))
+        qwen35 = _Qwen35()
+        qwen35_factory = mock.Mock(return_value=qwen35)
+        mtp_factory = mock.Mock(return_value=_Mtp())
+        provider = Qwen38MarkovMtpDraftProvider(
+            markov,
+            mtp_factory,
+            qwen35_factory=qwen35_factory,
+            max_new_tokens=16,
+        )
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+
+        self.assertEqual(provider.selected_provider, "qwen35")
+        self.assertEqual(proposal.token_ids[:3], (17, 18, 19))
+        self.assertEqual(proposal.token_confidences[:3], (1.0, 1.0, 1.0))
+        self.assertEqual(proposal.token_confidences[3:], (0.0,) * 12)
+        self.assertLessEqual(proposal.recommended_window, 4)
+        qwen35_factory.assert_called_once_with()
+        mtp_factory.assert_not_called()
+
+        committed = (*prompt, 4, 17, 18)
+        provider.observe_verification(2, 3)
+        provider.reconcile_prefix_state(
+            committed,
+            torch.ones((1, 3, 8)),
+        )
+        provider.observe_final(committed)
+
+        self.assertEqual(qwen35.reconcile_calls, [committed])
+        self.assertIn(("qwen35", 0, True), markov.provider_feedback)
+        self.assertIn(("qwen35", 1, True), markov.provider_feedback)
+        metrics = provider.metrics()
+        self.assertEqual(metrics.qwen35_rounds, 1)
+        self.assertEqual(metrics.qwen35_selections, 1)
+        self.assertEqual(metrics.qwen35_proposed_tokens, 3)
+        self.assertEqual(metrics.qwen35_accepted_tokens, 2)
+        self.assertEqual(metrics.external_source_body_bytes, 8192)
+        self.assertEqual(metrics.external_linear_calls, 17)
+        self.assertEqual(metrics.mtp_shared_source_body_bytes, 0)
+        self.assertEqual(metrics.source_body_bytes, 8192)
+        self.assertEqual(metrics.provider_tournament_qwen35_selections, 1)
+        self.assertIsNotNone(metrics.qwen35)
+        provider.close()
+
+    def test_qwen35_unknown_gets_one_round_then_mtp_is_the_fallback(self) -> None:
+        markov = _Markov([0.01, 0.01])
+        qwen35 = _Qwen35(tokens=(17, 18, 19))
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(
+            markov,
+            lambda: mtp,
+            qwen35_factory=lambda: qwen35,
+            max_new_tokens=8,
+        )
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        first = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+        self.assertEqual(first.token_ids, (17, 18, 19))
+        first_history = (*prompt, 4, 17)
+        provider.reconcile_prefix_state(
+            first_history,
+            torch.ones((1, 2, 8)),
+        )
+
+        second = provider.propose_round_state(
+            first_history,
+            5,
+            torch.ones((1, 1, 8)),
+        )
+
+        self.assertEqual(second.token_ids, (7, 8, 9))
+        self.assertEqual(provider.selected_provider, "mtp")
+        metrics = provider.metrics()
+        self.assertEqual(metrics.qwen35_wave_gate_unknown, 2)
+        self.assertEqual(metrics.qwen35_wave_gate_passes, 1)
+        self.assertEqual(metrics.qwen35_wave_gate_rejections, 1)
+        self.assertEqual(metrics.mtp_wave_gate_passes, 1)
+        provider.reconcile_prefix_state(
+            (*first_history, 5),
+            torch.ones((1, 1, 8)),
+        )
+        self.assertEqual(qwen35.advance_calls, [(*first_history, 5)])
+        provider.observe_final((*first_history, 5))
+        provider.close()
+
+    def test_remaining_budget_blocks_both_expensive_providers(self) -> None:
+        markov = _Markov(0.01)
+        qwen35_factory = mock.Mock(return_value=_Qwen35())
+        mtp_factory = mock.Mock(return_value=_Mtp())
+        provider = Qwen38MarkovMtpDraftProvider(
+            markov,
+            mtp_factory,
+            qwen35_factory=qwen35_factory,
+            max_new_tokens=2,
+        )
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+
+        self.assertEqual(proposal.token_ids, (3, 4, 5))
+        self.assertEqual(provider.selected_provider, "markov")
+        qwen35_factory.assert_not_called()
+        mtp_factory.assert_not_called()
+        metrics = provider.metrics()
+        self.assertEqual(metrics.qwen35_wave_gate_rejections, 1)
+        self.assertEqual(metrics.mtp_wave_gate_rejections, 1)
+        provider.reconcile_prefix_state(
+            (*prompt, 4),
+            torch.ones((1, 1, 8)),
+        )
+        provider.observe_final((*prompt, 4))
+        provider.close()
+
+    def test_learned_unprofitable_qwen35_falls_through_to_shared_mtp(self) -> None:
+        markov = _Markov(0.01)
+        markov.provider_prefix_probability = lambda provider, width: (
+            (0.5, True) if provider == "qwen35" else (0.0, False)
+        )
+        qwen35_factory = mock.Mock(return_value=_Qwen35())
+        mtp = _Mtp()
+        provider = Qwen38MarkovMtpDraftProvider(
+            markov,
+            lambda: mtp,
+            qwen35_factory=qwen35_factory,
+            max_new_tokens=4,
+        )
+        prompt = (1, 2, 3)
+        hidden = torch.zeros((1, len(prompt), 8))
+        provider.begin_request_state(prompt, hidden)
+
+        proposal = provider.propose_round_state(prompt, 4, hidden[:, -1:])
+
+        self.assertEqual(proposal.token_ids, (7, 8, 9))
+        self.assertEqual(provider.selected_provider, "mtp")
+        qwen35_factory.assert_not_called()
+        metrics = provider.metrics()
+        self.assertEqual(metrics.qwen35_wave_gate_rejections, 1)
+        self.assertEqual(metrics.last_qwen35_complete_wave_probability, 0.5)
+        self.assertEqual(metrics.mtp_wave_gate_unknown, 1)
+        self.assertEqual(metrics.mtp_shared_source_body_bytes, 4096)
+        provider.reconcile_prefix_state(
+            (*prompt, 4),
+            torch.ones((1, 1, 8)),
+        )
+        provider.observe_final((*prompt, 4))
+        provider.close()
+
     def test_teacher_verification_delegates_only_for_pending_mtp(self) -> None:
         markov = _Markov([0.01, 0.99])
         mtp = _Mtp()
@@ -1186,7 +1397,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertEqual(proposal.token_ids, (7, 8, 9))
         self.assertEqual(
             proposal.provider_abi,
-            "immer.qwen3.8-markov-mtp-hybrid-provider/v30",
+            "immer.qwen3.8-markov-mtp-hybrid-provider/v31",
         )
         self.assertTrue(
             all(abs(value - 0.7625) < 1e-12 for value in proposal.token_confidences)
@@ -1594,7 +1805,7 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.advance_calls[0][2], final_hidden))
 
         metrics = provider.metrics()
-        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v30")
+        self.assertEqual(metrics.schema, "immer.qwen3.8-markov-mtp-hybrid-provider/v31")
         self.assertEqual(metrics.selected_provider, "markov")
         self.assertEqual(metrics.selection_calls, 4)
         self.assertEqual(metrics.markov_rounds, 3)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from safetensors.torch import save_file
 
@@ -405,6 +406,27 @@ class Qwen35LocalDraftTests(unittest.TestCase):
         self.assertEqual(metrics.restaged_blocks, 0)
         self.assertEqual(metrics.committed_tokens, 8)
 
+    def test_k4_isolated_seal_never_hashes_tensor_bodies_and_can_follow_target(
+        self,
+    ) -> None:
+        provider = Qwen35K4DraftProvider(self._model(), head_block_rows=7)
+        self.assertEqual(
+            provider.target_state_isolation,
+            "no-target-state-access/v1",
+        )
+        with mock.patch(
+            "immer.runtimes.qwen3_8.local_draft._tensor_stamp",
+            side_effect=AssertionError("body hash is forbidden"),
+        ):
+            provider.advance_confirmed_prefix((1, 4, 6))
+            proposal = provider.propose_after((1, 4, 6), 7)
+            provider.reconcile_prefix((1, 4, 6, 7, proposal[0]))
+            provider.observe_final((1, 4, 6, 7, proposal[0], 9))
+
+        self.assertEqual(provider.committed_history, (1, 4, 6, 7, proposal[0], 9))
+        self.assertFalse(provider.metrics().pending)
+        provider.close()
+
     def test_k8_rolling_identical_model_emits_eight_tokens_in_one_wave(self) -> None:
         baseline = self._model()
         expected, baseline_evidence = baseline.generate_greedy(
@@ -659,7 +681,7 @@ class Qwen35LocalDraftTests(unittest.TestCase):
         pending = provider.model._pending_block_stage
         self.assertIsNotNone(pending)
         assert pending is not None
-        pending.layer_states[0].recurrent.data.add_(1.0)
+        pending.layer_states[0].recurrent.add_(1.0)
         with self.assertRaisesRegex(
             Qwen35K4DraftProviderError, "cursor or continuation state drifted"
         ):

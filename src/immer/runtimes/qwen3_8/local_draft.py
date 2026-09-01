@@ -77,6 +77,48 @@ def _layer_state_stamp(states: Iterable[object | None]) -> tuple[object, ...]:
     return tuple(rows)
 
 
+def _tensor_identity_stamp(value: torch.Tensor | None) -> object:
+    """Track an owned tensor without copying its body through the CPU."""
+
+    if value is None:
+        return None
+    return (
+        id(value),
+        int(value._version),
+        tuple(value.shape),
+        str(value.dtype),
+        str(value.device),
+        int(value.data_ptr()),
+    )
+
+
+def _layer_state_identity_stamp(
+    states: Iterable[object | None],
+) -> tuple[object, ...]:
+    rows: list[object] = []
+    for state in states:
+        if state is None:
+            rows.append(None)
+            continue
+        rows.append(
+            (
+                id(state),
+                type(state).__qualname__,
+                *(
+                    _tensor_identity_stamp(getattr(state, name, None))
+                    for name in (
+                        "key",
+                        "value",
+                        "crsa_log_usage",
+                        "conv",
+                        "recurrent",
+                    )
+                ),
+            )
+        )
+    return tuple(rows)
+
+
 @dataclass(frozen=True, slots=True)
 class Qwen35K2DraftProviderMetrics:
     """Cumulative local-draft work and reconciliation outcomes."""
@@ -480,6 +522,8 @@ class Qwen35K4DraftProvider:
     it and replays exactly the target-confirmed delta of width one through four.
     """
 
+    target_state_isolation = "no-target-state-access/v1"
+
     def __init__(
         self,
         model: StreamedQwen38,
@@ -609,10 +653,10 @@ class Qwen35K4DraftProvider:
             id(pending.handle._nonce),
             asdict(pending.evidence),
             pending.runtime_identity,
-            _tensor_stamp(pending.handle.hidden),
-            _tensor_stamp(pending.hidden),
-            _layer_state_stamp(pending.layer_states),
-            _tensor_stamp(pending.graft_history),
+            _tensor_identity_stamp(pending.handle.hidden),
+            _tensor_identity_stamp(pending.hidden),
+            _layer_state_identity_stamp(pending.layer_states),
+            _tensor_identity_stamp(pending.graft_history),
         )
 
     def _runtime_stamp(self) -> tuple[object, ...]:
@@ -621,11 +665,11 @@ class Qwen35K4DraftProvider:
             self.model.state_batch_size,
             self.model.state_poisoned,
             self.model._continuation_block_runtime_identity(),
-            _layer_state_stamp(self.model._layer_states),
-            _tensor_stamp(self.model._graft_history),
+            _layer_state_identity_stamp(self.model._layer_states),
+            _tensor_identity_stamp(self.model._graft_history),
             self._pending_stamp(),
             self._committed_history,
-            _tensor_stamp(self._last_hidden),
+            _tensor_identity_stamp(self._last_hidden),
             self._pending_base,
             self._pending_proposal,
             id(self._pending_stage),
@@ -888,6 +932,48 @@ class Qwen35K4DraftProvider:
                 f"rolling reconciliation failed: {type(exc).__name__}: {exc}",
                 exc,
             )
+
+    def advance_confirmed_prefix(self, history: tuple[int, ...], /) -> None:
+        """Advance an idle local drafter through target-confirmed tokens."""
+
+        self._assert_ready()
+        try:
+            committed = self._history(history, name="confirmed draft history")
+            if self._pending_stage is not None:
+                self._abort("cannot advance with a pending local draft")
+            previous = self._committed_history
+            if previous is None:
+                hidden, _evidence = self.model.prefill([committed], reset=True)
+                self._prefill_calls += 1
+                added = 0
+            else:
+                if committed[: len(previous)] != previous:
+                    self._abort("confirmed history changed the local draft prefix")
+                delta = committed[len(previous) :]
+                if not delta:
+                    return
+                hidden, _evidence = self.model.decode([delta])
+                added = len(delta)
+            self._committed_history = committed
+            self._last_hidden = hidden[:, -1:].detach().clone()
+            self._committed_tokens += added
+            if self.model.next_position != len(committed):
+                self._abort("confirmed draft state has the wrong committed cursor")
+            self._seal = self._runtime_stamp()
+        except Qwen35K4DraftProviderError as exc:
+            if not self._poisoned:
+                self._abort(str(exc), exc)
+            raise
+        except Exception as exc:
+            self._abort(
+                f"confirmed-prefix advance failed: {type(exc).__name__}: {exc}",
+                exc,
+            )
+
+    def observe_final(self, history: tuple[int, ...], /) -> None:
+        """Synchronize an unproposed terminal target suffix before close."""
+
+        self.advance_confirmed_prefix(history)
 
     def reconcile(self, history: tuple[int, ...], /) -> None:
         """Commit only the target-confirmed delta and destroy rejected suffixes."""
