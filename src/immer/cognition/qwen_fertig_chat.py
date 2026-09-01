@@ -490,6 +490,11 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
         request = mlp_page.get("request")
         if isinstance(request, dict):
             summary["mlp_page_route"] = {
+                **{
+                    key: mlp_page[key]
+                    for key in ("page_count", "route_width")
+                    if key in mlp_page
+                },
                 "request": {
                     key: request[key]
                     for key in (

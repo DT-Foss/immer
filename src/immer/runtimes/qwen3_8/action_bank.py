@@ -684,7 +684,20 @@ class InferenceActionBank:
         )
         if not exact and not parametric and not runtime:
             return None
-        runtime_actions = ("qwen_target", "target_verified_draft")
+        runtime_actions = (
+            tuple(
+                action
+                for action in runtime[0].actions
+                if action
+                in {
+                    "dynamic_mlp_pages",
+                    "qwen_target",
+                    "target_verified_draft",
+                }
+            )
+            if runtime
+            else ("qwen_target",)
+        )
         if exact:
             primary = exact[0].actions
         elif parametric:

@@ -224,7 +224,7 @@ class InferenceActionBankTests(unittest.TestCase):
         self.assertEqual(directive.primary_actions, ("stored_result",))
         self.assertEqual(
             directive.fallback_actions,
-            ("qwen_target", "target_verified_draft"),
+            ("dynamic_mlp_pages", "qwen_target", "target_verified_draft"),
         )
         self.assertTrue(directive.draft_enabled)
         self.assertEqual(directive.support, 3)

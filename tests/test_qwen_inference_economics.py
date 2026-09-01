@@ -44,13 +44,18 @@ def _raw_result(output: str = "answer") -> Result:
                 "target_source_body_bytes": 500,
             },
             "mlp_page_route": {
-                "request": {"adaptive_width_pages_saved": 11},
+                "page_count": 272,
+                "route_width": 192,
+                "request": {
+                    "adaptive_width_pages_saved": 11,
+                    "exact_rows": 2,
+                },
             },
             "q4": {
                 "request": {
                     "logical_weight_bytes": 400,
                     "page_mlp_prefetch_bytes": 50,
-                    "page_mlp_selected_pages": 17,
+                    "page_mlp_selected_pages": 384,
                     "page_mlp_weight_bytes": 200,
                 },
             },
@@ -123,7 +128,8 @@ class InferenceEconomicsReceiptTests(unittest.TestCase):
         self.assertEqual(receipt.target_source_body_bytes, 500)
         self.assertEqual(receipt.avoidable_work_bytes["draft_miss"], 33)
         self.assertEqual(receipt.avoidable_work_bytes["target_fallback"], 500)
-        self.assertEqual(receipt.saved_pages, 11)
+        self.assertEqual(receipt.selected_pages, 384)
+        self.assertEqual(receipt.saved_pages, 160)
         self.assertEqual(receipt.o1_priority, 4.5)
         document = receipt.to_document()
         self.assertEqual(InferenceEconomicsReceipt.from_document(document), receipt)

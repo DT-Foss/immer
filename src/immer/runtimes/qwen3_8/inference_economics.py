@@ -383,6 +383,11 @@ def receipt_from_result(
         )
     saved_forwards = _saved_qwen_forwards(result, generation)
     warm_hit = result.ok and _authenticated_warm_execution(result, route)
+    selected_pages = _uint(q4_request.get("page_mlp_selected_pages"))
+    full_page_actions = _uint(page.get("page_count")) * _uint(
+        page_request.get("exact_rows")
+    )
+    route_saved_pages = max(0, full_page_actions - selected_pages)
     receipt = InferenceEconomicsReceipt(
         request_sha256=(
             request_digest
@@ -422,8 +427,11 @@ def receipt_from_result(
         time_to_first_token_seconds=_nonnegative_float(
             generation.get("time_to_first_token_seconds")
         ),
-        selected_pages=_uint(q4_request.get("page_mlp_selected_pages")),
-        saved_pages=_uint(page_request.get("adaptive_width_pages_saved")),
+        selected_pages=selected_pages,
+        saved_pages=max(
+            route_saved_pages,
+            _uint(page_request.get("adaptive_width_pages_saved")),
+        ),
         o1_priority=_nonnegative_float(reward.get("o1_priority")),
         runtime_reward=(
             float(reward.get("reward"))
