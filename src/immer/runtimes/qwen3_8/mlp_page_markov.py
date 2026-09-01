@@ -502,6 +502,14 @@ class MlpPageMarkov:
                             ),
                         )
                         self.advance_selected(layer, payload, row_count=keep)
+                    elif kind == "coordinate":
+                        full_route, selected_width = payload
+                        self.replay_coordinate(
+                            layer,
+                            full_route,
+                            selected_width=selected_width,
+                            row_count=keep,
+                        )
                     else:
                         raise MlpPageMarkovError(
                             "MLP page transaction event is invalid"
@@ -1437,6 +1445,75 @@ class MlpPageMarkov:
                 self.route_width - len(route)
             ) * row_count
             self._dirty = True
+
+    def replay_coordinate(
+        self,
+        layer: int,
+        full_page_ids: Sequence[int],
+        *,
+        selected_width: int,
+        row_count: int = 1,
+    ) -> tuple[int, ...]:
+        """Advance session/transaction state from one exact stored page action."""
+
+        with self._lock:
+            self._ensure_open()
+            self._validate_layer(layer)
+            full_route = self._validate_route(full_page_ids)
+            if (
+                isinstance(selected_width, bool)
+                or not isinstance(selected_width, int)
+                or not 1 <= selected_width <= len(full_route)
+            ):
+                raise ValueError("selected_width is outside the full page route")
+            if (
+                isinstance(row_count, bool)
+                or not isinstance(row_count, int)
+                or row_count <= 0
+            ):
+                raise ValueError("row_count must be a positive integer")
+            selected = full_route[:selected_width]
+            self._begin_wave(layer, row_count=row_count)
+            transaction = self._transaction
+            if transaction is not None:
+                wave = transaction["current_wave"]
+                if wave < 0:
+                    raise MlpPageMarkovError(
+                        "stored MLP coordinate arrived before transaction layer zero"
+                    )
+                registered = transaction["wave_rows"][wave]
+                if registered is None:
+                    transaction["wave_rows"][wave] = row_count
+                elif registered != row_count:
+                    raise MlpPageMarkovError(
+                        "stored MLP coordinate rows changed between layers"
+                    )
+                transaction["events"].append(
+                    (
+                        "coordinate",
+                        wave,
+                        layer,
+                        (full_route, selected_width),
+                        None,
+                        None,
+                        None,
+                    )
+                )
+            self._last_routes[layer] = full_route
+            self._last_widths[layer] = selected_width
+            self._wave_routes[layer] = (full_route,)
+            self._wave_widths[layer] = (selected_width,)
+            if self._reward_active:
+                self._reward_traces.append(
+                    (layer, selected_width, (), row_count, selected, ())
+                )
+            self._metrics["selected_advances"] += 1
+            self._metrics["adaptive_width_predictions"] += 1
+            self._metrics["adaptive_width_pages_saved"] += (
+                self.route_width - selected_width
+            ) * row_count
+            self._dirty = True
+            return selected
 
     def begin_runtime_reward(self) -> None:
         """Start one terminal reward trace for the next normal request."""

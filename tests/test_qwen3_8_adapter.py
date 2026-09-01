@@ -19,6 +19,7 @@ from immer.cli import (
     _QWEN38_MTP_DRAFT_ABI,
     _qwen38_growing_warm_profile,
     _qwen38_output_semantics,
+    _qwen38_service_profile,
     _qwen38_runtime_code_paths,
     main,
 )
@@ -57,6 +58,10 @@ from immer.runtimes.qwen3_8.inference_economics import (
     InferenceEconomicsLedger,
 )
 from immer.runtimes.qwen3_8.markov_draft import MARKOV_DRAFT_PROVIDER_ABI
+from immer.runtimes.qwen3_8.mlp_page_coordinate import (
+    MLP_PAGE_COORDINATE_EVIDENCE_SCHEMA,
+    MlpPageCoordinateIdentity,
+)
 from immer.runtimes.qwen3_8.mtp_draft import (
     QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
     Qwen35MtpCarry,
@@ -630,6 +635,311 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(
             policy["attention_output_crystal"]["identity_sha256"],
             identity.identity_sha256,
+        )
+        chat.close()
+
+    def test_mlp_page_coordinate_mounts_model_verified_identity(self) -> None:
+        runtime = _Runtime()
+        q4_identity = {
+            "bank_codec_abi": 3,
+            "manifest_sha256": "f" * 64,
+            "native_abi": 7,
+            "schema": "q4-fixture/v1",
+        }
+        page_identity = {
+            "policy": "page-fixture/v1",
+            "route_width": 8,
+            "schema": "page-fixture/v1",
+        }
+        runtime.q4_bank = SimpleNamespace(identity=q4_identity)
+        runtime.delta_head_router = SimpleNamespace()
+        runtime.mlp_page_router = SimpleNamespace(
+            snapshot_identity=Mock(return_value=page_identity)
+        )
+        runtime.model.set_delta_head_router = Mock()
+        runtime.model.mlp_page_coordinate_runtime_math_sha256 = Mock(
+            return_value="e" * 64
+        )
+        runtime.model.attach_mlp_page_coordinate_bank = Mock()
+
+        def digest(value):
+            return hashlib.sha256(
+                json.dumps(
+                    value,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("ascii")
+            ).hexdigest()
+
+        identity = MlpPageCoordinateIdentity(
+            runtime_math_sha256="e" * 64,
+            q4_identity_sha256=digest(q4_identity),
+            page_router_identity_sha256=digest(page_identity),
+        )
+        opened = SimpleNamespace(identity=identity, metrics=Mock())
+        with tempfile.TemporaryDirectory() as temporary:
+            configured = Path(temporary) / "mlp-coordinate.json"
+            chat = _chat(
+                runtime,
+                q4_root="/q4",
+                mlp_page_state_path="/state/pages.json",
+                mlp_page_coordinate_state_path=configured,
+            )
+            with patch(
+                "immer.runtimes.qwen3_8.adapter.MlpPageCoordinateBank",
+                return_value=opened,
+            ) as constructor:
+                chat._load_locked()
+
+        state_path, mounted_identity = constructor.call_args.args
+        self.assertEqual(mounted_identity, identity)
+        self.assertIn(".mlp-page-coordinate-", state_path.name)
+        self.assertIn(identity.identity_sha256[:16], state_path.name)
+        self.assertEqual(state_path.suffix, ".json")
+        runtime.model.mlp_page_coordinate_runtime_math_sha256.assert_called_once_with()
+        runtime.model.set_delta_head_router.assert_called_once_with(None)
+        runtime.mlp_page_router.snapshot_identity.assert_called_once_with()
+        runtime.model.attach_mlp_page_coordinate_bank.assert_called_once_with(
+            opened
+        )
+        self.assertIs(chat._mlp_page_coordinate_bank, opened)
+        chat.close()
+
+    def test_mlp_page_coordinate_evidence_is_request_local_delta(self) -> None:
+        runtime = _Runtime()
+        runtime.model.set_mlp_page_coordinate_enabled = Mock()
+        chat = _chat(runtime)
+        chat._load_locked()
+        identity = MlpPageCoordinateIdentity(
+            runtime_math_sha256="e" * 64,
+            q4_identity_sha256="f" * 64,
+            page_router_identity_sha256="d" * 64,
+        )
+
+        def metrics(values):
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "hit_count": values[0],
+                    "identity_sha256": identity.identity_sha256,
+                    "logical_page_weight_bytes_saved": values[2],
+                    "physical_pages_saved": values[1],
+                }
+            )
+
+        bank = SimpleNamespace(
+            identity=identity,
+            metrics=Mock(
+                side_effect=(
+                    metrics((11, 20, 40_960)),
+                    metrics((13, 28, 57_344)),
+                )
+            ),
+        )
+        chat._mlp_page_coordinate_state_path = Path("/state/mlp-coordinate.json")
+        chat._mlp_page_coordinate_bank = bank
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        evidence = result.evidence["mlp_page_coordinate"]
+        self.assertEqual(evidence["schema"], MLP_PAGE_COORDINATE_EVIDENCE_SCHEMA)
+        self.assertEqual(evidence["identity"], identity.to_record())
+        self.assertEqual(evidence["identity_sha256"], identity.identity_sha256)
+        self.assertEqual(
+            evidence["request"],
+            {
+                "hits": 2,
+                "logical_page_weight_bytes_saved": 16_384,
+                "physical_pages_saved": 8,
+            },
+        )
+        self.assertNotIn("hello", json.dumps(evidence, sort_keys=True))
+        runtime.model.set_mlp_page_coordinate_enabled.assert_called_once_with(True)
+        with patch(
+            "immer.runtimes.qwen3_8.adapter._digest",
+            side_effect=lambda value: value,
+        ):
+            policy = chat._result_cell_generation_policy_sha256()
+        self.assertEqual(
+            policy["mlp_page_coordinate"]["identity_sha256"],
+            identity.identity_sha256,
+        )
+        chat.close()
+
+    def test_mlp_page_coordinate_stays_enabled_for_action_discovery(self) -> None:
+        runtime = _Runtime()
+        runtime.model.set_mlp_page_coordinate_enabled = Mock()
+        chat = _chat(runtime)
+        chat._load_locked()
+        identity = MlpPageCoordinateIdentity(
+            runtime_math_sha256="e" * 64,
+            q4_identity_sha256="f" * 64,
+            page_router_identity_sha256="d" * 64,
+        )
+        stable_metrics = SimpleNamespace(
+            to_dict=lambda: {
+                "hit_count": 0,
+                "identity_sha256": identity.identity_sha256,
+                "logical_page_weight_bytes_saved": 0,
+                "physical_pages_saved": 0,
+            }
+        )
+        chat._mlp_page_coordinate_state_path = Path("/state/mlp-coordinate.json")
+        chat._mlp_page_coordinate_bank = SimpleNamespace(
+            identity=identity,
+            metrics=Mock(return_value=stable_metrics),
+        )
+
+        def directive(actions):
+            return InferenceActionDirective(
+                question_sha256=hashlib.sha256(b"hello").hexdigest(),
+                runtime_profile_sha256="2" * 64,
+                primary_actions=actions,
+                fallback_actions=actions,
+                draft_enabled=False,
+                source_signature_sha256s=("3" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+            )
+
+        baseline = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {
+                    QWEN38_INFERENCE_ACTION_METADATA: directive(
+                        ("qwen_target",)
+                    ).to_document()
+                },
+            )
+        )
+        selected = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {
+                    QWEN38_INFERENCE_ACTION_METADATA: directive(
+                        ("mlp_page_coordinate", "qwen_target")
+                    ).to_document()
+                },
+            )
+        )
+
+        self.assertTrue(baseline.ok, baseline.reason)
+        self.assertTrue(selected.ok, selected.reason)
+        baseline_applied = baseline.evidence["inference_action_directive"][
+            "applied"
+        ]
+        selected_applied = selected.evidence["inference_action_directive"][
+            "applied"
+        ]
+        self.assertTrue(baseline_applied["mlp_page_coordinate"])
+        self.assertFalse(
+            baseline_applied["mlp_page_coordinate_directive_selected"]
+        )
+        self.assertTrue(selected_applied["mlp_page_coordinate"])
+        self.assertTrue(
+            selected_applied["mlp_page_coordinate_directive_selected"]
+        )
+        self.assertEqual(
+            runtime.model.set_mlp_page_coordinate_enabled.call_args_list,
+            [call(True), call(True)],
+        )
+        chat.close()
+
+    def test_delta_action_disables_coordinate_before_router_swap(self) -> None:
+        runtime = _Runtime()
+        events: list[tuple[str, object]] = []
+        coordinate_enabled = True
+
+        def set_coordinate(enabled):
+            nonlocal coordinate_enabled
+            coordinate_enabled = enabled
+            events.append(("coordinate", enabled))
+
+        def set_delta(router):
+            if router is not None and coordinate_enabled:
+                raise RuntimeError("Delta attached before coordinate opt-out")
+            runtime.model.delta_head_router = router
+            events.append(("delta", router))
+
+        runtime.model.set_mlp_page_coordinate_enabled = Mock(
+            side_effect=set_coordinate
+        )
+        runtime.model.set_delta_head_router = Mock(side_effect=set_delta)
+        router = SimpleNamespace(
+            metrics=Mock(
+                side_effect=(
+                    {"calls": 0, "logical_bytes_saved": 0, "rows": 0},
+                    {"calls": 1, "logical_bytes_saved": 10, "rows": 2},
+                )
+            )
+        )
+        runtime.delta_head_router = router
+        runtime.delta_head_receipt = {
+            "layers": [0],
+            "schema": "fixture.delta-head/v2",
+        }
+        chat = _chat(
+            runtime,
+            q4_root="/q4",
+            delta_head_state_path="/state/delta.json",
+        )
+        chat._load_locked()
+        identity = MlpPageCoordinateIdentity(
+            runtime_math_sha256="e" * 64,
+            q4_identity_sha256="f" * 64,
+            page_router_identity_sha256="d" * 64,
+        )
+        stable_metrics = SimpleNamespace(
+            to_dict=lambda: {
+                "hit_count": 0,
+                "identity_sha256": identity.identity_sha256,
+                "logical_page_weight_bytes_saved": 0,
+                "physical_pages_saved": 0,
+            }
+        )
+        chat._mlp_page_coordinate_state_path = Path("/state/mlp-coordinate.json")
+        chat._mlp_page_coordinate_bank = SimpleNamespace(
+            identity=identity,
+            metrics=Mock(return_value=stable_metrics),
+        )
+        directive = InferenceActionDirective(
+            question_sha256=hashlib.sha256(b"hello").hexdigest(),
+            runtime_profile_sha256="2" * 64,
+            primary_actions=("mlp_head_coordinate", "qwen_target"),
+            fallback_actions=("qwen_target",),
+            draft_enabled=False,
+            source_signature_sha256s=("3" * 64,),
+            support=1,
+            saved_qwen_forwards=0,
+        )
+
+        result = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {QWEN38_INFERENCE_ACTION_METADATA: directive.to_document()},
+            )
+        )
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(
+            events,
+            [
+                ("delta", None),
+                ("coordinate", False),
+                ("delta", router),
+                ("delta", None),
+                ("coordinate", True),
+            ],
+        )
+        self.assertFalse(
+            result.evidence["inference_action_directive"]["applied"][
+                "mlp_page_coordinate"
+            ]
         )
         chat.close()
 
@@ -1667,6 +1977,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             "unused-tokenizer.json",
             q4_root="/models/qwen-q4",
             mlp_page_state_path="/state/mlp-pages.json",
+            mlp_page_coordinate_state_path="/state/mlp-coordinate.json",
             mlp_page_route_width=192,
         )
         self.assertEqual(
@@ -1674,6 +1985,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
             Path("/state/mlp-pages.json"),
         )
         self.assertEqual(component._mlp_page_route_width, 192)
+        self.assertEqual(
+            component._mlp_page_coordinate_state_path,
+            Path("/state/mlp-coordinate.json"),
+        )
         component.close()
 
         with self.assertRaisesRegex(ValueError, "requires Q4"):
@@ -1697,6 +2012,22 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 q4_root="/models/qwen-q4",
                 mlp_page_state_path="/state/mlp-pages.json",
                 mlp_page_route_width=272,
+            )
+        with self.assertRaisesRegex(ValueError, "require Q4 MLP page routing"):
+            Qwen38CausalChat(
+                "unused.causal",
+                "unused-tokenizer.json",
+                q4_root="/models/qwen-q4",
+                mlp_page_coordinate_state_path="/state/mlp-coordinate.json",
+            )
+        with self.assertRaisesRegex(ValueError, "require bfloat16"):
+            Qwen38CausalChat(
+                "unused.causal",
+                "unused-tokenizer.json",
+                compute_dtype="float32",
+                q4_root="/models/qwen-q4",
+                mlp_page_state_path="/state/mlp-pages.json",
+                mlp_page_coordinate_state_path="/state/mlp-coordinate.json",
             )
 
     def test_success_is_lazy_uses_no_thinking_prompt_and_returns_compact_receipts(
@@ -2150,6 +2481,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "draft_window_ceiling": None,
                 "mlp_head_coordinate": False,
                 "mlp_head_coordinate_directive_selected": False,
+                "mlp_page_coordinate": False,
+                "mlp_page_coordinate_directive_selected": False,
             },
         )
         self.assertEqual(
@@ -3711,6 +4044,23 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 mlp_page_state_path=root / "pages-a.json",
             )
             args.attention_output_crystal_state = None
+            args.mlp_page_coordinate_state = root / "coordinate-a.json"
+            coordinate_routed = _qwen38_growing_warm_profile(
+                **common,
+                mlp_page_state_path=root / "pages-a.json",
+            )
+            args.mlp_page_coordinate_state = root / "coordinate-b.json"
+            same_coordinate_other_file = _qwen38_growing_warm_profile(
+                **common,
+                mlp_page_state_path=root / "pages-a.json",
+            )
+            semantics_coordinate = _qwen38_output_semantics(
+                args,
+                tokenizer_path=tokenizer,
+                q4_root=q4,
+                mlp_page_state_path=root / "pages-a.json",
+            )
+            args.mlp_page_coordinate_state = None
             same_policy_other_file = _qwen38_growing_warm_profile(
                 **common,
                 mlp_page_state_path=root / "pages-b.json",
@@ -3759,10 +4109,13 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotEqual(disabled, routed)
         self.assertNotEqual(routed, crystal_routed)
         self.assertEqual(crystal_routed, same_crystal_other_file)
+        self.assertNotEqual(routed, coordinate_routed)
+        self.assertEqual(coordinate_routed, same_coordinate_other_file)
         self.assertEqual(routed, same_policy_other_file)
         self.assertNotEqual(routed, changed_width)
         self.assertNotEqual(routed, changed_policy)
         self.assertEqual(semantics_a, semantics_threads)
+        self.assertEqual(semantics_a, semantics_coordinate)
         self.assertNotEqual(routed, changed_runtime_code)
 
     def test_cli_draft_abis_match_runtime_exports(self) -> None:
@@ -3775,6 +4128,45 @@ class Qwen38CausalChatTests(unittest.TestCase):
             _QWEN38_MTP_DRAFT_ABI,
             QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
         )
+
+    def test_service_profile_binds_coordinate_activation_not_state_path(
+        self,
+    ) -> None:
+        args = SimpleNamespace(
+            mlp_page_coordinate_state=Path("/state/coordinate-a.json")
+        )
+        common = {
+            "args": args,
+            "bundle_path": Path("/models/qwen"),
+            "tokenizer_path": Path("/models/qwen/tokenizer.json"),
+            "q4_root": Path("/models/qwen/q4"),
+            "fast_mlp_root": None,
+            "warm_root": None,
+            "draft_mode": None,
+            "markov_draft_state": None,
+            "mtp_draft_state": None,
+            "markov_atlas_path": None,
+            "markov_o1_retention_path": None,
+            "mlp_page_state_path": Path("/state/pages.json"),
+            "draft_window_state_path": None,
+            "runtime_code_revision": "a" * 64,
+        }
+        enabled_a = _qwen38_service_profile(
+            **common,
+            mlp_page_coordinate_enabled=True,
+        )
+        args.mlp_page_coordinate_state = Path("/other/coordinate-b.json")
+        enabled_b = _qwen38_service_profile(
+            **common,
+            mlp_page_coordinate_enabled=True,
+        )
+        disabled = _qwen38_service_profile(
+            **common,
+            mlp_page_coordinate_enabled=False,
+        )
+
+        self.assertEqual(enabled_a, enabled_b)
+        self.assertNotEqual(enabled_a, disabled)
 
     def test_cli_explicit_layout_does_not_inherit_deployed_q4(self) -> None:
         qwen = _chat(_Runtime())
@@ -3976,6 +4368,59 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIsInstance(cache, SemanticStateAnchorCache)
         self.assertEqual(cache.root, anchor)
 
+    def test_cli_non_bf16_deployment_requires_coordinate_opt_out(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            (deployed / "causal" / "q4-base-v3-mtp").mkdir(parents=True)
+            page_state = Path(temporary) / "pages.json"
+            coordinate_state = Path(temporary) / "coordinate.json"
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_MLP_PAGE_STATE",
+                    page_state,
+                ),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_MLP_PAGE_COORDINATE_STATE",
+                    coordinate_state,
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stderr(io.StringIO()),
+                redirect_stdout(io.StringIO()),
+            ):
+                rejected = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--compute-dtype",
+                        "float32",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+                accepted = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--compute-dtype",
+                        "float32",
+                        "--no-mlp-page-coordinate",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+
+        self.assertEqual(rejected, 2)
+        self.assertEqual(accepted, 0)
+        self.assertIsNone(
+            constructor.call_args.kwargs["mlp_page_coordinate_state_path"]
+        )
+
     def test_cli_deployment_enables_passive_economics_by_default(self) -> None:
         qwen = _chat(_Runtime())
         with tempfile.TemporaryDirectory() as temporary:
@@ -4053,6 +4498,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             markov_state.write_bytes(b"fixture")
             mtp_state = Path(temporary) / "qwen-mtp.json"
             page_state = Path(temporary) / "qwen-mlp-pages.json"
+            coordinate_state = Path(temporary) / "qwen-mlp-coordinate.json"
             context_state = Path(temporary) / "qwen-context.json"
             with (
                 patch.dict("os.environ", {}, clear=True),
@@ -4065,6 +4511,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 patch(
                     "immer.cli._QWEN38_DEPLOYMENT_MLP_PAGE_STATE",
                     page_state,
+                ),
+                patch(
+                    "immer.cli._QWEN38_DEPLOYMENT_MLP_PAGE_COORDINATE_STATE",
+                    coordinate_state,
                 ),
                 patch(
                     "immer.cli._QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE",
@@ -4085,6 +4535,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["markov_draft_state_path"], str(markov_state))
         self.assertEqual(options["mtp_draft_state_path"], str(mtp_state))
         self.assertEqual(options["mlp_page_state_path"], page_state)
+        self.assertEqual(
+            options["mlp_page_coordinate_state_path"],
+            str(coordinate_state),
+        )
         self.assertEqual(
             options["contextual_continuation_state_path"],
             str(context_state),
@@ -4119,6 +4573,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "hello",
                         "--raw-qwen",
                         "--no-mlp-page-route",
+                        "--no-mlp-page-coordinate",
                         "--no-context-crystal",
                         "--no-attention-output-crystal",
                     ]
@@ -4128,6 +4583,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         options = constructor.call_args.kwargs
         self.assertEqual(options["q4_root"], str(q4))
         self.assertIsNone(options["mlp_page_state_path"])
+        self.assertIsNone(options["mlp_page_coordinate_state_path"])
         self.assertIsNone(options["contextual_continuation_state_path"])
         self.assertIsNone(options["attention_output_crystal_state_path"])
 
@@ -5061,6 +5517,49 @@ class Qwen38CausalChatTests(unittest.TestCase):
             "/state/qwen-delta-head.json",
         )
         self.assertEqual(options["delta_head_active_layers"], (0, 2, 4))
+
+    def test_cli_wires_and_can_disable_mlp_page_coordinates(self) -> None:
+        qwen = _chat(_Runtime())
+        common = [
+            "chat",
+            "hello",
+            "--qwen38-causal-bundle",
+            "/models/qwen.causal",
+            "--qwen38-tokenizer",
+            "/models/tokenizer.json",
+            "--qwen38-q4",
+            "/models/qwen-q4",
+            "--mlp-page-state",
+            "/state/pages.json",
+            "--mlp-page-coordinate-state",
+            "/state/mlp-coordinate.json",
+            "--raw-qwen",
+            "--no-markov-draft",
+        ]
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(common)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            constructor.call_args.kwargs["mlp_page_coordinate_state_path"],
+            "/state/mlp-coordinate.json",
+        )
+
+        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            conflict = main([*common, "--no-mlp-page-coordinate"])
+            missing_router = main(
+                [
+                    item
+                    for item in common
+                    if item not in {"--mlp-page-state", "/state/pages.json"}
+                ]
+            )
+        self.assertEqual(conflict, 2)
+        self.assertEqual(missing_router, 2)
 
     def test_cli_wires_native_prefix_sinkhorn_into_the_qwen_runtime(self) -> None:
         qwen = _chat(_Runtime())

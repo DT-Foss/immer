@@ -28,6 +28,10 @@ from immer.runtimes.qwen3_8.model import (
     StreamedQwen38,
 )
 from immer.runtimes.qwen3_8.kernels import AttentionState, DeltaNetState
+from immer.runtimes.qwen3_8.mlp_page_coordinate import (
+    MlpPageCoordinateBank,
+    MlpPageCoordinateIdentity,
+)
 from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
 from immer.runtimes.qwen3_8.semantic_state_cache import SemanticStateAnchorCache
 from immer.runtimes.qwen3_8.graft import (
@@ -667,6 +671,182 @@ class Qwen38ModelTests(unittest.TestCase):
                 mlp_page_router=router,
                 max_seq_len=32,
             )
+
+    def test_exact_k1_mlp_page_coordinate_replays_the_executed_route(self) -> None:
+        class Q4Stub:
+            identity = {"manifest_sha256": "c" * 64}
+
+            def __init__(self) -> None:
+                self.page_weight_bytes = 0
+                base = "model.language_model.layers.1.mlp"
+                self.entries = {
+                    f"{base}.{name}.weight": SimpleNamespace(payload_bytes=100)
+                    for name in ("gate_proj", "up_proj", "down_proj")
+                }
+
+            @staticmethod
+            def has(_name: str) -> bool:
+                return True
+
+            @staticmethod
+            def mlp(*_args, **_kwargs):
+                raise AssertionError("pager mock owns full MLP execution")
+
+            @staticmethod
+            def mlp_selected_pages(*_args, **_kwargs):
+                raise AssertionError("pager mock owns selected MLP execution")
+
+            def metrics(self):
+                return {"page_mlp_weight_bytes": self.page_weight_bytes}
+
+        class PageRouter:
+            route_width = 4
+            page_count = 4
+
+            def __init__(self) -> None:
+                self.routed = []
+                self.replayed = []
+
+            @staticmethod
+            def prepare(layer: int):
+                return SimpleNamespace(layer=layer, ready=False, page_ids=())
+
+            @staticmethod
+            def observe_exact_batch(_layer, _ids, _scores, _totals) -> None:
+                pass
+
+            @staticmethod
+            def advance_selected(_layer, _ids, *, row_count=1) -> None:
+                pass
+
+            @staticmethod
+            def begin_transaction() -> None:
+                pass
+
+            @staticmethod
+            def begin_exact_wave(_layer: int) -> None:
+                pass
+
+            @staticmethod
+            def compile_routes() -> None:
+                pass
+
+            @staticmethod
+            def commit_transaction(*, accepted_rows=None) -> None:
+                pass
+
+            @staticmethod
+            def rollback_transaction() -> None:
+                pass
+
+            @staticmethod
+            def reset_session() -> None:
+                pass
+
+            def route(self, layer: int, *, row_count: int):
+                self.routed.append((layer, row_count))
+                return SimpleNamespace(
+                    ready=True,
+                    page_ids=(3, 1),
+                    full_page_ids=(3, 1, 2, 0),
+                )
+
+            def replay_coordinate(
+                self,
+                layer,
+                full_page_ids,
+                *,
+                selected_width,
+                row_count=1,
+            ):
+                selected = tuple(full_page_ids)[:selected_width]
+                self.replayed.append((layer, selected, row_count))
+                return selected
+
+            @staticmethod
+            def snapshot_identity():
+                return {"schema": "test-page-router/v1"}
+
+            @staticmethod
+            def metrics():
+                return {}
+
+        router = PageRouter()
+        q4 = Q4Stub()
+        route_config_mapping = _tiny_config_mapping()
+        route_config_mapping["intermediate_size"] = 256
+        route_config = Qwen38Config.from_mapping(
+            route_config_mapping,
+            require_official=False,
+        )
+        model = StreamedQwen38(
+            route_config,
+            self.pager,
+            mlp_page_router=router,
+            max_batch_size=1,
+            max_seq_len=16,
+        )
+        original_q4 = self.pager.q4_bank
+        original_dtype = self.pager.compute_dtype
+        self.pager.q4_bank = q4
+        self.pager.compute_dtype = torch.bfloat16
+        hidden = torch.ones(1, 1, self.config.dim, dtype=torch.bfloat16)
+
+        def selected_output(values, _names, _pages):
+            q4.page_weight_bytes += 100
+            return torch.full_like(values, 0.25)
+
+        try:
+            components = model._mlp_page_coordinate_identity_components()
+            bank = MlpPageCoordinateBank(
+                self.root / "mlp-page-coordinates.json",
+                MlpPageCoordinateIdentity(**components),
+                max_cells=16,
+            )
+            model.attach_mlp_page_coordinate_bank(bank)
+            delta_router = SimpleNamespace(
+                begin_transaction=mock.Mock(),
+                commit_transaction=mock.Mock(),
+                finalize_transaction=mock.Mock(),
+                project=mock.Mock(),
+                project_many=mock.Mock(),
+                reset_session=mock.Mock(),
+                revert_committed_transaction=mock.Mock(),
+                rollback_transaction=mock.Mock(),
+                snapshot_identity=mock.Mock(return_value={"layers": [0]}),
+                supports_layer=mock.Mock(return_value=True),
+            )
+            with self.assertRaisesRegex(Qwen38RuntimeError, "MLP page bank"):
+                model.set_delta_head_router(delta_router)
+            with mock.patch.object(
+                self.pager,
+                "mlp_selected_pages",
+                side_effect=selected_output,
+            ):
+                first_transaction = bank.begin_transaction()
+                model._active_mlp_page_coordinate_transaction = first_transaction
+                first = model._mlp(hidden, layer=1, absolute_position=5)
+                model._active_mlp_page_coordinate_transaction = None
+                first_transaction.commit(accepted_end_position=6)
+
+                router.routed.clear()
+                second_transaction = bank.begin_transaction()
+                model._active_mlp_page_coordinate_transaction = second_transaction
+                second = model._mlp(hidden, layer=1, absolute_position=5)
+                model._active_mlp_page_coordinate_transaction = None
+                second_transaction.commit(accepted_end_position=6)
+
+            self.assertTrue(torch.equal(first, second))
+            self.assertEqual(router.routed, [])
+            self.assertEqual(router.replayed, [(1, (3, 1), 1)])
+            metrics = bank.metrics()
+            self.assertEqual(metrics.hit_count, 1)
+            self.assertEqual(metrics.physical_pages_saved, 2)
+            self.assertEqual(metrics.logical_page_weight_bytes_saved, 200)
+        finally:
+            model._active_mlp_page_coordinate_transaction = None
+            self.pager.q4_bank = original_q4
+            self.pager.compute_dtype = original_dtype
 
     def test_continuation_stage_transactions_page_route_state(self) -> None:
         class PageRouter:
@@ -1356,6 +1536,41 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(self.model.next_position, 4)
         with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
             self.model.discard_continuation_block(next_stage)
+
+    def test_k1_continuation_owns_mlp_coordinate_transaction_to_commit(self) -> None:
+        self.model.prefill([[1, 4]])
+        bank = MlpPageCoordinateBank(
+            self.root / "lifecycle-mlp-page-coordinates.json",
+            MlpPageCoordinateIdentity(
+                runtime_math_sha256="a" * 64,
+                q4_identity_sha256="b" * 64,
+                page_router_identity_sha256="c" * 64,
+            ),
+            max_cells=8,
+        )
+        # This lifecycle test does not execute the Q4 page seam; the dedicated
+        # model test above covers exact capture/replay.  Bind the real bank
+        # directly so the pending owner can be observed with the BF16-free fixture.
+        self.model.mlp_page_coordinate_bank = bank
+        self.model.mlp_page_coordinate_enabled = True
+
+        discarded = self.model.stage_continuation_block([[9]])
+        discarded_owner = (
+            self.model._pending_block_stage.mlp_page_coordinate_transaction_owner
+        )
+        self.assertIsNotNone(discarded_owner)
+        self.model.discard_continuation_block(discarded)
+        self.assertTrue(discarded_owner.closed)
+
+        first = self.model.stage_continuation_block([[9]])
+        owner = self.model._pending_block_stage.mlp_page_coordinate_transaction_owner
+        extended = self.model.extend_continuation_block(first, [[7]])
+        self.assertIs(
+            self.model._pending_block_stage.mlp_page_coordinate_transaction_owner,
+            owner,
+        )
+        self.model.commit_continuation_prefix(extended, 1)
+        self.assertTrue(owner.closed)
 
     def test_attention_output_crystal_replays_exact_attention_before_weight_reads(
         self,

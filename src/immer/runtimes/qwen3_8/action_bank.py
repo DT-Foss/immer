@@ -31,6 +31,7 @@ ACTION_CATALOG = (
     "external_drafter",
     "fertig_exact",
     "mlp_head_coordinate",
+    "mlp_page_coordinate",
     "parametric_program",
     "prefix_sinkhorn",
     "qwen_suffix",
@@ -109,6 +110,7 @@ def executed_actions_from_result(
     prefix_sinkhorn = execution.get("prefix_sinkhorn")
     delta_head_router = execution.get("delta_head_router")
     attention_output_crystal = execution.get("attention_output_crystal")
+    mlp_page_coordinate = execution.get("mlp_page_coordinate")
     draft = execution.get("draft")
     battery_hit = (
         isinstance(anchor, Mapping) and anchor.get("status") == "hit"
@@ -150,6 +152,24 @@ def executed_actions_from_result(
             )
         ):
             actions = tuple(sorted({*actions, "attention_output_crystal"}))
+    if (
+        "qwen_target" in actions
+        and isinstance(mlp_page_coordinate, Mapping)
+        and mlp_page_coordinate.get("schema")
+        == "immer.qwen3.8-mlp-page-coordinate-evidence/v1"
+    ):
+        request = mlp_page_coordinate.get("request")
+        if isinstance(request, Mapping) and all(
+            isinstance(request.get(field), int)
+            and not isinstance(request.get(field), bool)
+            and request.get(field, 0) > 0
+            for field in (
+                "hits",
+                "physical_pages_saved",
+                "logical_page_weight_bytes_saved",
+            )
+        ):
+            actions = tuple(sorted({*actions, "mlp_page_coordinate"}))
     if isinstance(draft, Mapping):
         crystal = draft.get("context_crystal")
         accepted = (
@@ -220,7 +240,11 @@ class InferenceActionReceipt:
         _nonnegative_float(self.request_wall_seconds, "request_wall_seconds")
         if any(
             action in self.actions
-            for action in ("attention_output_crystal", "mlp_head_coordinate")
+            for action in (
+                "attention_output_crystal",
+                "mlp_head_coordinate",
+                "mlp_page_coordinate",
+            )
         ) and ("qwen_target" not in self.actions or self.target_forwards <= 0):
             raise ValueError(
                 "coordinate actions require executed Qwen target work"
@@ -394,6 +418,10 @@ class InferenceActionDirective:
             if "mlp_head_coordinate" in actions and "qwen_target" not in actions:
                 raise ValueError(
                     f"{name} mlp_head_coordinate requires qwen_target"
+                )
+            if "mlp_page_coordinate" in actions and "qwen_target" not in actions:
+                raise ValueError(
+                    f"{name} mlp_page_coordinate requires qwen_target"
                 )
         if self.draft_enabled is not None and not isinstance(
             self.draft_enabled,
@@ -743,6 +771,7 @@ class InferenceActionBank:
             and (
                 "attention_output_crystal" in receipt.actions
                 or "mlp_head_coordinate" in receipt.actions
+                or "mlp_page_coordinate" in receipt.actions
                 or (
                     "target_verified_draft" in receipt.actions
                     and receipt.saved_qwen_forwards > 0
@@ -756,6 +785,7 @@ class InferenceActionBank:
             and "qwen_target" in receipt.actions
             and (
                 "attention_output_crystal" in receipt.actions
+                or "mlp_page_coordinate" in receipt.actions
                 or (
                     "target_verified_draft" in receipt.actions
                     and receipt.saved_qwen_forwards > 0
@@ -783,6 +813,7 @@ class InferenceActionBank:
                     "compute_crystal",
                     "continuation_battery",
                     "dynamic_mlp_pages",
+                    "mlp_page_coordinate",
                     "qwen_target",
                     "target_verified_draft",
                 }
@@ -798,6 +829,8 @@ class InferenceActionBank:
             runtime_action_set.update(
                 {"attention_output_crystal", "qwen_target"}
             )
+        if any("mlp_page_coordinate" in receipt.actions for receipt in runtime):
+            runtime_action_set.update({"mlp_page_coordinate", "qwen_target"})
         if exact_runtime and any(
             "mlp_head_coordinate" in receipt.actions for receipt in exact_runtime
         ):

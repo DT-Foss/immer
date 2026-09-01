@@ -135,6 +135,47 @@ class MlpPageMarkovTests(unittest.TestCase):
         self.assertEqual(metrics["energy_feedback_rows"], 4)
         self.assertEqual(metrics["width_marginal_contexts"], 1)
 
+    def test_exact_coordinate_replay_survives_transaction_prefix_commit(self) -> None:
+        controller = MlpPageMarkov(
+            None,
+            n_layers=2,
+            page_count=8,
+            route_width=4,
+            min_exact_rows=1,
+        )
+        controller.begin_transaction()
+        self.assertEqual(
+            controller.replay_coordinate(
+                0,
+                (0, 1, 2, 3),
+                selected_width=2,
+            ),
+            (0, 1),
+        )
+        controller.replay_coordinate(
+            1,
+            (4, 5, 6, 7),
+            selected_width=3,
+        )
+        controller.replay_coordinate(
+            0,
+            (3, 2, 1, 0),
+            selected_width=1,
+        )
+        controller.replay_coordinate(
+            1,
+            (7, 6, 5, 4),
+            selected_width=1,
+        )
+
+        controller.commit_transaction(accepted_rows=1)
+
+        self.assertEqual(controller._last_routes, [(0, 1, 2, 3), (4, 5, 6, 7)])
+        self.assertEqual(controller._last_widths, [2, 3])
+        metrics = controller.metrics()
+        self.assertEqual(metrics["selected_advances"], 2)
+        self.assertEqual(metrics["adaptive_width_pages_saved"], 3)
+
     def test_width_agents_follow_temporal_and_cross_layer_causal_context(self) -> None:
         controller = MlpPageMarkov(
             None,

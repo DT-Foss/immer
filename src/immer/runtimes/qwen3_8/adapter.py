@@ -74,6 +74,11 @@ from .mlp_page_markov import (
     MLP_PAGE_MARKOV_SCHEMA,
     MlpPageMarkov,
 )
+from .mlp_page_coordinate import (
+    MLP_PAGE_COORDINATE_EVIDENCE_SCHEMA,
+    MlpPageCoordinateBank,
+    MlpPageCoordinateIdentity,
+)
 from .mtp_draft import (
     MTP_MATRIX_NAMES,
     QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
@@ -167,6 +172,17 @@ def _digest(value: object) -> str:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _transport_neutral_digest(value: object) -> str:
+    payload = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -842,6 +858,16 @@ class _OwnedRuntime:
                 detach_attention_crystal(None)
             except Exception as exc:
                 failures.append(exc)
+        detach_mlp_page_coordinate = getattr(
+            self.model,
+            "attach_mlp_page_coordinate_bank",
+            None,
+        )
+        if callable(detach_mlp_page_coordinate):
+            try:
+                detach_mlp_page_coordinate(None)
+            except Exception as exc:
+                failures.append(exc)
         self.model.mlp_sparse_executor = None
         self.model.mlp_page_router = None
         self.model.delta_head_router = None
@@ -1330,6 +1356,7 @@ class Qwen38CausalChat:
         fast_mlp_selected_block_count: int | None = None,
         fast_mlp_online_state_path: str | Path | None = None,
         mlp_page_state_path: str | Path | None = None,
+        mlp_page_coordinate_state_path: str | Path | None = None,
         mlp_page_route_width: int = 192,
         delta_head_state_path: str | Path | None = None,
         delta_head_active_layers: Sequence[int] | None = None,
@@ -1591,6 +1618,13 @@ class Qwen38CausalChat:
             (str, Path),
         ):
             raise TypeError("mlp_page_state_path must be a local path or None")
+        if mlp_page_coordinate_state_path is not None and not isinstance(
+            mlp_page_coordinate_state_path,
+            (str, Path),
+        ):
+            raise TypeError(
+                "mlp_page_coordinate_state_path must be a local path or None"
+            )
         if delta_head_state_path is not None and not isinstance(
             delta_head_state_path,
             (str, Path),
@@ -1666,6 +1700,15 @@ class Qwen38CausalChat:
                 )
             if mlp_page_route_width >= 272:
                 raise ValueError("mlp_page_route_width must leave at least one page out")
+        if mlp_page_coordinate_state_path is not None:
+            if q4_root is None or mlp_page_state_path is None:
+                raise ValueError(
+                    "MLP page coordinates require Q4 MLP page routing"
+                )
+            if compute_dtype not in {"auto", "bfloat16"}:
+                raise ValueError(
+                    "MLP page coordinates require bfloat16 compute_dtype"
+                )
         if q4_root is not None and any(
             value is not None for value in (exact_head_root, range_markov_state_path)
         ):
@@ -1774,6 +1817,11 @@ class Qwen38CausalChat:
             if mlp_page_state_path is None
             else Path(mlp_page_state_path).expanduser().absolute()
         )
+        self._mlp_page_coordinate_state_path = (
+            None
+            if mlp_page_coordinate_state_path is None
+            else Path(mlp_page_coordinate_state_path).expanduser().absolute()
+        )
         self._mlp_page_route_width = mlp_page_route_width
         self._delta_head_state_path = (
             None
@@ -1800,6 +1848,7 @@ class Qwen38CausalChat:
         self._last_delta_head_evidence: dict[str, Any] | None = None
         self._last_exact_head_evidence: dict[str, Any] | None = None
         self._last_attention_output_crystal_evidence: dict[str, int] | None = None
+        self._last_mlp_page_coordinate_evidence: dict[str, int] | None = None
         self._draft_window_selection: DraftWindowSelection | None = None
         self._action_bank_draft_window_ceiling: int | None = None
         self._draft_window_policy_metrics: dict[str, Any] | None = None
@@ -1812,6 +1861,7 @@ class Qwen38CausalChat:
         self._markov_o1_retention: O1MarkovRetention | None = None
         self._contextual_continuation_bank: ContextualContinuationBank | None = None
         self._attention_output_crystal_bank: AttentionOutputCrystalBank | None = None
+        self._mlp_page_coordinate_bank: MlpPageCoordinateBank | None = None
         self._conversation_session_id: str | None = None
         self._conversation_prefix_token_ids: tuple[int, ...] = ()
         self._conversation_mtp_carry: Qwen35MtpCarry | None = None
@@ -2171,6 +2221,19 @@ class Qwen38CausalChat:
                 "width_actions": list(
                     MlpPageMarkov.width_actions_for(route_width)
                 ),
+            }
+        if self._mlp_page_coordinate_state_path is not None:
+            bank = self._mlp_page_coordinate_bank
+            policy["mlp_page_coordinate"] = {
+                "enabled": True,
+                "evidence_schema": MLP_PAGE_COORDINATE_EVIDENCE_SCHEMA,
+                "identity": (
+                    None if bank is None else bank.identity.to_record()
+                ),
+                "identity_sha256": (
+                    None if bank is None else bank.identity.identity_sha256
+                ),
+                "scope": "exact-k1-page-action/v1",
             }
         return _digest(policy)
 
@@ -2672,6 +2735,7 @@ class Qwen38CausalChat:
         self._last_delta_head_evidence = None
         self._last_exact_head_evidence = None
         self._last_attention_output_crystal_evidence = None
+        self._last_mlp_page_coordinate_evidence = None
         fast_mount = getattr(runtime, "fast_mlp_mount", None)
         fast_before = None if fast_mount is None else fast_mount.metrics()
         delta_router = getattr(runtime.model, "delta_head_router", None)
@@ -3430,6 +3494,68 @@ class Qwen38CausalChat:
         self._last_attention_output_crystal_evidence = request
         return request
 
+    def _mlp_page_coordinate_metrics(self) -> dict[str, int] | None:
+        bank = self._mlp_page_coordinate_bank
+        if bank is None:
+            return None
+        metrics = bank.metrics()
+        to_dict = getattr(metrics, "to_dict", None)
+        if not callable(to_dict):
+            raise Qwen38ChatError(
+                "MLP page coordinate metrics lack to_dict()"
+            )
+        record = to_dict()
+        if not isinstance(record, Mapping):
+            raise Qwen38ChatError(
+                "MLP page coordinate metrics are not a mapping"
+            )
+        if record.get("identity_sha256") != bank.identity.identity_sha256:
+            raise Qwen38ChatError(
+                "MLP page coordinate metrics changed runtime identity"
+            )
+        counters: dict[str, int] = {}
+        for field in (
+            "hit_count",
+            "physical_pages_saved",
+            "logical_page_weight_bytes_saved",
+        ):
+            value = record.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise Qwen38ChatError(
+                    f"MLP page coordinate {field} is invalid"
+                )
+            counters[field] = value
+        return counters
+
+    def _record_mlp_page_coordinate_request(
+        self,
+        before: Mapping[str, int] | None,
+        after: Mapping[str, int] | None,
+    ) -> dict[str, int] | None:
+        if before is None or after is None:
+            return None
+        fields = {
+            "hits": "hit_count",
+            "physical_pages_saved": "physical_pages_saved",
+            "logical_page_weight_bytes_saved": (
+                "logical_page_weight_bytes_saved"
+            ),
+        }
+        request = {
+            output: int(after[source]) - int(before[source])
+            for output, source in fields.items()
+        }
+        if any(value < 0 for value in request.values()):
+            raise Qwen38ChatError(
+                "MLP page coordinate request counters moved backwards"
+            )
+        self._last_mlp_page_coordinate_evidence = request
+        return request
+
     def _base_evidence(self) -> dict[str, Any]:
         evidence: dict[str, Any] = {
             "execution": "local-authenticated-causal-bundle/v1",
@@ -3498,6 +3624,13 @@ class Qwen38CausalChat:
                 "identity": identity.to_record(),
                 "identity_sha256": identity.identity_sha256,
                 "schema": ATTENTION_OUTPUT_CRYSTAL_EVIDENCE_SCHEMA,
+            }
+        if self._mlp_page_coordinate_bank is not None:
+            identity = self._mlp_page_coordinate_bank.identity
+            evidence["mlp_page_coordinate"] = {
+                "identity": identity.to_record(),
+                "identity_sha256": identity.identity_sha256,
+                "schema": MLP_PAGE_COORDINATE_EVIDENCE_SCHEMA,
             }
         return evidence
 
@@ -3663,6 +3796,91 @@ class Qwen38CausalChat:
                         "runtime model must attach attention-output Crystal banks"
                     )
                 attach_bank(attention_output_crystal_bank)
+            mlp_page_coordinate_bank = None
+            if self._mlp_page_coordinate_state_path is not None:
+                configured_delta_router = getattr(
+                    runtime,
+                    "delta_head_router",
+                    None,
+                )
+                if configured_delta_router is not None:
+                    set_delta_head_router = getattr(
+                        model,
+                        "set_delta_head_router",
+                        None,
+                    )
+                    if not callable(set_delta_head_router):
+                        raise TypeError(
+                            "runtime model cannot isolate MLP page coordinates"
+                        )
+                    set_delta_head_router(None)
+                runtime_math_identity = getattr(
+                    model,
+                    "mlp_page_coordinate_runtime_math_sha256",
+                    None,
+                )
+                if not callable(runtime_math_identity):
+                    raise TypeError(
+                        "runtime model lacks MLP page coordinate identity"
+                    )
+                runtime_math_sha256 = runtime_math_identity()
+                if not _is_sha256(runtime_math_sha256):
+                    raise Qwen38ChatError(
+                        "runtime model returned an invalid MLP page "
+                        "coordinate identity"
+                    )
+                q4_bank = getattr(runtime, "q4_bank", None)
+                if q4_bank is None:
+                    q4_bank = getattr(getattr(model, "pager", None), "q4_bank", None)
+                q4_identity = getattr(q4_bank, "identity", None)
+                if not isinstance(q4_identity, Mapping):
+                    raise Qwen38ChatError(
+                        "MLP page coordinate bank lacks a Q4 identity"
+                    )
+                mlp_page_router = getattr(runtime, "mlp_page_router", None)
+                snapshot_identity = getattr(
+                    mlp_page_router,
+                    "snapshot_identity",
+                    None,
+                )
+                if not callable(snapshot_identity):
+                    raise Qwen38ChatError(
+                        "MLP page coordinate bank lacks a page-router identity"
+                    )
+                page_router_identity = snapshot_identity()
+                if not isinstance(page_router_identity, Mapping):
+                    raise Qwen38ChatError(
+                        "MLP page router identity is invalid"
+                    )
+                coordinate_identity = MlpPageCoordinateIdentity(
+                    runtime_math_sha256=runtime_math_sha256,
+                    q4_identity_sha256=_transport_neutral_digest(
+                        dict(q4_identity)
+                    ),
+                    page_router_identity_sha256=_transport_neutral_digest(
+                        dict(page_router_identity)
+                    ),
+                )
+                configured = self._mlp_page_coordinate_state_path
+                suffix = configured.suffix or ".json"
+                state_path = configured.with_name(
+                    f"{configured.stem}.mlp-page-coordinate-"
+                    f"{coordinate_identity.identity_sha256[:16]}{suffix}"
+                )
+                mlp_page_coordinate_bank = MlpPageCoordinateBank(
+                    state_path,
+                    coordinate_identity,
+                )
+                attach_bank = getattr(
+                    model,
+                    "attach_mlp_page_coordinate_bank",
+                    None,
+                )
+                if not callable(attach_bank):
+                    raise TypeError(
+                        "runtime model must attach MLP page coordinate banks"
+                    )
+                attach_bank(mlp_page_coordinate_bank)
             model_context = _positive_int(
                 getattr(model, "max_seq_len", None), "runtime model max_seq_len"
             )
@@ -3699,6 +3917,7 @@ class Qwen38CausalChat:
         self._markov_o1_retention = markov_o1_retention
         self._contextual_continuation_bank = contextual_continuation_bank
         self._attention_output_crystal_bank = attention_output_crystal_bank
+        self._mlp_page_coordinate_bank = mlp_page_coordinate_bank
         return runtime
 
     def _template_anchor_prefix(
@@ -3865,6 +4084,23 @@ class Qwen38CausalChat:
             set_attention_output_crystal_enabled(
                 attention_output_crystal_applied
             )
+        mlp_page_coordinate_applied = False
+        mlp_page_coordinate_directive_selected = False
+        if self._mlp_page_coordinate_bank is not None:
+            mlp_page_coordinate_applied = not delta_head_applied
+            mlp_page_coordinate_directive_selected = (
+                "mlp_page_coordinate" in effective_qwen_actions
+            )
+            set_mlp_page_coordinate_enabled = getattr(
+                runtime.model,
+                "set_mlp_page_coordinate_enabled",
+                None,
+            )
+            if not callable(set_mlp_page_coordinate_enabled):
+                raise Qwen38ChatError(
+                    "runtime model cannot select MLP page coordinate execution"
+                )
+            set_mlp_page_coordinate_enabled(mlp_page_coordinate_applied)
         if delta_head_applied:
             assert callable(set_delta_head_router)
             set_delta_head_router(delta_head_router)
@@ -4131,6 +4367,7 @@ class Qwen38CausalChat:
         attention_output_crystal_before = (
             self._attention_output_crystal_metrics()
         )
+        mlp_page_coordinate_before = self._mlp_page_coordinate_metrics()
         request_started = time.perf_counter()
         raw_generated, raw_evidence = self._generate_locked(
             runtime,
@@ -4154,9 +4391,24 @@ class Qwen38CausalChat:
                         "runtime model lost attention-output Crystal selection"
                     )
                 set_attention_output_crystal_enabled(True)
+            if self._mlp_page_coordinate_bank is not None:
+                set_mlp_page_coordinate_enabled = getattr(
+                    runtime.model,
+                    "set_mlp_page_coordinate_enabled",
+                    None,
+                )
+                if not callable(set_mlp_page_coordinate_enabled):
+                    raise Qwen38ChatError(
+                        "runtime model lost MLP page coordinate selection"
+                    )
+                set_mlp_page_coordinate_enabled(True)
         self._record_attention_output_crystal_request(
             attention_output_crystal_before,
             self._attention_output_crystal_metrics(),
+        )
+        self._record_mlp_page_coordinate_request(
+            mlp_page_coordinate_before,
+            self._mlp_page_coordinate_metrics(),
         )
         q4_after = _runtime_q4_metrics(runtime)
         mlp_page_persistence_error = None
@@ -4366,6 +4618,10 @@ class Qwen38CausalChat:
                     "mlp_head_coordinate_directive_selected": (
                         delta_head_directive_selected
                     ),
+                    "mlp_page_coordinate": mlp_page_coordinate_applied,
+                    "mlp_page_coordinate_directive_selected": (
+                        mlp_page_coordinate_directive_selected
+                    ),
                     "draft_enabled": self._last_draft_evidence is not None,
                     "draft_window_ceiling": (
                         None
@@ -4398,6 +4654,11 @@ class Qwen38CausalChat:
                 "request": dict(
                     self._last_attention_output_crystal_evidence
                 ),
+            }
+        if self._last_mlp_page_coordinate_evidence is not None:
+            evidence["mlp_page_coordinate"] = {
+                **dict(evidence["mlp_page_coordinate"]),
+                "request": dict(self._last_mlp_page_coordinate_evidence),
             }
         settle_page_reward = getattr(
             mlp_page_router,
@@ -4826,6 +5087,17 @@ class Qwen38CausalChat:
                             "runtime model lost attention-output Crystal selection"
                         )
                     crystal_setter(True)
+                if self._mlp_page_coordinate_bank is not None:
+                    coordinate_setter = getattr(
+                        runtime.model,
+                        "set_mlp_page_coordinate_enabled",
+                        None,
+                    )
+                    if not callable(coordinate_setter):
+                        raise Qwen38ChatError(
+                            "runtime model lost MLP page coordinate selection"
+                        )
+                    coordinate_setter(True)
 
             try:
                 result = self._execute_locked(
@@ -4983,6 +5255,7 @@ class Qwen38CausalChat:
             self._markov_o1_retention = None
             self._contextual_continuation_bank = None
             self._attention_output_crystal_bank = None
+            self._mlp_page_coordinate_bank = None
             self._clear_conversation_binding()
             self._closed = True
             if runtime is not None:

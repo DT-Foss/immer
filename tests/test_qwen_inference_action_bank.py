@@ -408,6 +408,33 @@ class InferenceActionReceiptTests(unittest.TestCase):
             ),
         )
 
+    def test_exact_mlp_page_coordinate_records_physical_page_work(self) -> None:
+        economics = _economics(
+            "mlp-page-coordinate",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "mlp_page_coordinate": {
+                    "schema": "immer.qwen3.8-mlp-page-coordinate-evidence/v1",
+                    "request": {
+                        "hits": 4,
+                        "logical_page_weight_bytes_saved": 8192,
+                        "physical_pages_saved": 320,
+                    },
+                }
+            },
+        )
+        self.assertEqual(
+            executed_actions_from_result(result, economics),
+            ("mlp_page_coordinate", "qwen_target"),
+        )
+
 
 class InferenceActionBankTests(unittest.TestCase):
     def test_observe_restart_duplicate_and_ranking(self) -> None:
@@ -677,6 +704,37 @@ class InferenceActionBankTests(unittest.TestCase):
                 question_sha256=_sha("invalid coordinate"),
                 runtime_profile_sha256=_sha("profile"),
                 primary_actions=("mlp_head_coordinate",),
+                fallback_actions=("qwen_target",),
+                draft_enabled=None,
+                source_signature_sha256s=("3" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+            )
+
+    def test_mlp_page_coordinate_is_safe_additive_runtime_replay(self) -> None:
+        economics = _economics(
+            "mlp-page-coordinate-runtime",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        actions = ("mlp_page_coordinate", "qwen_target")
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            bank.observe(economics, executed_actions=actions)
+            directive = bank.recommend(
+                question_sha256=_sha("page-coordinate question"),
+                runtime_profile_sha256=_sha("other profile"),
+            )
+
+        assert directive is not None
+        self.assertEqual(directive.primary_actions, actions)
+        self.assertEqual(directive.fallback_actions, actions)
+        with self.assertRaises(ValueError):
+            InferenceActionDirective(
+                question_sha256=_sha("invalid page coordinate"),
+                runtime_profile_sha256=_sha("profile"),
+                primary_actions=("mlp_page_coordinate",),
                 fallback_actions=("qwen_target",),
                 draft_enabled=None,
                 source_signature_sha256s=("3" * 64,),

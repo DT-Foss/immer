@@ -118,6 +118,9 @@ _QWEN38_DEPLOYMENT_O1_RETENTION = (
 _QWEN38_DEPLOYMENT_MLP_PAGE_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-mlp-page-markov-v1.json"
 )
+_QWEN38_DEPLOYMENT_MLP_PAGE_COORDINATE_STATE = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-mlp-page-coordinate-v1.json"
+)
 _QWEN38_DEPLOYMENT_DRAFT_WINDOW_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-draft-window-v1.bin"
 )
@@ -316,8 +319,16 @@ def _qwen38_service_profile(
     draft_window_state_path: Path | None,
     runtime_code_revision: str,
     attention_output_crystal_state_path: Path | None = None,
+    mlp_page_coordinate_enabled: bool | None = None,
 ) -> str:
     """Bind socket clients to the exact output-affecting runtime configuration."""
+
+    if mlp_page_coordinate_enabled is None:
+        mlp_page_coordinate_enabled = (
+            getattr(args, "mlp_page_coordinate_state", None) is not None
+        )
+    if not isinstance(mlp_page_coordinate_enabled, bool):
+        raise TypeError("mlp_page_coordinate_enabled must be boolean")
 
     argument_names = (
         "compute_dtype",
@@ -373,6 +384,7 @@ def _qwen38_service_profile(
         "attention_output_crystal": (
             attention_output_crystal_state_path is not None
         ),
+        "mlp_page_coordinate": mlp_page_coordinate_enabled,
         "arguments": {
             name: normalized(getattr(args, name, None)) for name in argument_names
         },
@@ -534,6 +546,9 @@ def _qwen38_growing_warm_profile(
                 ),
                 "output": "exact-full-attention-token-transition/v1",
             }
+        ),
+        "mlp_page_coordinate": (
+            getattr(args, "mlp_page_coordinate_state", None) is not None
         ),
         "compute_dtype": args.compute_dtype,
         "device": "cpu" if args.device == "auto" else args.device,
@@ -1559,6 +1574,51 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     "--mlp-page-state and --fast-mlp are mutually exclusive"
                 )
             fast_mlp_root = None
+        disable_mlp_page_coordinate = bool(
+            getattr(args, "no_mlp_page_coordinate", False)
+        )
+        if disable_mlp_page_coordinate and getattr(
+            args,
+            "mlp_page_coordinate_state",
+            None,
+        ) is not None:
+            raise ValueError(
+                "--mlp-page-coordinate-state and "
+                "--no-mlp-page-coordinate are mutually exclusive"
+            )
+        mlp_page_coordinate_state_path = (
+            None
+            if disable_mlp_page_coordinate
+            else _chat_path(
+                getattr(args, "mlp_page_coordinate_state", None),
+                "IMMER_QWEN38_MLP_PAGE_COORDINATE_STATE",
+            )
+        )
+        if (
+            not disable_mlp_page_coordinate
+            and mlp_page_coordinate_state_path is None
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+            and q4_root is not None
+            and mlp_page_state_path is not None
+        ):
+            mlp_page_coordinate_state_path = (
+                _QWEN38_DEPLOYMENT_MLP_PAGE_COORDINATE_STATE
+            )
+        if mlp_page_coordinate_state_path is not None and (
+            q4_root is None or mlp_page_state_path is None
+        ):
+            raise ValueError(
+                "MLP page coordinates require local Q4 MLP page routing"
+            )
+        if (
+            mlp_page_coordinate_state_path is not None
+            and args.compute_dtype not in {"auto", "bfloat16"}
+        ):
+            raise ValueError(
+                "MLP page coordinates require bfloat16 compute; pass "
+                "--no-mlp-page-coordinate to use another dtype"
+            )
+        args.mlp_page_coordinate_state = mlp_page_coordinate_state_path
         if bool(getattr(args, "no_markov_draft", False)) and markov_atlas_path is not None:
             raise ValueError("--markov-atlas and --no-markov-draft are mutually exclusive")
         if (
@@ -1738,6 +1798,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             mlp_page_state_path=mlp_page_state_path,
             attention_output_crystal_state_path=(
                 attention_output_crystal_state_path
+            ),
+            mlp_page_coordinate_enabled=(
+                mlp_page_coordinate_state_path is not None
             ),
             draft_window_state_path=draft_window_state_path,
             runtime_code_revision=runtime_code_revision,
@@ -2214,6 +2277,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             fast_mlp_root=None if fast_mlp_root is None else str(fast_mlp_root),
             fast_mlp_online_state_path=args.fast_mlp_online_state,
             mlp_page_state_path=mlp_page_state_path,
+            mlp_page_coordinate_state_path=(
+                None
+                if mlp_page_coordinate_state_path is None
+                else str(mlp_page_coordinate_state_path)
+            ),
             mlp_page_route_width=args.mlp_page_width,
             fast_mlp_source_budget_mb=args.fast_mlp_source_budget_mb,
             fast_mlp_max_resident_bytes=(
@@ -3403,6 +3471,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-mlp-page-route",
         action="store_true",
         help="disable the deployed direct Markov MLP page route",
+    )
+    chat.add_argument(
+        "--mlp-page-coordinate-state",
+        help=(
+            "persistent exact K1 MLP page actions keyed by target BF16 inputs"
+        ),
+    )
+    chat.add_argument(
+        "--no-mlp-page-coordinate",
+        action="store_true",
+        help="disable the deployed exact K1 MLP page coordinate bank",
     )
     chat.add_argument(
         "--delta-head-online-state",

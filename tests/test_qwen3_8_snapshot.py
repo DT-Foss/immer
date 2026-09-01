@@ -354,6 +354,10 @@ class Qwen38SnapshotTests(unittest.TestCase):
             "immer/runtimes/qwen3_8/attention_output_crystal.py",
             runtime_paths,
         )
+        self.assertIn(
+            "immer/runtimes/qwen3_8/mlp_page_coordinate.py",
+            runtime_paths,
+        )
         self.assertIn("immer/runtimes/qwen3_8/native_crsa.py", runtime_paths)
         self.assertIn("immer/runtimes/qwen3_8/native_fork.py", runtime_paths)
 

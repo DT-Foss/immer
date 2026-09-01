@@ -40,6 +40,10 @@ from .kernels import (
     rms_norm,
     swiglu,
 )
+from .mlp_page_coordinate import (
+    MlpPageCoordinateBank,
+    MlpPageCoordinateTransaction,
+)
 from .native_crsa import (
     NativeHeadCrsaEvidence,
     NativePrefixSinkhornOperatorBlock,
@@ -267,6 +271,7 @@ class _PendingStatefulBlock:
     attention_output_crystal_transaction_owner: (
         AttentionOutputCrystalTransaction | None
     )
+    mlp_page_coordinate_transaction_owner: MlpPageCoordinateTransaction | None
 
 
 class StreamedQwen38:
@@ -308,6 +313,7 @@ class StreamedQwen38:
         mlp_page_router: Any | None = None,
         delta_head_router: Any | None = None,
         attention_output_crystal_bank: AttentionOutputCrystalBank | None = None,
+        mlp_page_coordinate_bank: MlpPageCoordinateBank | None = None,
         native_deltanet_recurrence: bool = False,
         native_deltanet_fusion: bool = False,
         packed_continuation_gemm: bool = False,
@@ -540,6 +546,12 @@ class StreamedQwen38:
             AttentionOutputCrystalTransaction | None
         ) = None
         self._attention_output_crystal_failures = 0
+        self.mlp_page_coordinate_bank: MlpPageCoordinateBank | None = None
+        self.mlp_page_coordinate_enabled = False
+        self._active_mlp_page_coordinate_transaction: (
+            MlpPageCoordinateTransaction | None
+        ) = None
+        self._mlp_page_coordinate_failures = 0
         self._attention_state_digest_cache: dict[
             tuple[object, ...],
             tuple[
@@ -567,6 +579,8 @@ class StreamedQwen38:
         self._pending_block_stage: _PendingStatefulBlock | None = None
         if attention_output_crystal_bank is not None:
             self.attach_attention_output_crystal_bank(attention_output_crystal_bank)
+        if mlp_page_coordinate_bank is not None:
+            self.attach_mlp_page_coordinate_bank(mlp_page_coordinate_bank)
 
     @property
     def next_position(self) -> int:
@@ -652,6 +666,86 @@ class StreamedQwen38:
             )
         self.attention_output_crystal_enabled = enabled
 
+    @property
+    def mlp_page_coordinate_failures(self) -> int:
+        return self._mlp_page_coordinate_failures
+
+    def mlp_page_coordinate_runtime_math_sha256(self) -> str:
+        """Bind exact page actions to the live Q4 target and router policy."""
+
+        return self._snapshot_digest(
+            {
+                "runtime": self._snapshot_identity(transport_neutral=True),
+                "schema": "immer.qwen3.8-mlp-page-coordinate-runtime-math/v1",
+                "transition": "exact-bf16-mlp-input-to-q4-page-action/v1",
+            }
+        )
+
+    def _mlp_page_coordinate_identity_components(self) -> dict[str, str]:
+        q4_bank = getattr(self.pager, "q4_bank", None)
+        router = self.mlp_page_router
+        if q4_bank is None or not isinstance(getattr(q4_bank, "identity", None), dict):
+            raise Qwen38RuntimeError("MLP page coordinates require a Q4 identity")
+        if router is None:
+            raise Qwen38RuntimeError("MLP page coordinates require a page router")
+        if not callable(getattr(router, "replay_coordinate", None)):
+            raise Qwen38RuntimeError(
+                "MLP page coordinates require router replay support"
+            )
+        router_identity = router.snapshot_identity()
+        if not isinstance(router_identity, dict):
+            raise Qwen38RuntimeError("MLP page router identity is invalid")
+        return {
+            "runtime_math_sha256": self.mlp_page_coordinate_runtime_math_sha256(),
+            "q4_identity_sha256": self._snapshot_digest(dict(q4_bank.identity)),
+            "page_router_identity_sha256": self._snapshot_digest(router_identity),
+        }
+
+    def attach_mlp_page_coordinate_bank(
+        self,
+        bank: MlpPageCoordinateBank | None,
+    ) -> None:
+        """Attach an exact K1 page-action bank while no request is staged."""
+
+        if bank is not None and not isinstance(bank, MlpPageCoordinateBank):
+            raise TypeError(
+                "mlp_page_coordinate_bank must be an MlpPageCoordinateBank or None"
+            )
+        if bank is not None and self.pager.compute_dtype != torch.bfloat16:
+            raise ValueError("MLP page coordinates require exact BF16 execution")
+        if (
+            self._pending_block_stage is not None
+            or self._active_mlp_page_coordinate_transaction is not None
+        ):
+            raise Qwen38RuntimeError(
+                "MLP page coordinate attachment cannot change during a stage"
+            )
+        if bank is not None:
+            expected = self._mlp_page_coordinate_identity_components()
+            identity = bank.identity
+            if any(getattr(identity, field) != value for field, value in expected.items()):
+                raise Qwen38RuntimeError(
+                    "MLP page coordinate identity does not match the target"
+                )
+        self.mlp_page_coordinate_bank = bank
+        self.mlp_page_coordinate_enabled = bank is not None
+
+    def set_mlp_page_coordinate_enabled(self, enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise TypeError("MLP page coordinate activation must be boolean")
+        if enabled and self.mlp_page_coordinate_bank is None:
+            raise Qwen38RuntimeError(
+                "MLP page coordinate activation requires an attached bank"
+            )
+        if (
+            self._pending_block_stage is not None
+            or self._active_mlp_page_coordinate_transaction is not None
+        ):
+            raise Qwen38RuntimeError(
+                "MLP page coordinate activation cannot change during a stage"
+            )
+        self.mlp_page_coordinate_enabled = enabled
+
     def set_delta_head_router(self, router: Any | None) -> None:
         """Select one output-changing DeltaNet coordinate action while idle."""
 
@@ -687,9 +781,17 @@ class StreamedQwen38:
                 raise Qwen38RuntimeError(
                     "Delta head coordinates require an action-bound attention bank"
                 )
+            if (
+                self.mlp_page_coordinate_enabled
+                or self._active_mlp_page_coordinate_transaction is not None
+            ):
+                raise Qwen38RuntimeError(
+                    "Delta head coordinates require an action-bound MLP page bank"
+                )
         if (
             self._pending_block_stage is not None
             or self._active_attention_output_crystal_transaction is not None
+            or self._active_mlp_page_coordinate_transaction is not None
         ):
             raise Qwen38RuntimeError(
                 "Delta head coordinate action cannot change during a stage"
@@ -2134,7 +2236,34 @@ class StreamedQwen38:
         observe = getattr(executor, "observe_full", None)
         return observe if callable(observe) else None
 
-    def _mlp(self, hidden: torch.Tensor, *, layer: int) -> torch.Tensor:
+    @staticmethod
+    def _q4_mlp_full_payload_bytes(q4_bank: Any, names: tuple[str, str, str]) -> int:
+        entries = getattr(q4_bank, "entries", None)
+        if not isinstance(entries, dict):
+            raise Qwen38RuntimeError("Q4 bank lacks an MLP payload inventory")
+        total = 0
+        for name in names:
+            try:
+                entry = entries[name]
+            except KeyError:
+                raise Qwen38RuntimeError(f"Q4 bank lacks {name}") from None
+            value = (
+                entry.get("payload_bytes")
+                if isinstance(entry, dict)
+                else getattr(entry, "payload_bytes", None)
+            )
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise Qwen38RuntimeError("Q4 MLP payload size is invalid")
+            total += value
+        return total
+
+    def _mlp(
+        self,
+        hidden: torch.Tensor,
+        *,
+        layer: int,
+        absolute_position: int | None = None,
+    ) -> torch.Tensor:
         row_count = hidden.numel() // hidden.shape[-1]
         if row_count == 1 and self._sparse_mlp_allowed(layer, row_count):
             try:
@@ -2166,6 +2295,108 @@ class StreamedQwen38:
         ):
             page_router = self.mlp_page_router
             if page_router is not None:
+                coordinate_transaction = (
+                    self._active_mlp_page_coordinate_transaction
+                )
+                coordinate_bank = (
+                    self.mlp_page_coordinate_bank
+                    if coordinate_transaction is not None
+                    and self.mlp_page_coordinate_enabled
+                    else None
+                )
+                if coordinate_transaction is not None and coordinate_bank is None:
+                    raise Qwen38RuntimeError(
+                        "MLP page coordinate transaction attachment is inconsistent"
+                    )
+                coordinate_key = None
+                if coordinate_bank is not None:
+                    if row_count != 1 or absolute_position is None:
+                        raise Qwen38RuntimeError(
+                            "MLP page coordinate replay currently requires K1 decode"
+                        )
+                    coordinate_key = coordinate_bank.make_key(
+                        layer,
+                        absolute_position,
+                        hidden,
+                        row_count=1,
+                    )
+                    hit = coordinate_bank.peek(coordinate_key)
+                    if hit is not None:
+                        selected_page_ids = hit.selected_page_ids
+                        if any(
+                            page < 0 or page >= page_router.page_count
+                            for page in selected_page_ids
+                        ):
+                            raise Qwen38RuntimeError(
+                                "MLP page coordinate hit exceeds the page topology"
+                            )
+                        replay_coordinate = getattr(
+                            page_router,
+                            "replay_coordinate",
+                            None,
+                        )
+                        if not callable(replay_coordinate):
+                            raise Qwen38RuntimeError(
+                                "MLP page router cannot replay stored coordinates"
+                            )
+                        replayed = replay_coordinate(
+                            layer,
+                            hit.page_ids,
+                            selected_width=hit.selected_width,
+                            row_count=1,
+                        )
+                        if tuple(replayed) != selected_page_ids:
+                            raise Qwen38RuntimeError(
+                                "MLP page router changed the stored coordinate"
+                            )
+                        before_weight_bytes = int(
+                            q4_bank.metrics().get("page_mlp_weight_bytes", 0)
+                        )
+                        route_shape = (*hidden.shape[:-1], len(selected_page_ids))
+                        output = self.pager.mlp_selected_pages(
+                            hidden,
+                            fused_names,
+                            torch.tensor(
+                                selected_page_ids,
+                                dtype=torch.int64,
+                                device="cpu",
+                            )
+                            .reshape(
+                                *((1,) * (hidden.ndim - 1)),
+                                len(selected_page_ids),
+                            )
+                            .expand(route_shape)
+                            .contiguous(),
+                        )
+                        selected_weight_bytes = max(
+                            0,
+                            int(
+                                q4_bank.metrics().get(
+                                    "page_mlp_weight_bytes",
+                                    before_weight_bytes,
+                                )
+                            )
+                            - before_weight_bytes,
+                        )
+                        logical_saved = max(
+                            0,
+                            self._q4_mlp_full_payload_bytes(q4_bank, fused_names)
+                            - selected_weight_bytes,
+                        )
+                        if logical_saved != hit.logical_page_weight_bytes_saved:
+                            raise Qwen38RuntimeError(
+                                "MLP page coordinate savings changed under its identity"
+                            )
+                        coordinate_transaction.stage_hit(
+                            absolute_position,
+                            hit,
+                            physical_pages_saved=(
+                                page_router.page_count - len(selected_page_ids)
+                            ),
+                            logical_page_weight_bytes_saved=logical_saved,
+                        )
+                        self._observe_layer_boundary(layer, "mlp.output", output)
+                        return output
                 prediction = (
                     page_router.route(layer, row_count=row_count)
                     if row_count == 1
@@ -2177,6 +2408,13 @@ class StreamedQwen38:
                 if prediction is not None and bool(
                     getattr(prediction, "ready", False)
                 ):
+                    before_weight_bytes = (
+                        0
+                        if coordinate_bank is None
+                        else int(
+                            q4_bank.metrics().get("page_mlp_weight_bytes", 0)
+                        )
+                    )
                     route_shape = (*hidden.shape[:-1], len(page_ids))
                     output = self.pager.mlp_selected_pages(
                         hidden,
@@ -2195,6 +2433,37 @@ class StreamedQwen38:
                         page_ids,
                         row_count=row_count,
                     )
+                    if coordinate_bank is not None:
+                        assert coordinate_transaction is not None
+                        selected_weight_bytes = max(
+                            0,
+                            int(
+                                q4_bank.metrics().get(
+                                    "page_mlp_weight_bytes",
+                                    before_weight_bytes,
+                                )
+                            )
+                            - before_weight_bytes,
+                        )
+                        logical_saved = max(
+                            0,
+                            self._q4_mlp_full_payload_bytes(q4_bank, fused_names)
+                            - selected_weight_bytes,
+                        )
+                        full_page_ids = tuple(
+                            getattr(prediction, "full_page_ids", ())
+                        ) or page_ids
+                        staged_coordinate = coordinate_bank.stage(
+                            coordinate_key,
+                            full_page_ids,
+                            selected_width=len(page_ids),
+                            logical_page_weight_bytes_saved=logical_saved,
+                            row_count=1,
+                        )
+                        coordinate_transaction.stage_capture(
+                            absolute_position,
+                            staged_coordinate,
+                        )
                     self._observe_layer_boundary(layer, "mlp.output", output)
                     return output
                 if prediction is None:
@@ -2714,7 +2983,23 @@ class StreamedQwen38:
         hidden: tuple[torch.Tensor, ...],
         *,
         layer: int,
+        start_pos: int | None = None,
     ) -> tuple[torch.Tensor, ...]:
+        if (
+            len(hidden) == 1
+            and self._active_mlp_page_coordinate_transaction is not None
+        ):
+            if start_pos is None:
+                raise Qwen38RuntimeError(
+                    "K1 MLP page coordinate execution lacks an absolute position"
+                )
+            return (
+                self._mlp(
+                    hidden[0],
+                    layer=layer,
+                    absolute_position=start_pos,
+                ),
+            )
         row_count = sum(row.numel() // row.shape[-1] for row in hidden)
         if self._sparse_mlp_allowed(layer, row_count):
             try:
@@ -2903,7 +3188,11 @@ class StreamedQwen38:
             after_attention,
             f"{prefix}.post_attention_layernorm.weight",
         )
-        mlp = self._mlp_token_rows(mlp_input, layer=layer)
+        mlp = self._mlp_token_rows(
+            mlp_input,
+            layer=layer,
+            start_pos=start_pos,
+        )
         return (
             tuple(after_attention[index] + mlp[index] for index in range(len(hidden))),
             next_state,
@@ -3025,7 +3314,15 @@ class StreamedQwen38:
         residual = hidden
         mlp_input = self._norm(hidden, f"{prefix}.post_attention_layernorm.weight")
         self._observe_layer_boundary(layer, "mlp.input", mlp_input)
-        hidden = residual + self._mlp(mlp_input, layer=layer)
+        if self._active_mlp_page_coordinate_transaction is None:
+            mlp_output = self._mlp(mlp_input, layer=layer)
+        else:
+            mlp_output = self._mlp(
+                mlp_input,
+                layer=layer,
+                absolute_position=start_pos,
+            )
+        hidden = residual + mlp_output
         self._observe_layer_boundary(layer, "layer.output", hidden)
         return hidden, retained_state
 
@@ -3158,6 +3455,17 @@ class StreamedQwen38:
                         "instance": id(self.attention_output_crystal_bank),
                     }
                 ),
+                "mlp_page_coordinate": (
+                    None
+                    if not self.mlp_page_coordinate_enabled
+                    or self.mlp_page_coordinate_bank is None
+                    else {
+                        "identity_sha256": (
+                            self.mlp_page_coordinate_bank.identity.identity_sha256
+                        ),
+                        "instance": id(self.mlp_page_coordinate_bank),
+                    }
+                ),
                 "native_head_crsa": native,
             }
         )
@@ -3191,6 +3499,39 @@ class StreamedQwen38:
                 warnings.warn(
                     "attention-output Crystal publication failed after exact "
                     f"target execution: {type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            except Exception:
+                pass
+
+    @staticmethod
+    def _rollback_mlp_page_coordinate_transaction(
+        owner: MlpPageCoordinateTransaction | None,
+    ) -> None:
+        if owner is not None and not owner.closed:
+            owner.rollback()
+
+    def _commit_mlp_page_coordinate_transaction(
+        self,
+        owner: MlpPageCoordinateTransaction | None,
+        *,
+        accepted_end_position: int,
+    ) -> None:
+        if owner is None:
+            return
+        try:
+            owner.commit(accepted_end_position=accepted_end_position)
+        except Exception as exc:
+            self._mlp_page_coordinate_failures += 1
+            try:
+                self._rollback_mlp_page_coordinate_transaction(owner)
+            except Exception:
+                pass
+            try:
+                warnings.warn(
+                    "MLP page coordinate publication failed after target "
+                    f"execution: {type(exc).__name__}: {exc}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -3453,6 +3794,16 @@ class StreamedQwen38:
             self._rollback_attention_output_crystal_transaction(active_crystal)
         self._rollback_attention_output_crystal_transaction(crystal_owner)
         self._active_attention_output_crystal_transaction = None
+        coordinate_owner = (
+            None
+            if pending is None
+            else pending.mlp_page_coordinate_transaction_owner
+        )
+        active_coordinate = self._active_mlp_page_coordinate_transaction
+        if active_coordinate is not None and active_coordinate is not coordinate_owner:
+            self._rollback_mlp_page_coordinate_transaction(active_coordinate)
+        self._rollback_mlp_page_coordinate_transaction(coordinate_owner)
+        self._active_mlp_page_coordinate_transaction = None
         self._attention_state_digest_cache.clear()
 
     def reset_state(self, *, release: bool = False) -> None:
@@ -3882,6 +4233,12 @@ class StreamedQwen38:
             else None
         )
         crystal_transaction: AttentionOutputCrystalTransaction | None = None
+        coordinate_bank = (
+            self.mlp_page_coordinate_bank
+            if self.mlp_page_coordinate_enabled and ids.shape[1] == 1
+            else None
+        )
+        coordinate_transaction: MlpPageCoordinateTransaction | None = None
         previous_stage = self._pending_block_stage
         if previous_stage is not None:
             if previous_stage.mlp_page_transaction_owner is not None:
@@ -3891,6 +4248,9 @@ class StreamedQwen38:
             self._rollback_attention_output_crystal_transaction(
                 previous_stage.attention_output_crystal_transaction_owner
             )
+            self._rollback_mlp_page_coordinate_transaction(
+                previous_stage.mlp_page_coordinate_transaction_owner
+            )
         self._pending_block_stage = None
         try:
             if page_router is not None:
@@ -3899,12 +4259,15 @@ class StreamedQwen38:
                 delta_router.begin_transaction()
             if crystal_bank is not None:
                 crystal_transaction = crystal_bank.begin_transaction()
+            if coordinate_bank is not None:
+                coordinate_transaction = coordinate_bank.begin_transaction()
         except Exception:
             if page_router is not None:
                 page_router.rollback_transaction()
             if delta_router is not None:
                 delta_router.rollback_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
             raise
         try:
             source = self.pager.source
@@ -3917,10 +4280,12 @@ class StreamedQwen38:
             if delta_router is not None:
                 delta_router.rollback_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
             raise
         try:
             embedded = self.embed_batch(ids)
             self._active_attention_output_crystal_transaction = crystal_transaction
+            self._active_mlp_page_coordinate_transaction = coordinate_transaction
             if ids.shape[1] == 2:
                 staged = self._stage_continuation_k2_pair(
                     embedded,
@@ -3956,10 +4321,12 @@ class StreamedQwen38:
             if delta_router is not None:
                 delta_router.rollback_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
             self.pager.release()
             raise
         finally:
             self._active_attention_output_crystal_transaction = None
+            self._active_mlp_page_coordinate_transaction = None
             self.pager.release()
 
         try:
@@ -4009,6 +4376,7 @@ class StreamedQwen38:
                 mlp_page_transaction_owner=page_router,
                 delta_head_transaction_owner=delta_router,
                 attention_output_crystal_transaction_owner=crystal_transaction,
+                mlp_page_coordinate_transaction_owner=coordinate_transaction,
             )
             return stage
         except Exception:
@@ -4018,6 +4386,7 @@ class StreamedQwen38:
             if delta_router is not None:
                 delta_router.rollback_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
             raise
 
     def extend_continuation_block(
@@ -4044,6 +4413,7 @@ class StreamedQwen38:
         crystal_transaction = (
             pending.attention_output_crystal_transaction_owner
         )
+        coordinate_transaction = pending.mlp_page_coordinate_transaction_owner
 
         # A matching handle is consumed exactly once.  No later validation or
         # compute failure may leave the old private transaction committable.
@@ -4106,6 +4476,7 @@ class StreamedQwen38:
             started = time.perf_counter()
             embedded = self.embed_batch(ids)
             self._active_attention_output_crystal_transaction = crystal_transaction
+            self._active_mlp_page_coordinate_transaction = coordinate_transaction
             staged = self._stage_continuation_token_rows(
                 embedded,
                 staged_base,
@@ -4175,6 +4546,7 @@ class StreamedQwen38:
                 mlp_page_transaction_owner=page_router,
                 delta_head_transaction_owner=delta_router,
                 attention_output_crystal_transaction_owner=crystal_transaction,
+                mlp_page_coordinate_transaction_owner=coordinate_transaction,
             )
             return next_stage
         except Exception:
@@ -4184,9 +4556,11 @@ class StreamedQwen38:
             if delta_router is not None:
                 delta_router.rollback_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
             raise
         finally:
             self._active_attention_output_crystal_transaction = None
+            self._active_mlp_page_coordinate_transaction = None
             self.pager.release()
 
     def discard_continuation_block(self, stage: StatefulBlockStage) -> None:
@@ -4206,6 +4580,9 @@ class StreamedQwen38:
             delta_router.rollback_transaction()
         self._rollback_attention_output_crystal_transaction(
             pending.attention_output_crystal_transaction_owner
+        )
+        self._rollback_mlp_page_coordinate_transaction(
+            pending.mlp_page_coordinate_transaction_owner
         )
         self.pager.release()
 
@@ -4319,6 +4696,7 @@ class StreamedQwen38:
         crystal_transaction = (
             pending.attention_output_crystal_transaction_owner
         )
+        coordinate_transaction = pending.mlp_page_coordinate_transaction_owner
 
         def rollback_coordinate_routes() -> None:
             self._pending_block_stage = None
@@ -4327,6 +4705,7 @@ class StreamedQwen38:
             if delta_router is not None:
                 delta_router.rollback_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
 
         row = pending.evidence
         stage_width = row.end_pos - row.start_pos
@@ -4396,6 +4775,7 @@ class StreamedQwen38:
             if delta_router is not None:
                 delta_router.rollback_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
             raise
         end_pos = row.start_pos + width
         hidden = pending_hidden[:, :width]
@@ -4406,6 +4786,7 @@ class StreamedQwen38:
             if page_router is not None:
                 page_router.rollback_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
             raise
         try:
             if page_router is not None:
@@ -4414,11 +4795,16 @@ class StreamedQwen38:
             if delta_router is not None:
                 delta_router.revert_committed_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
             raise
         if delta_router is not None:
             delta_router.finalize_transaction()
         self._commit_attention_output_crystal_transaction(
             crystal_transaction,
+            accepted_end_position=end_pos,
+        )
+        self._commit_mlp_page_coordinate_transaction(
+            coordinate_transaction,
             accepted_end_position=end_pos,
         )
         self._layer_states = list(states)
@@ -4470,6 +4856,7 @@ class StreamedQwen38:
         crystal_transaction = (
             pending.attention_output_crystal_transaction_owner
         )
+        coordinate_transaction = pending.mlp_page_coordinate_transaction_owner
 
         def rollback_coordinate_routes() -> None:
             self._pending_block_stage = None
@@ -4478,6 +4865,7 @@ class StreamedQwen38:
             if delta_router is not None:
                 delta_router.rollback_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
 
         row = pending.evidence
         if self._state_poisoned:
@@ -4538,6 +4926,7 @@ class StreamedQwen38:
             if page_router is not None:
                 page_router.rollback_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
             raise
         try:
             if page_router is not None:
@@ -4546,11 +4935,16 @@ class StreamedQwen38:
             if delta_router is not None:
                 delta_router.revert_committed_transaction()
             self._rollback_attention_output_crystal_transaction(crystal_transaction)
+            self._rollback_mlp_page_coordinate_transaction(coordinate_transaction)
             raise
         if delta_router is not None:
             delta_router.finalize_transaction()
         self._commit_attention_output_crystal_transaction(
             crystal_transaction,
+            accepted_end_position=row.end_pos,
+        )
+        self._commit_mlp_page_coordinate_transaction(
+            coordinate_transaction,
             accepted_end_position=row.end_pos,
         )
         self._layer_states = committed_states
@@ -4653,6 +5047,9 @@ class StreamedQwen38:
                     pending.delta_head_transaction_owner.rollback_transaction()
                 self._rollback_attention_output_crystal_transaction(
                     pending.attention_output_crystal_transaction_owner
+                )
+                self._rollback_mlp_page_coordinate_transaction(
+                    pending.mlp_page_coordinate_transaction_owner
                 )
             self._pending_block_stage = None
             del pending
@@ -4831,17 +5228,37 @@ class StreamedQwen38:
             raise ValueError("decode accepts exactly one token per batch row")
         if self._next_position == 0:
             raise ValueError("decode requires a completed prefill")
-        if (
+        attention_active = (
             ids.shape[0] == 1
             and self.attention_output_crystal_enabled
             and self.attention_output_crystal_bank is not None
             and self.delta_probe is None
-        ):
+        )
+        coordinate_active = (
+            ids.shape[0] == 1
+            and self.mlp_page_coordinate_enabled
+            and self.mlp_page_coordinate_bank is not None
+            and self.delta_probe is None
+        )
+        if attention_active or coordinate_active:
             transaction = self._active_attention_output_crystal_transaction
-            owns_transaction = transaction is None
-            if transaction is None:
+            owns_transaction = attention_active and transaction is None
+            if owns_transaction:
+                assert self.attention_output_crystal_bank is not None
                 transaction = self.attention_output_crystal_bank.begin_transaction()
                 self._active_attention_output_crystal_transaction = transaction
+            coordinate_transaction = self._active_mlp_page_coordinate_transaction
+            owns_coordinate_transaction = (
+                coordinate_active and coordinate_transaction is None
+            )
+            if owns_coordinate_transaction:
+                assert self.mlp_page_coordinate_bank is not None
+                coordinate_transaction = (
+                    self.mlp_page_coordinate_bank.begin_transaction()
+                )
+                self._active_mlp_page_coordinate_transaction = (
+                    coordinate_transaction
+                )
             try:
                 hidden, evidence = self.hidden_stateful(
                     ids,
@@ -4851,13 +5268,24 @@ class StreamedQwen38:
             except Exception:
                 if owns_transaction:
                     self._rollback_attention_output_crystal_transaction(transaction)
+                if owns_coordinate_transaction:
+                    self._rollback_mlp_page_coordinate_transaction(
+                        coordinate_transaction
+                    )
                 raise
             finally:
                 if owns_transaction:
                     self._active_attention_output_crystal_transaction = None
+                if owns_coordinate_transaction:
+                    self._active_mlp_page_coordinate_transaction = None
             if owns_transaction:
                 self._commit_attention_output_crystal_transaction(
                     transaction,
+                    accepted_end_position=self._next_position,
+                )
+            if owns_coordinate_transaction:
+                self._commit_mlp_page_coordinate_transaction(
+                    coordinate_transaction,
                     accepted_end_position=self._next_position,
                 )
             return hidden, evidence
@@ -4991,6 +5419,7 @@ class StreamedQwen38:
         forward_count = len(forwards)
         first_token_seconds: float | None = None
         generation_crystal_transaction: AttentionOutputCrystalTransaction | None = None
+        generation_coordinate_transaction: MlpPageCoordinateTransaction | None = None
         generation_delta_router = self.delta_head_router
         delta_transaction_active = False
         if (
@@ -5007,6 +5436,21 @@ class StreamedQwen38:
             )
             self._active_attention_output_crystal_transaction = (
                 generation_crystal_transaction
+            )
+        if (
+            self.mlp_page_coordinate_enabled
+            and self.mlp_page_coordinate_bank is not None
+            and self.delta_probe is None
+        ):
+            if self._active_mlp_page_coordinate_transaction is not None:
+                raise Qwen38RuntimeError(
+                    "greedy generation found an active MLP coordinate transaction"
+                )
+            generation_coordinate_transaction = (
+                self.mlp_page_coordinate_bank.begin_transaction()
+            )
+            self._active_mlp_page_coordinate_transaction = (
+                generation_coordinate_transaction
             )
         if generation_delta_router is not None:
             generation_delta_router.begin_transaction()
@@ -5049,14 +5493,23 @@ class StreamedQwen38:
             self._rollback_attention_output_crystal_transaction(
                 generation_crystal_transaction
             )
+            self._rollback_mlp_page_coordinate_transaction(
+                generation_coordinate_transaction
+            )
             if delta_transaction_active:
                 generation_delta_router.rollback_transaction()
             raise
         finally:
             if generation_crystal_transaction is not None:
                 self._active_attention_output_crystal_transaction = None
+            if generation_coordinate_transaction is not None:
+                self._active_mlp_page_coordinate_transaction = None
         self._commit_attention_output_crystal_transaction(
             generation_crystal_transaction,
+            accepted_end_position=self._next_position,
+        )
+        self._commit_mlp_page_coordinate_transaction(
+            generation_coordinate_transaction,
             accepted_end_position=self._next_position,
         )
         if delta_transaction_active:
