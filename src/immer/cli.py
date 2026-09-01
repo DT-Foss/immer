@@ -189,8 +189,10 @@ def _authenticate_layer_transition_crystal_atlas(
     path: Path,
     *,
     atlas_revision_sha256: str,
+    option: str = "--layer-transition-crystal-atlas",
+    subject: str = "layer-transition Crystal",
 ) -> None:
-    _require_existing_real_directory(path, "--layer-transition-crystal-atlas")
+    _require_existing_real_directory(path, option)
     from .knowledge.livecausal import LiveGraph
     from .runtimes.qwen3_8.semantic_atlas import GraphRevision
 
@@ -198,24 +200,22 @@ def _authenticate_layer_transition_crystal_atlas(
         atlas = LiveGraph(path)
         revision_history = atlas.store.revision_history()
     except Exception as exc:
-        raise ValueError(
-            "--layer-transition-crystal-atlas is unavailable or unauthenticated"
-        ) from exc
+        raise ValueError(f"{option} is unavailable or unauthenticated") from exc
     if not any(
         GraphRevision(sequence, event_sha256).sha256 == atlas_revision_sha256
         for sequence, event_sha256 in revision_history
     ):
-        raise ValueError(
-            "layer-transition Crystal bank belongs to a foreign Atlas authority"
-        )
+        raise ValueError(f"{subject} bank belongs to a foreign Atlas authority")
 
 
 def _authenticate_layer_transition_crystal_compute_graph(
     path: Path,
     *,
     graph_revision_sha256: str,
+    option: str = "--layer-transition-crystal-compute-root",
+    subject: str = "layer-transition Crystal",
 ) -> Any:
-    _require_existing_real_directory(path, "--layer-transition-crystal-compute-root")
+    _require_existing_real_directory(path, option)
     from .runtimes.ooe.compute_crystals import ComputeCrystalBank
     from .runtimes.ooe.compute_graph import (
         ComputeOperatorGraph,
@@ -230,9 +230,7 @@ def _authenticate_layer_transition_crystal_compute_graph(
         while True:
             current_sha256 = current.sha256
             if current_sha256 in seen:
-                raise ValueError(
-                    "layer-transition Compute graph history contains a cycle"
-                )
+                raise ValueError(f"{subject} Compute graph history contains a cycle")
             seen.add(current_sha256)
             if current_sha256 == graph_revision_sha256:
                 return current
@@ -248,19 +246,13 @@ def _authenticate_layer_transition_crystal_compute_graph(
                 or current.generation != previous.generation + 1
                 or current.previous_state_sha256 != previous.sha256
             ):
-                raise ValueError(
-                    "layer-transition Compute graph history is unauthenticated"
-                )
+                raise ValueError(f"{subject} Compute graph history is unauthenticated")
             current = previous
     except ValueError:
         raise
     except Exception as exc:
-        raise ValueError(
-            "--layer-transition-crystal-compute-root is unavailable or unauthenticated"
-        ) from exc
-    raise ValueError(
-        "layer-transition Crystal bank belongs to a foreign Compute graph authority"
-    )
+        raise ValueError(f"{option} is unavailable or unauthenticated") from exc
+    raise ValueError(f"{subject} bank belongs to a foreign Compute graph authority")
 
 
 def _qwen38_layer_transition_crystal_policy(
@@ -357,6 +349,89 @@ def _qwen38_layer_transition_crystal_policy(
         "q4_sha256": identity.q4_sha256,
         "request_applied": True if request_applied is None else request_applied,
         "schema": "immer.qwen3.8-layer-transition-crystal-policy/v1",
+    }
+
+
+def _qwen38_layer_mlp_crystal_policy(
+    args: argparse.Namespace,
+    *,
+    request_applied: bool | None = None,
+) -> dict[str, object] | None:
+    """Return a path-free policy for one configured layer-63 MLP bank."""
+
+    configured = getattr(args, "layer_mlp_crystal_state", None)
+    configured_atlas = getattr(args, "layer_mlp_crystal_atlas", None)
+    configured_compute_root = getattr(args, "layer_mlp_crystal_compute_root", None)
+    radius = getattr(args, "layer_mlp_crystal_max_error_radius", 0.0)
+    try:
+        radius = _finite_non_negative_float(radius)
+    except argparse.ArgumentTypeError as exc:
+        raise ValueError(
+            "layer-MLP Crystal max-error radius must be finite and non-negative"
+        ) from exc
+    if configured is None:
+        if configured_atlas is not None:
+            raise ValueError(
+                "--layer-mlp-crystal-atlas requires --layer-mlp-crystal-state"
+            )
+        if configured_compute_root is not None:
+            raise ValueError(
+                "--layer-mlp-crystal-compute-root requires --layer-mlp-crystal-state"
+            )
+        if radius != 0.0:
+            raise ValueError(
+                "--layer-mlp-crystal-max-error-radius requires "
+                "--layer-mlp-crystal-state"
+            )
+        return None
+    if configured_atlas is None:
+        raise ValueError("--layer-mlp-crystal-state requires --layer-mlp-crystal-atlas")
+    if configured_compute_root is None:
+        raise ValueError(
+            "--layer-mlp-crystal-state requires --layer-mlp-crystal-compute-root"
+        )
+    if request_applied is not None and not isinstance(request_applied, bool):
+        raise TypeError("request_applied must be boolean or null")
+    path = Path(configured).expanduser().absolute()
+    if not path.is_file():
+        raise ValueError("--layer-mlp-crystal-state must name an existing sealed file")
+    from .runtimes.qwen3_8.layer_mlp_crystal import (
+        LAYER_MLP_RESIDUAL_ACTION_ABI,
+        Layer63MlpResidualCrystalBank,
+        Layer63MlpResidualCrystalIdentity,
+    )
+
+    bank = Layer63MlpResidualCrystalBank.load(path)
+    identity = getattr(bank, "identity", None)
+    if not isinstance(identity, Layer63MlpResidualCrystalIdentity):
+        raise ValueError("layer-MLP Crystal bank identity is invalid")
+    if identity.action_abi != LAYER_MLP_RESIDUAL_ACTION_ABI:
+        raise ValueError("layer-MLP Crystal action ABI is invalid")
+    atlas_path = Path(configured_atlas).expanduser().absolute()
+    _authenticate_layer_transition_crystal_atlas(
+        atlas_path,
+        atlas_revision_sha256=identity.atlas_revision_sha256,
+        option="--layer-mlp-crystal-atlas",
+        subject="layer-MLP Crystal",
+    )
+    compute_root = Path(configured_compute_root).expanduser().absolute()
+    _authenticate_layer_transition_crystal_compute_graph(
+        compute_root,
+        graph_revision_sha256=identity.graph_revision_sha256,
+        option="--layer-mlp-crystal-compute-root",
+        subject="layer-MLP Crystal",
+    )
+    return {
+        "action_abi": identity.action_abi,
+        "atlas_revision_sha256": identity.atlas_revision_sha256,
+        "enabled": True,
+        "graph_revision_sha256": identity.graph_revision_sha256,
+        "identity_sha256": identity.identity_sha256,
+        "max_error_radius": radius.hex(),
+        "model_sha256": identity.model_sha256,
+        "q4_sha256": identity.q4_sha256,
+        "request_applied": True if request_applied is None else request_applied,
+        "schema": "immer.qwen3.8-layer-mlp-residual-crystal-policy/v1",
     }
 
 
@@ -572,6 +647,7 @@ def _qwen38_service_profile(
 
     profile = {
         "attention_output_crystal": (attention_output_crystal_state_path is not None),
+        "layer_mlp_crystal": _qwen38_layer_mlp_crystal_policy(args),
         "layer_transition_crystal": (_qwen38_layer_transition_crystal_policy(args)),
         "mlp_page_coordinate": mlp_page_coordinate_enabled,
         "arguments": {
@@ -735,6 +811,7 @@ def _qwen38_growing_warm_profile(
             }
         ),
         "layer_transition_crystal": (_qwen38_layer_transition_crystal_policy(args)),
+        "layer_mlp_crystal": _qwen38_layer_mlp_crystal_policy(args),
         "mlp_page_coordinate": (
             getattr(args, "mlp_page_coordinate_state", None) is not None
         ),
@@ -819,7 +896,10 @@ def _qwen38_output_semantics(
 ):
     # A private layer-transition bank is a bounded approximate same-runtime
     # action.  It cannot share the cross-profile exact-output replay authority.
-    if _qwen38_layer_transition_crystal_policy(args) is not None:
+    if (
+        _qwen38_layer_transition_crystal_policy(args) is not None
+        or _qwen38_layer_mlp_crystal_policy(args) is not None
+    ):
         return None
     if q4_root is None:
         return None
@@ -881,7 +961,8 @@ def _qwen38_runtime_code_paths() -> tuple[Path, ...]:
             (
                 path
                 for path in (package / "runtimes" / "qwen3_8").glob("*.py")
-                if path.name != "layer_transition_builder.py"
+                if path.name
+                not in {"layer_transition_builder.py", "layer_mlp_builder.py"}
             ),
             key=lambda path: path.name,
         )
@@ -2008,6 +2089,85 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         args.layer_transition_crystal_max_error_radius = (
             layer_transition_crystal_max_error_radius
         )
+        layer_mlp_crystal_state_path = _chat_path(
+            getattr(args, "layer_mlp_crystal_state", None),
+            "IMMER_QWEN38_LAYER_MLP_CRYSTAL_STATE",
+        )
+        layer_mlp_crystal_atlas_path = _chat_path(
+            getattr(args, "layer_mlp_crystal_atlas", None),
+            "IMMER_QWEN38_LAYER_MLP_ATLAS",
+        )
+        layer_mlp_crystal_compute_root = _chat_path(
+            getattr(args, "layer_mlp_crystal_compute_root", None),
+            "IMMER_QWEN38_LAYER_MLP_COMPUTE_ROOT",
+        )
+        layer_mlp_crystal_max_error_radius = _finite_non_negative_float(
+            getattr(args, "layer_mlp_crystal_max_error_radius", 0.0)
+        )
+        if layer_mlp_crystal_state_path is not None and q4_root is None:
+            raise ValueError("layer-MLP Crystals require local Q4 execution")
+        if (
+            layer_mlp_crystal_state_path is not None
+            and not layer_mlp_crystal_state_path.is_file()
+        ):
+            raise ValueError(
+                "--layer-mlp-crystal-state must name an existing sealed file"
+            )
+        if (
+            layer_mlp_crystal_state_path is not None
+            and layer_mlp_crystal_atlas_path is None
+        ):
+            raise ValueError(
+                "--layer-mlp-crystal-state requires --layer-mlp-crystal-atlas"
+            )
+        if (
+            layer_mlp_crystal_state_path is not None
+            and layer_mlp_crystal_compute_root is None
+        ):
+            raise ValueError(
+                "--layer-mlp-crystal-state requires --layer-mlp-crystal-compute-root"
+            )
+        if (
+            layer_mlp_crystal_state_path is None
+            and layer_mlp_crystal_atlas_path is not None
+        ):
+            raise ValueError(
+                "--layer-mlp-crystal-atlas requires --layer-mlp-crystal-state"
+            )
+        if (
+            layer_mlp_crystal_state_path is None
+            and layer_mlp_crystal_compute_root is not None
+        ):
+            raise ValueError(
+                "--layer-mlp-crystal-compute-root requires --layer-mlp-crystal-state"
+            )
+        if layer_mlp_crystal_atlas_path is not None:
+            _require_existing_real_directory(
+                layer_mlp_crystal_atlas_path,
+                "--layer-mlp-crystal-atlas",
+            )
+        if layer_mlp_crystal_compute_root is not None:
+            _require_existing_real_directory(
+                layer_mlp_crystal_compute_root,
+                "--layer-mlp-crystal-compute-root",
+            )
+        if layer_mlp_crystal_state_path is not None and args.compute_dtype not in {
+            "auto",
+            "bfloat16",
+        }:
+            raise ValueError("layer-MLP Crystals require bfloat16 compute")
+        if (
+            layer_mlp_crystal_state_path is None
+            and layer_mlp_crystal_max_error_radius != 0.0
+        ):
+            raise ValueError(
+                "--layer-mlp-crystal-max-error-radius requires "
+                "--layer-mlp-crystal-state"
+            )
+        args.layer_mlp_crystal_state = layer_mlp_crystal_state_path
+        args.layer_mlp_crystal_atlas = layer_mlp_crystal_atlas_path
+        args.layer_mlp_crystal_compute_root = layer_mlp_crystal_compute_root
+        args.layer_mlp_crystal_max_error_radius = layer_mlp_crystal_max_error_radius
         disable_draft_window = bool(getattr(args, "no_draft_window_controller", False))
         if disable_draft_window and getattr(args, "draft_window_state", None):
             raise ValueError(
@@ -2169,6 +2329,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                         "layer_transition_crystal": (
                             _qwen38_layer_transition_crystal_policy(args)
                         ),
+                        "layer_mlp_crystal": _qwen38_layer_mlp_crystal_policy(args),
                         "prefix_sinkhorn": bool(args.prefix_sinkhorn),
                         "raw_qwen": bool(args.raw_qwen),
                         "runtime_code_revision": runtime_code_revision,
@@ -2554,6 +2715,22 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             layer_transition_crystal_max_error_radius=(
                 layer_transition_crystal_max_error_radius
             ),
+            layer_mlp_crystal_state_path=(
+                None
+                if layer_mlp_crystal_state_path is None
+                else str(layer_mlp_crystal_state_path)
+            ),
+            layer_mlp_crystal_atlas_path=(
+                None
+                if layer_mlp_crystal_atlas_path is None
+                else str(layer_mlp_crystal_atlas_path)
+            ),
+            layer_mlp_crystal_compute_root=(
+                None
+                if layer_mlp_crystal_compute_root is None
+                else str(layer_mlp_crystal_compute_root)
+            ),
+            layer_mlp_crystal_max_error_radius=(layer_mlp_crystal_max_error_radius),
             mtp_draft_state_path=mtp_draft_state,
             draft_window_state_path=(
                 None
@@ -3695,6 +3872,37 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "maximum admitted artifact error radius for the private BF16 "
             "layer-63 bank (default: 0)"
+        ),
+    )
+    chat.add_argument(
+        "--layer-mlp-crystal-state",
+        help=(
+            "existing sealed private layer-63 MLP residual Crystal bank; "
+            "no bank is mounted by default"
+        ),
+    )
+    chat.add_argument(
+        "--layer-mlp-crystal-atlas",
+        help=(
+            "existing O1 Semantic Atlas authority whose authenticated history "
+            "contains the private layer-63 MLP bank revision"
+        ),
+    )
+    chat.add_argument(
+        "--layer-mlp-crystal-compute-root",
+        help=(
+            "existing Compute Crystal bank whose authenticated operator-graph "
+            "history contains the private layer-63 MLP bank revision"
+        ),
+    )
+    chat.add_argument(
+        "--layer-mlp-crystal-max-error-radius",
+        type=_finite_non_negative_float,
+        default=0.0,
+        metavar="RADIUS",
+        help=(
+            "maximum admitted artifact error radius for the private BF16 "
+            "layer-63 MLP bank (default: 0)"
         ),
     )
     chat.add_argument(

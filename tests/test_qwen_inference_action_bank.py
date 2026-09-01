@@ -108,6 +108,38 @@ def _layer_transition_crystal_evidence(
     }
 
 
+def _layer_mlp_crystal_evidence() -> dict[str, object]:
+    pins = {
+        "action_abi": (
+            "immer.qwen3.8/layer63-mlp-residual-rademacher-centered-ridge-bf16/v1"
+        ),
+        "identity_sha256": _sha("layer-mlp-identity"),
+        "model_sha256": _sha("layer-mlp-model"),
+        "q4_sha256": _sha("layer-mlp-q4"),
+        "graph_revision_sha256": _sha("layer-mlp-graph"),
+        "atlas_revision_sha256": _sha("layer-mlp-atlas"),
+    }
+    request = {
+        **pins,
+        "attempts": 3,
+        "fallbacks": 1,
+        "max_error_radius": 0.25,
+        "packed_weight_bytes_avoided": 16_384,
+        "packed_weight_bytes_per_transition": 8192,
+        "physical_transitions": 2,
+        "replacements": 2,
+        "skipped_q4_matrix_calls": 6,
+        "transition_rows": 2,
+    }
+    return {
+        **pins,
+        "max_error_radius": 0.25,
+        "packed_weight_bytes_per_transition": 8192,
+        "request": request,
+        "schema": "immer.qwen3.8-layer-mlp-residual-crystal-evidence/v1",
+    }
+
+
 class InferenceActionReceiptTests(unittest.TestCase):
     def test_normal_cold_request_becomes_one_content_addressed_action_vector(
         self,
@@ -435,6 +467,40 @@ class InferenceActionReceiptTests(unittest.TestCase):
         )
         self.assertEqual(receipt.actions, actions)
         self.assertEqual(receipt.saved_qwen_forwards, 0)
+
+    def test_layer_mlp_crystal_records_physical_gate_up_down_replacement(
+        self,
+    ) -> None:
+        economics = _economics(
+            "layer-mlp-crystal",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={"layer_mlp_crystal": _layer_mlp_crystal_evidence()},
+        )
+
+        actions = executed_actions_from_result(result, economics)
+
+        self.assertEqual(actions, ("layer_mlp_crystal", "qwen_target"))
+        broken = _layer_mlp_crystal_evidence()
+        broken["request"] = {**broken["request"], "skipped_q4_matrix_calls": 5}
+        self.assertEqual(
+            executed_actions_from_result(
+                Result(
+                    ExecutionStatus.OK,
+                    "qwen3.8.causal-chat",
+                    output="answer",
+                    evidence={"layer_mlp_crystal": broken},
+                ),
+                economics,
+            ),
+            ("qwen_target",),
+        )
 
     def test_attention_output_crystal_requires_exact_positive_physical_work(
         self,
@@ -1300,6 +1366,32 @@ class InferenceActionBankTests(unittest.TestCase):
                 saved_qwen_forwards=0,
                 disabled_actions=("layer_transition_crystal",),
             )
+
+    def test_layer_mlp_crystal_is_recommended_only_for_same_runtime(self) -> None:
+        crystal = _economics(
+            "layer-mlp-runtime",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            bank.observe(
+                crystal,
+                executed_actions=("layer_mlp_crystal", "qwen_target"),
+            )
+            same = bank.recommend(
+                question_sha256=_sha("same-runtime MLP question"),
+                runtime_profile_sha256=_sha("profile"),
+            )
+            other = bank.recommend(
+                question_sha256=_sha("other-runtime MLP question"),
+                runtime_profile_sha256=_sha("other profile"),
+            )
+
+        assert same is not None
+        self.assertIn("layer_mlp_crystal", same.primary_actions)
+        assert other is None
 
     def test_reconcile_recovers_a_missed_derived_event_and_tamper_is_hard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

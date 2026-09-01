@@ -28,6 +28,10 @@ from immer.runtimes.qwen3_8.model import (
     StreamedQwen38,
 )
 from immer.runtimes.qwen3_8.kernels import AttentionState, DeltaNetState
+from immer.runtimes.qwen3_8.layer_mlp_crystal import (
+    Layer63MlpResidualCrystalBank,
+    Layer63MlpResidualCrystalIdentity,
+)
 from immer.runtimes.qwen3_8.layer_transition_crystal import (
     LayerTransitionCrystalBank,
     LayerTransitionCrystalIdentity,
@@ -4175,6 +4179,9 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
         self.model.layer_transition_crystal_bank = bank
         self.model.layer_transition_crystal_enabled = True
         self.model.layer_transition_crystal_max_error_radius = 0.0
+        mlp_bank = self._mlp_crystal_bank(None)
+        self.model.layer_mlp_crystal_bank = mlp_bank
+        self.model.layer_mlp_crystal_enabled = True
 
         original_linear_group = self.pager.linear_group
         projected_names: list[tuple[str, ...]] = []
@@ -4230,6 +4237,7 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
             ],
         )
         bank.replace.assert_called_once_with(hidden, max_error_radius=0.0)
+        mlp_bank.replace.assert_not_called()
         metrics = self.model.layer_transition_crystal_metrics()
         self.assertEqual(metrics["physical_transitions"], 1)
         self.assertEqual(metrics["transition_rows"], 1)
@@ -4379,6 +4387,329 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
         self.assertEqual(metrics["exact_kv_state_updates"], 4)
         self.assertEqual(metrics["skipped_q4_matrix_calls"], 5)
         self.assertEqual(metrics["packed_weight_bytes_avoided"], avoided_bytes)
+
+    @staticmethod
+    def _mlp_crystal_bank(replacement):
+        return SimpleNamespace(
+            identity=SimpleNamespace(
+                atlas_revision_sha256="a" * 64,
+                graph_revision_sha256="b" * 64,
+                identity_sha256="c" * 64,
+                model_sha256="d" * 64,
+                q4_sha256="e" * 64,
+            ),
+            metrics=lambda: SimpleNamespace(
+                to_dict=lambda: {"attempts": 1, "fallbacks": 0, "replacements": 1}
+            ),
+            replace=mock.Mock(return_value=replacement),
+        )
+
+    def test_layer_mlp_k1_hit_keeps_exact_attention_and_kv_but_skips_mlp(
+        self,
+    ) -> None:
+        layer = self.config.n_layers - 1
+        hidden = torch.randn((1, 1, self.config.dim)).to(torch.bfloat16)
+        mask = torch.ones((1, 1), dtype=torch.bool)
+        _, expected_state = self.model._forward_layer(
+            hidden,
+            layer=layer,
+            token_mask=mask,
+            state=None,
+            start_pos=0,
+            stateful=True,
+        )
+        self.assertIsInstance(expected_state, AttentionState)
+        output = torch.randn((1, 1, self.config.dim)).to(torch.bfloat16)
+        replacement = SimpleNamespace(
+            output=output,
+            logical_weight_bytes_replaced=(self.model.LAYER63_MLP_Q4_WEIGHT_BYTES),
+        )
+        bank = self._mlp_crystal_bank(replacement)
+        self.model.layer_mlp_crystal_bank = bank
+        self.model.layer_mlp_crystal_enabled = True
+        self.model.layer_mlp_crystal_max_error_radius = 0.125
+        self.model._active_mlp_page_coordinate_transaction = SimpleNamespace()
+        original_group = self.pager.linear_group
+        original_linear = self.pager.linear
+        grouped_names: list[tuple[str, ...]] = []
+        projected_names: list[str] = []
+
+        def record_group(value, names, **kwargs):
+            grouped_names.append(tuple(names))
+            return original_group(value, names, **kwargs)
+
+        def record_linear(value, name, **kwargs):
+            projected_names.append(name)
+            return original_linear(value, name, **kwargs)
+
+        with (
+            mock.patch.object(
+                self.model,
+                "_layer_mlp_crystal_avoided_q4_bytes",
+                return_value=self.model.LAYER63_MLP_Q4_WEIGHT_BYTES,
+            ),
+            mock.patch.object(
+                self.pager,
+                "linear_group",
+                side_effect=record_group,
+            ),
+            mock.patch.object(
+                self.pager,
+                "linear",
+                side_effect=record_linear,
+            ),
+            mock.patch.object(
+                self.model,
+                "_mlp",
+                side_effect=AssertionError("MLP executed on a Crystal hit"),
+            ),
+        ):
+            actual_hidden, actual_state = self.model._forward_layer(
+                hidden,
+                layer=layer,
+                token_mask=mask,
+                state=None,
+                start_pos=0,
+                stateful=True,
+            )
+
+        self.assertTrue(torch.equal(actual_hidden, output))
+        self.assertIsInstance(actual_state, AttentionState)
+        assert isinstance(actual_state, AttentionState)
+        assert isinstance(expected_state, AttentionState)
+        self.assertTrue(torch.equal(actual_state.key, expected_state.key))
+        self.assertTrue(torch.equal(actual_state.value, expected_state.value))
+        base = f"model.language_model.layers.{layer}.self_attn"
+        self.assertIn(
+            (f"{base}.q_proj", f"{base}.k_proj", f"{base}.v_proj"),
+            grouped_names,
+        )
+        for name in (
+            f"{base}.q_proj.weight",
+            f"{base}.k_proj.weight",
+            f"{base}.v_proj.weight",
+            f"{base}.o_proj",
+        ):
+            self.assertIn(name, projected_names)
+        bank.replace.assert_called_once()
+        call = bank.replace.call_args
+        self.assertEqual(len(call.args), 2)
+        self.assertEqual(tuple(call.args[0].shape), (1, 1, self.config.dim))
+        self.assertEqual(tuple(call.args[1].shape), (1, 1, self.config.dim))
+        self.assertEqual(call.args[0].dtype, torch.bfloat16)
+        self.assertEqual(call.args[1].dtype, torch.bfloat16)
+        self.assertEqual(call.kwargs, {"max_error_radius": 0.125})
+        metrics = self.model.layer_mlp_crystal_metrics()
+        self.assertEqual(metrics["physical_transitions"], 1)
+        self.assertEqual(metrics["transition_rows"], 1)
+        self.assertEqual(metrics["exact_kv_state_updates"], 0)
+        self.assertEqual(metrics["skipped_q4_matrix_calls"], 3)
+        self.assertEqual(
+            metrics["packed_weight_bytes_avoided"],
+            self.model.LAYER63_MLP_Q4_WEIGHT_BYTES,
+        )
+
+    def test_layer_mlp_miss_runs_original_mlp_once(self) -> None:
+        layer = self.config.n_layers - 1
+        hidden = torch.randn((1, 1, self.config.dim)).to(torch.bfloat16)
+        mask = torch.ones((1, 1), dtype=torch.bool)
+        bank = self._mlp_crystal_bank(None)
+        self.model.layer_mlp_crystal_bank = bank
+        self.model.layer_mlp_crystal_enabled = True
+
+        with mock.patch.object(
+            self.model,
+            "_mlp",
+            wraps=self.model._mlp,
+        ) as exact_mlp:
+            output, state = self.model._forward_layer(
+                hidden,
+                layer=layer,
+                token_mask=mask,
+                state=None,
+                start_pos=0,
+                stateful=True,
+            )
+
+        self.assertEqual(tuple(output.shape), (1, 1, self.config.dim))
+        self.assertIsInstance(state, AttentionState)
+        bank.replace.assert_called_once()
+        exact_mlp.assert_called_once()
+        self.assertEqual(self.model._layer_mlp_crystal_hits, 0)
+        self.assertEqual(
+            self.model._layer_mlp_crystal_packed_weight_bytes_avoided,
+            0,
+        )
+
+    def test_layer_mlp_observer_forces_exact_mlp_without_bank_attempt(self) -> None:
+        layer = self.config.n_layers - 1
+        hidden = torch.randn((1, 1, self.config.dim)).to(torch.bfloat16)
+        mask = torch.ones((1, 1), dtype=torch.bool)
+        replacement = SimpleNamespace(
+            output=hidden.clone(),
+            logical_weight_bytes_replaced=(self.model.LAYER63_MLP_Q4_WEIGHT_BYTES),
+        )
+        bank = self._mlp_crystal_bank(replacement)
+        self.model.layer_mlp_crystal_bank = bank
+        self.model.layer_mlp_crystal_enabled = True
+        self.model.layer_boundary_observer = lambda *_args: None
+        self.model.layer_boundary_stages = LAYER_BOUNDARY_STAGES
+
+        with mock.patch.object(
+            self.model,
+            "_mlp",
+            wraps=self.model._mlp,
+        ) as exact_mlp:
+            self.model._forward_layer(
+                hidden,
+                layer=layer,
+                token_mask=mask,
+                state=None,
+                start_pos=0,
+                stateful=True,
+            )
+
+        bank.replace.assert_not_called()
+        exact_mlp.assert_called_once()
+
+    def test_layer_mlp_inventory_is_gate_up_down_and_exact_deployed_bytes(
+        self,
+    ) -> None:
+        names = self.model._layer_mlp_crystal_q4_names()
+        self.assertEqual(len(names), 3)
+        self.assertEqual(
+            tuple(name.rsplit(".", 2)[-2] for name in names),
+            ("gate_proj", "up_proj", "down_proj"),
+        )
+        sizes = (
+            50_000_000,
+            50_000_000,
+            self.model.LAYER63_MLP_Q4_WEIGHT_BYTES - 100_000_000,
+        )
+        entries = {
+            name: {"payload_bytes": size}
+            for name, size in zip(names, sizes, strict=True)
+        }
+        self.pager.q4_bank = SimpleNamespace(
+            entries=entries,
+            has=lambda name: name in entries,
+            identity={"schema": "fixture-q4/v1"},
+        )
+        self.assertEqual(
+            self.model._layer_mlp_crystal_avoided_q4_bytes(),
+            self.model.LAYER63_MLP_Q4_WEIGHT_BYTES,
+        )
+        invalid = SimpleNamespace(
+            output=torch.zeros((1, 1, self.config.dim), dtype=torch.bfloat16),
+            logical_weight_bytes_replaced=(self.model.LAYER63_MLP_Q4_WEIGHT_BYTES - 1),
+        )
+        bank = self._mlp_crystal_bank(invalid)
+        self.model.layer_mlp_crystal_bank = bank
+        self.model.layer_mlp_crystal_enabled = True
+        row = torch.zeros((1, 1, self.config.dim), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "byte claim changed"):
+            self.model._layer_mlp_crystal_forward(
+                row,
+                row,
+                layer=self.config.n_layers - 1,
+                token_mask=torch.ones((1, 1), dtype=torch.bool),
+                stateful=True,
+            )
+        self.assertEqual(self.model._layer_mlp_crystal_hits, 0)
+        self.assertEqual(
+            self.model._layer_mlp_crystal_packed_weight_bytes_avoided,
+            0,
+        )
+
+    def test_layer_mlp_attach_binds_model_q4_authorities_and_scope(self) -> None:
+        names = self.model._layer_mlp_crystal_q4_names()
+        entries = {
+            name: {"payload_bytes": 1_000 + index} for index, name in enumerate(names)
+        }
+        self.pager.q4_bank = SimpleNamespace(
+            entries=entries,
+            has=lambda name: name in entries,
+            identity={"manifest_sha256": "6" * 64, "schema": "fixture-q4/v1"},
+        )
+        identity = Layer63MlpResidualCrystalIdentity(
+            model_sha256=self.model.layer_mlp_crystal_model_sha256(),
+            q4_sha256=self.model.layer_mlp_crystal_q4_sha256(),
+            graph_revision_sha256="7" * 64,
+            atlas_revision_sha256="8" * 64,
+            projection=LayerTransitionProjectionIdentity(
+                hidden_dim=self.config.dim,
+                sketch_dim=3,
+                seed_sha256="9" * 64,
+            ),
+        )
+        bank = Layer63MlpResidualCrystalBank(
+            self.root / "layer-mlp-crystal.json",
+            identity,
+        )
+
+        with self.assertRaisesRegex(Qwen38RuntimeError, "contains no actions"):
+            self.model.attach_layer_mlp_crystal_bank(
+                bank,
+                max_error_radius=0.25,
+                graph_revision_sha256=identity.graph_revision_sha256,
+                atlas_revision_sha256=identity.atlas_revision_sha256,
+            )
+        expected_bytes = sum(row["payload_bytes"] for row in entries.values())
+        with mock.patch.object(
+            Layer63MlpResidualCrystalBank,
+            "crystals",
+            new_callable=mock.PropertyMock,
+            return_value=(
+                SimpleNamespace(logical_weight_bytes_replaced=expected_bytes),
+            ),
+        ):
+            self.model.attach_layer_mlp_crystal_bank(
+                bank,
+                max_error_radius=0.25,
+                graph_revision_sha256=identity.graph_revision_sha256,
+                atlas_revision_sha256=identity.atlas_revision_sha256,
+            )
+
+        self.assertIs(self.model.layer_mlp_crystal_bank, bank)
+        self.assertTrue(self.model.layer_mlp_crystal_enabled)
+        self.assertEqual(self.model.layer_mlp_crystal_max_error_radius, 0.25)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "graph authority"):
+            self.model.attach_layer_mlp_crystal_bank(
+                bank,
+                graph_revision_sha256="a" * 64,
+                atlas_revision_sha256=identity.atlas_revision_sha256,
+            )
+        self.model.detach_layer_mlp_crystal_bank()
+        self.assertIsNone(self.model.layer_mlp_crystal_bank)
+        self.assertFalse(self.model.layer_mlp_crystal_enabled)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "requires an attached bank"):
+            self.model.set_layer_mlp_crystal_enabled(True)
+
+    def test_layer_mlp_crystal_never_runs_for_k2_or_k4(self) -> None:
+        layer = self.config.n_layers - 1
+        bank = self._mlp_crystal_bank(
+            SimpleNamespace(
+                output=torch.zeros((1, 1, self.config.dim), dtype=torch.bfloat16),
+                logical_weight_bytes_replaced=(self.model.LAYER63_MLP_Q4_WEIGHT_BYTES),
+            )
+        )
+        self.model.layer_mlp_crystal_bank = bank
+        self.model.layer_mlp_crystal_enabled = True
+        for width in (2, 4):
+            with self.subTest(width=width):
+                rows = tuple(
+                    torch.randn((1, 1, self.config.dim)).to(torch.bfloat16)
+                    for _ in range(width)
+                )
+                self.model._forward_layer_token_rows(
+                    rows,
+                    layer=layer,
+                    state=None,
+                    start_pos=0,
+                    native_head_crsa_observer=lambda _row: None,
+                )
+
+        bank.replace.assert_not_called()
 
 
 if __name__ == "__main__":

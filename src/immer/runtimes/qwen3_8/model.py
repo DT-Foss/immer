@@ -41,6 +41,14 @@ from .kernels import (
     rms_norm,
     swiglu,
 )
+from .layer_mlp_crystal import (
+    FEATURE_STAGE as LAYER_MLP_FEATURE_STAGE,
+    LAYER_MLP_RESIDUAL_ACTION_ABI,
+    SOURCE_STAGE as LAYER_MLP_SOURCE_STAGE,
+    TARGET_LAYER_INDEX as LAYER_MLP_TARGET_LAYER_INDEX,
+    TARGET_STAGE as LAYER_MLP_TARGET_STAGE,
+    Layer63MlpResidualCrystalBank,
+)
 from .layer_transition_crystal import (
     TARGET_LAYER_INDEX,
     LayerTransitionCrystalBank,
@@ -288,6 +296,7 @@ class StreamedQwen38:
     EMBED_NAME = "model.language_model.embed_tokens.weight"
     FINAL_NORM_NAME = "model.language_model.norm.weight"
     HEAD_NAME = "lm_head.weight"
+    LAYER63_MLP_Q4_WEIGHT_BYTES = 150_405_120
 
     @property
     def output_head_name(self) -> str:
@@ -321,6 +330,10 @@ class StreamedQwen38:
         layer_transition_crystal_max_error_radius: float = 0.0,
         layer_transition_crystal_graph_revision_sha256: str | None = None,
         layer_transition_crystal_atlas_revision_sha256: str | None = None,
+        layer_mlp_crystal_bank: Layer63MlpResidualCrystalBank | None = None,
+        layer_mlp_crystal_max_error_radius: float = 0.0,
+        layer_mlp_crystal_graph_revision_sha256: str | None = None,
+        layer_mlp_crystal_atlas_revision_sha256: str | None = None,
         native_deltanet_recurrence: bool = False,
         native_deltanet_fusion: bool = False,
         packed_continuation_gemm: bool = False,
@@ -571,6 +584,13 @@ class StreamedQwen38:
         self._layer_transition_crystal_exact_kv_state_updates = 0
         self._layer_transition_crystal_skipped_q4_matrix_calls = 0
         self._layer_transition_crystal_packed_weight_bytes_avoided = 0
+        self.layer_mlp_crystal_bank: Layer63MlpResidualCrystalBank | None = None
+        self.layer_mlp_crystal_enabled = False
+        self.layer_mlp_crystal_max_error_radius = 0.0
+        self._layer_mlp_crystal_hits = 0
+        self._layer_mlp_crystal_rows = 0
+        self._layer_mlp_crystal_skipped_q4_matrix_calls = 0
+        self._layer_mlp_crystal_packed_weight_bytes_avoided = 0
         self._attention_state_digest_cache: dict[
             tuple[object, ...],
             tuple[
@@ -606,6 +626,13 @@ class StreamedQwen38:
                 max_error_radius=layer_transition_crystal_max_error_radius,
                 graph_revision_sha256=(layer_transition_crystal_graph_revision_sha256),
                 atlas_revision_sha256=(layer_transition_crystal_atlas_revision_sha256),
+            )
+        if layer_mlp_crystal_bank is not None:
+            self.attach_layer_mlp_crystal_bank(
+                layer_mlp_crystal_bank,
+                max_error_radius=layer_mlp_crystal_max_error_radius,
+                graph_revision_sha256=(layer_mlp_crystal_graph_revision_sha256),
+                atlas_revision_sha256=(layer_mlp_crystal_atlas_revision_sha256),
             )
 
     @property
@@ -1113,6 +1140,229 @@ class StreamedQwen38:
             "skipped_q4_matrix_calls": (
                 self._layer_transition_crystal_skipped_q4_matrix_calls
             ),
+        }
+
+    def layer_mlp_crystal_model_sha256(self) -> str:
+        """Return the checkpoint pin shared by layer-63 executable actions."""
+
+        return self.layer_transition_crystal_model_sha256()
+
+    def layer_mlp_crystal_q4_sha256(self) -> str:
+        """Return the packed-weight pin shared by layer-63 executable actions."""
+
+        return self.layer_transition_crystal_q4_sha256()
+
+    @staticmethod
+    def _layer_mlp_crystal_q4_names() -> tuple[str, ...]:
+        base = f"model.language_model.layers.{LAYER_MLP_TARGET_LAYER_INDEX}.mlp"
+        return (
+            f"{base}.gate_proj.weight",
+            f"{base}.up_proj.weight",
+            f"{base}.down_proj.weight",
+        )
+
+    def _layer_mlp_crystal_avoided_q4_bytes(self) -> int:
+        """Return the physical Gate/Up/Down payload replaced by one action."""
+
+        q4_bank = getattr(self.pager, "q4_bank", None)
+        entries = None if q4_bank is None else getattr(q4_bank, "entries", None)
+        has = None if q4_bank is None else getattr(q4_bank, "has", None)
+        if not isinstance(entries, dict) or not callable(has):
+            raise Qwen38RuntimeError("layer-MLP Crystals require a packed Q4 inventory")
+        total = 0
+        for name in self._layer_mlp_crystal_q4_names():
+            if not bool(has(name)):
+                raise Qwen38RuntimeError(f"layer-MLP Crystal Q4 bank lacks {name}")
+            try:
+                entry = entries[name]
+            except KeyError:
+                raise Qwen38RuntimeError(
+                    f"layer-MLP Crystal inventory lacks {name}"
+                ) from None
+            payload_bytes = (
+                entry.get("payload_bytes")
+                if isinstance(entry, dict)
+                else getattr(entry, "payload_bytes", None)
+            )
+            if (
+                isinstance(payload_bytes, bool)
+                or not isinstance(payload_bytes, int)
+                or payload_bytes <= 0
+            ):
+                raise Qwen38RuntimeError("layer-MLP Crystal Q4 payload size is invalid")
+            total += payload_bytes
+        if (
+            self.config.dim == 5120
+            and self.config.intermediate_size == 17408
+            and self.config.n_layers == 64
+            and total != self.LAYER63_MLP_Q4_WEIGHT_BYTES
+        ):
+            raise Qwen38RuntimeError(
+                "layer-MLP Crystal deployed Q4 inventory differs from "
+                f"{self.LAYER63_MLP_Q4_WEIGHT_BYTES} bytes"
+            )
+        return total
+
+    def attach_layer_mlp_crystal_bank(
+        self,
+        bank: Layer63MlpResidualCrystalBank | None,
+        *,
+        max_error_radius: float = 0.0,
+        graph_revision_sha256: str | None = None,
+        atlas_revision_sha256: str | None = None,
+    ) -> None:
+        """Attach a layer-63 MLP residual operator while the runtime is idle."""
+
+        if bank is not None and not isinstance(bank, Layer63MlpResidualCrystalBank):
+            raise TypeError(
+                "layer_mlp_crystal_bank must be a Layer63MlpResidualCrystalBank or None"
+            )
+        if (
+            isinstance(max_error_radius, bool)
+            or not isinstance(max_error_radius, (int, float))
+            or not math.isfinite(float(max_error_radius))
+            or float(max_error_radius) < 0.0
+        ):
+            raise ValueError(
+                "layer-MLP Crystal max_error_radius must be finite and non-negative"
+            )
+        if (
+            self._pending_block_stage is not None
+            or self._active_attention_output_crystal_transaction is not None
+            or self._active_mlp_page_coordinate_transaction is not None
+        ):
+            raise Qwen38RuntimeError(
+                "layer-MLP Crystal attachment cannot change during a stage"
+            )
+        if bank is not None:
+            identity = bank.identity
+            for label, claimed, expected in (
+                ("graph", graph_revision_sha256, identity.graph_revision_sha256),
+                ("Atlas", atlas_revision_sha256, identity.atlas_revision_sha256),
+            ):
+                if (
+                    not isinstance(claimed, str)
+                    or len(claimed) != 64
+                    or set(claimed) - set("0123456789abcdef")
+                    or claimed != expected
+                ):
+                    raise Qwen38RuntimeError(
+                        f"layer-MLP Crystal {label} authority differs from its bank"
+                    )
+            if self.pager.compute_dtype != torch.bfloat16:
+                raise ValueError(
+                    "layer-MLP Crystals require exact BF16 target execution"
+                )
+            if (
+                self.config.n_layers - 1 != LAYER_MLP_TARGET_LAYER_INDEX
+                or not self.config.is_full_attention(LAYER_MLP_TARGET_LAYER_INDEX)
+            ):
+                raise Qwen38RuntimeError(
+                    "layer-MLP Crystals require full-attention layer 63 as the "
+                    "final decoder layer"
+                )
+            scope = (
+                identity.layer_index,
+                identity.source_stage,
+                identity.feature_stage,
+                identity.target_stage,
+                identity.action_abi,
+            )
+            expected_scope = (
+                LAYER_MLP_TARGET_LAYER_INDEX,
+                LAYER_MLP_SOURCE_STAGE,
+                LAYER_MLP_FEATURE_STAGE,
+                LAYER_MLP_TARGET_STAGE,
+                LAYER_MLP_RESIDUAL_ACTION_ABI,
+            )
+            if scope != expected_scope:
+                raise Qwen38RuntimeError(
+                    "layer-MLP Crystal execution scope differs from target"
+                )
+            if identity.hidden_dim != self.config.dim:
+                raise Qwen38RuntimeError(
+                    "layer-MLP Crystal hidden width differs from target"
+                )
+            if identity.model_sha256 != self.layer_mlp_crystal_model_sha256():
+                raise Qwen38RuntimeError(
+                    "layer-MLP Crystal model pin differs from target"
+                )
+            if identity.q4_sha256 != self.layer_mlp_crystal_q4_sha256():
+                raise Qwen38RuntimeError("layer-MLP Crystal Q4 pin differs from target")
+            crystals = bank.crystals
+            if not crystals:
+                raise Qwen38RuntimeError("layer-MLP Crystal bank contains no actions")
+            expected_bytes = self._layer_mlp_crystal_avoided_q4_bytes()
+            if any(
+                crystal.logical_weight_bytes_replaced != expected_bytes
+                for crystal in crystals
+            ):
+                raise Qwen38RuntimeError(
+                    "layer-MLP Crystal physical byte claim differs from Q4"
+                )
+        self.layer_mlp_crystal_bank = bank
+        self.layer_mlp_crystal_enabled = bank is not None
+        self.layer_mlp_crystal_max_error_radius = (
+            0.0 if bank is None else float(max_error_radius)
+        )
+
+    def detach_layer_mlp_crystal_bank(self) -> None:
+        """Detach the layer-63 MLP action under the attachment idle guard."""
+
+        self.attach_layer_mlp_crystal_bank(None)
+
+    def set_layer_mlp_crystal_enabled(self, enabled: bool) -> None:
+        """Select the attached MLP residual action for the next request."""
+
+        if not isinstance(enabled, bool):
+            raise TypeError("layer-MLP Crystal activation must be boolean")
+        if enabled and self.layer_mlp_crystal_bank is None:
+            raise Qwen38RuntimeError(
+                "layer-MLP Crystal activation requires an attached bank"
+            )
+        if (
+            self._pending_block_stage is not None
+            or self._active_attention_output_crystal_transaction is not None
+            or self._active_mlp_page_coordinate_transaction is not None
+        ):
+            raise Qwen38RuntimeError(
+                "layer-MLP Crystal activation cannot change during a stage"
+            )
+        self.layer_mlp_crystal_enabled = enabled
+
+    def layer_mlp_crystal_metrics(self) -> dict[str, object]:
+        """Return cumulative physical layer-63 MLP replacement counters."""
+
+        bank = self.layer_mlp_crystal_bank
+        bank_metrics = None if bank is None else bank.metrics().to_dict()
+        identity = None if bank is None else bank.identity
+        return {
+            "atlas_revision_sha256": (
+                None if identity is None else identity.atlas_revision_sha256
+            ),
+            "attempts": 0 if bank_metrics is None else int(bank_metrics["attempts"]),
+            "enabled": self.layer_mlp_crystal_enabled,
+            "exact_kv_state_updates": 0,
+            "fallbacks": 0 if bank_metrics is None else int(bank_metrics["fallbacks"]),
+            "graph_revision_sha256": (
+                None if identity is None else identity.graph_revision_sha256
+            ),
+            "identity_sha256": None if identity is None else identity.identity_sha256,
+            "max_error_radius": self.layer_mlp_crystal_max_error_radius,
+            "model_sha256": None if identity is None else identity.model_sha256,
+            "packed_weight_bytes_avoided": (
+                self._layer_mlp_crystal_packed_weight_bytes_avoided
+            ),
+            "physical_transitions": self._layer_mlp_crystal_hits,
+            "q4_sha256": None if identity is None else identity.q4_sha256,
+            "replacements": (
+                0 if bank_metrics is None else int(bank_metrics["replacements"])
+            ),
+            "schema": "immer.qwen3.8-layer-mlp-residual-crystal-metrics/v1",
+            "skipped_q4_matrix_calls": (
+                self._layer_mlp_crystal_skipped_q4_matrix_calls
+            ),
+            "transition_rows": self._layer_mlp_crystal_rows,
         }
 
     def set_delta_head_router(self, router: Any | None) -> None:
@@ -1656,6 +1906,15 @@ class StreamedQwen38:
                     "max_error_radius": (
                         self.layer_transition_crystal_max_error_radius.hex()
                     ),
+                }
+            ),
+            "layer_mlp_crystal": (
+                None
+                if self.layer_mlp_crystal_bank is None
+                else {
+                    "enabled": self.layer_mlp_crystal_enabled,
+                    "identity": self.layer_mlp_crystal_bank.identity.to_record(),
+                    "max_error_radius": self.layer_mlp_crystal_max_error_radius.hex(),
                 }
             ),
             "native_head_crsa": self._native_head_crsa_snapshot_identity(),
@@ -3928,6 +4187,65 @@ class StreamedQwen38:
         self._layer_transition_crystal_packed_weight_bytes_avoided += avoided_bytes
         return output, next_state
 
+    def _layer_mlp_crystal_forward(
+        self,
+        base_hidden: torch.Tensor,
+        mlp_input: torch.Tensor,
+        *,
+        layer: int,
+        token_mask: torch.Tensor,
+        stateful: bool,
+    ) -> torch.Tensor | None:
+        """Replace one final-layer K1 MLP after exact attention and RMSNorm."""
+
+        bank = self.layer_mlp_crystal_bank
+        if (
+            bank is None
+            or not self.layer_mlp_crystal_enabled
+            or not stateful
+            or layer != LAYER_MLP_TARGET_LAYER_INDEX
+            or layer != self.config.n_layers - 1
+            or tuple(base_hidden.shape) != (1, 1, self.config.dim)
+            or tuple(mlp_input.shape) != (1, 1, self.config.dim)
+            or base_hidden.dtype != torch.bfloat16
+            or mlp_input.dtype != torch.bfloat16
+            or self.layer_boundary_observer is not None
+        ):
+            return None
+        if (
+            tuple(token_mask.shape) != (1, 1)
+            or token_mask.dtype != torch.bool
+            or not bool(token_mask.item())
+        ):
+            return None
+        replacement = bank.replace(
+            base_hidden,
+            mlp_input,
+            max_error_radius=self.layer_mlp_crystal_max_error_radius,
+        )
+        if replacement is None:
+            return None
+        output = replacement.output
+        if (
+            tuple(output.shape) != (1, 1, self.config.dim)
+            or output.dtype != self.pager.compute_dtype
+            or not self._on_pager_device(output)
+            or not bool(torch.isfinite(output).all().item())
+        ):
+            raise Qwen38RuntimeError("layer-MLP Crystal emitted an invalid hidden row")
+        avoided_bytes = self._layer_mlp_crystal_avoided_q4_bytes()
+        if replacement.logical_weight_bytes_replaced != avoided_bytes:
+            raise Qwen38RuntimeError(
+                "layer-MLP Crystal byte claim changed after attachment"
+            )
+        self._layer_mlp_crystal_hits += 1
+        self._layer_mlp_crystal_rows += 1
+        self._layer_mlp_crystal_skipped_q4_matrix_calls += len(
+            self._layer_mlp_crystal_q4_names()
+        )
+        self._layer_mlp_crystal_packed_weight_bytes_avoided += avoided_bytes
+        return output
+
     def _forward_layer(
         self,
         hidden: torch.Tensor,
@@ -3992,15 +4310,25 @@ class StreamedQwen38:
         residual = hidden
         mlp_input = self._norm(hidden, f"{prefix}.post_attention_layernorm.weight")
         self._observe_layer_boundary(layer, "mlp.input", mlp_input)
-        if self._active_mlp_page_coordinate_transaction is None:
-            mlp_output = self._mlp(mlp_input, layer=layer)
+        layer_mlp_crystal = self._layer_mlp_crystal_forward(
+            residual,
+            mlp_input,
+            layer=layer,
+            token_mask=token_mask,
+            stateful=stateful,
+        )
+        if layer_mlp_crystal is not None:
+            hidden = layer_mlp_crystal
         else:
-            mlp_output = self._mlp(
-                mlp_input,
-                layer=layer,
-                absolute_position=start_pos,
-            )
-        hidden = residual + mlp_output
+            if self._active_mlp_page_coordinate_transaction is None:
+                mlp_output = self._mlp(mlp_input, layer=layer)
+            else:
+                mlp_output = self._mlp(
+                    mlp_input,
+                    layer=layer,
+                    absolute_position=start_pos,
+                )
+            hidden = residual + mlp_output
         self._observe_layer_boundary(layer, "layer.output", hidden)
         return hidden, retained_state
 
@@ -4152,6 +4480,20 @@ class StreamedQwen38:
                         "instance": id(self.layer_transition_crystal_bank),
                         "max_error_radius": (
                             self.layer_transition_crystal_max_error_radius.hex()
+                        ),
+                    }
+                ),
+                "layer_mlp_crystal": (
+                    None
+                    if self.layer_mlp_crystal_bank is None
+                    else {
+                        "enabled": self.layer_mlp_crystal_enabled,
+                        "identity_sha256": (
+                            self.layer_mlp_crystal_bank.identity.identity_sha256
+                        ),
+                        "instance": id(self.layer_mlp_crystal_bank),
+                        "max_error_radius": (
+                            self.layer_mlp_crystal_max_error_radius.hex()
                         ),
                     }
                 ),

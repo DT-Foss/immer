@@ -30,6 +30,7 @@ ACTION_CATALOG = (
     "dynamic_mlp_pages",
     "external_drafter",
     "fertig_exact",
+    "layer_mlp_crystal",
     "layer_transition_crystal",
     "lm_head_coordinate",
     "mlp_head_coordinate",
@@ -206,6 +207,83 @@ def physical_layer_transition_crystal_executed(value: object) -> bool:
     )
 
 
+def physical_layer_mlp_crystal_executed(value: object) -> bool:
+    """Accept only physical layer-63 Gate/Up/Down replacement evidence."""
+
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema") != "immer.qwen3.8-layer-mlp-residual-crystal-evidence/v1"
+        or value.get("action_abi")
+        != "immer.qwen3.8/layer63-mlp-residual-rademacher-centered-ridge-bf16/v1"
+        or not all(
+            _is_sha256(value.get(field))
+            for field in (
+                "identity_sha256",
+                "model_sha256",
+                "q4_sha256",
+                "graph_revision_sha256",
+                "atlas_revision_sha256",
+            )
+        )
+    ):
+        return False
+    request = value.get("request")
+    if not isinstance(request, Mapping) or not all(
+        request.get(field) == value.get(field)
+        for field in (
+            "action_abi",
+            "identity_sha256",
+            "model_sha256",
+            "q4_sha256",
+            "graph_revision_sha256",
+            "atlas_revision_sha256",
+        )
+    ):
+        return False
+    positive = (
+        "attempts",
+        "replacements",
+        "physical_transitions",
+        "transition_rows",
+        "skipped_q4_matrix_calls",
+        "packed_weight_bytes_avoided",
+    )
+    if any(
+        isinstance(request.get(field), bool)
+        or not isinstance(request.get(field), int)
+        or request.get(field, 0) <= 0
+        for field in positive
+    ):
+        return False
+    fallbacks = request.get("fallbacks")
+    if isinstance(fallbacks, bool) or not isinstance(fallbacks, int) or fallbacks < 0:
+        return False
+    attempts = request["attempts"]
+    replacements = request["replacements"]
+    transitions = request["physical_transitions"]
+    rows = request["transition_rows"]
+    skipped = request["skipped_q4_matrix_calls"]
+    avoided = request["packed_weight_bytes_avoided"]
+    per_transition = value.get("packed_weight_bytes_per_transition")
+    radius = value.get("max_error_radius")
+    return (
+        isinstance(per_transition, int)
+        and not isinstance(per_transition, bool)
+        and per_transition > 0
+        and request.get("packed_weight_bytes_per_transition") == per_transition
+        and isinstance(radius, (int, float))
+        and not isinstance(radius, bool)
+        and float(radius) >= 0.0
+        and float(radius) not in {float("inf"), float("-inf")}
+        and float(radius) == float(radius)
+        and request.get("max_error_radius") == radius
+        and attempts == replacements + fallbacks
+        and replacements == transitions == rows
+        and skipped == transitions * 3
+        and avoided == transitions * per_transition
+    )
+
+
 def _uint(value: object, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{label} must be a non-negative integer")
@@ -267,6 +345,7 @@ def executed_actions_from_result(
     exact_head = execution.get("exact_head")
     delta_head_router = execution.get("delta_head_router")
     attention_output_crystal = execution.get("attention_output_crystal")
+    layer_mlp_crystal = execution.get("layer_mlp_crystal")
     layer_transition_crystal = execution.get("layer_transition_crystal")
     mlp_page_coordinate = execution.get("mlp_page_coordinate")
     draft = execution.get("draft")
@@ -287,6 +366,10 @@ def executed_actions_from_result(
         layer_transition_crystal
     ):
         actions = tuple(sorted({*actions, "layer_transition_crystal"}))
+    if "qwen_target" in actions and physical_layer_mlp_crystal_executed(
+        layer_mlp_crystal
+    ):
+        actions = tuple(sorted({*actions, "layer_mlp_crystal"}))
     if isinstance(delta_head_router, Mapping):
         request = delta_head_router.get("request")
         if isinstance(request, Mapping) and all(
@@ -408,6 +491,7 @@ class InferenceActionReceipt:
             action in self.actions
             for action in (
                 "attention_output_crystal",
+                "layer_mlp_crystal",
                 "layer_transition_crystal",
                 "lm_head_coordinate",
                 "mlp_head_coordinate",
@@ -588,6 +672,8 @@ class InferenceActionDirective:
                 raise ValueError(
                     f"{name} layer_transition_crystal requires qwen_target"
                 )
+            if "layer_mlp_crystal" in actions and "qwen_target" not in actions:
+                raise ValueError(f"{name} layer_mlp_crystal requires qwen_target")
             if "mlp_page_coordinate" in actions and "qwen_target" not in actions:
                 raise ValueError(f"{name} mlp_page_coordinate requires qwen_target")
             if "prefix_sinkhorn" in actions and "qwen_target" not in actions:
@@ -947,6 +1033,7 @@ class InferenceActionBank:
             and "qwen_target" in receipt.actions
             and (
                 "attention_output_crystal" in receipt.actions
+                or "layer_mlp_crystal" in receipt.actions
                 or "layer_transition_crystal" in receipt.actions
                 or "lm_head_coordinate" in receipt.actions
                 or "mlp_head_coordinate" in receipt.actions
@@ -994,6 +1081,7 @@ class InferenceActionBank:
                     "compute_crystal",
                     "continuation_battery",
                     "dynamic_mlp_pages",
+                    "layer_mlp_crystal",
                     "layer_transition_crystal",
                     "lm_head_coordinate",
                     "mlp_page_coordinate",
@@ -1019,6 +1107,10 @@ class InferenceActionBank:
             "layer_transition_crystal" in receipt.actions for receipt in exact_runtime
         ):
             runtime_action_set.update({"layer_transition_crystal", "qwen_target"})
+        if exact_runtime and any(
+            "layer_mlp_crystal" in receipt.actions for receipt in exact_runtime
+        ):
+            runtime_action_set.update({"layer_mlp_crystal", "qwen_target"})
         if exact_runtime and any(
             "mlp_head_coordinate" in receipt.actions for receipt in exact_runtime
         ):
