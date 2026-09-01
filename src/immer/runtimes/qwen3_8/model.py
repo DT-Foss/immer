@@ -256,6 +256,7 @@ class _PendingStatefulBlock:
     prefix_trace: _ContinuationPrefixTrace
     runtime_identity: str
     mlp_page_transaction_owner: Any | None
+    delta_head_transaction_owner: Any | None
 
 
 class StreamedQwen38:
@@ -406,8 +407,14 @@ class StreamedQwen38:
                 )
         if delta_head_router is not None:
             required = (
+                "begin_transaction",
+                "commit_transaction",
+                "finalize_transaction",
                 "project",
                 "project_many",
+                "reset_session",
+                "revert_committed_transaction",
+                "rollback_transaction",
                 "snapshot_identity",
                 "supports_layer",
             )
@@ -2831,6 +2838,14 @@ class StreamedQwen38:
             owner.rollback_transaction()
         if current is not None:
             current.reset_session()
+        delta_owner = (
+            None if pending is None else pending.delta_head_transaction_owner
+        )
+        delta_current = self.delta_head_router
+        if delta_owner is not None and delta_owner is not delta_current:
+            delta_owner.rollback_transaction()
+        if delta_current is not None:
+            delta_current.reset_session()
 
     def reset_state(self, *, release: bool = False) -> None:
         """Drop every committed KV/DeltaNet cache and clear the poison latch."""
@@ -3252,15 +3267,25 @@ class StreamedQwen38:
         runtime_identity = self._continuation_block_runtime_identity()
 
         page_router = self.mlp_page_router
+        delta_router = self.delta_head_router
         previous_stage = self._pending_block_stage
-        if (
-            previous_stage is not None
-            and previous_stage.mlp_page_transaction_owner is not None
-        ):
-            previous_stage.mlp_page_transaction_owner.rollback_transaction()
+        if previous_stage is not None:
+            if previous_stage.mlp_page_transaction_owner is not None:
+                previous_stage.mlp_page_transaction_owner.rollback_transaction()
+            if previous_stage.delta_head_transaction_owner is not None:
+                previous_stage.delta_head_transaction_owner.rollback_transaction()
         self._pending_block_stage = None
-        if page_router is not None:
-            page_router.begin_transaction()
+        try:
+            if page_router is not None:
+                page_router.begin_transaction()
+            if delta_router is not None:
+                delta_router.begin_transaction()
+        except Exception:
+            if page_router is not None:
+                page_router.rollback_transaction()
+            if delta_router is not None:
+                delta_router.rollback_transaction()
+            raise
         try:
             source = self.pager.source
             start_bytes = self._metric(source, "network_or_source_body_bytes")
@@ -3269,6 +3294,8 @@ class StreamedQwen38:
         except Exception:
             if page_router is not None:
                 page_router.rollback_transaction()
+            if delta_router is not None:
+                delta_router.rollback_transaction()
             raise
         try:
             embedded = self.embed_batch(ids)
@@ -3304,6 +3331,8 @@ class StreamedQwen38:
             self._pending_block_stage = None
             if page_router is not None:
                 page_router.rollback_transaction()
+            if delta_router is not None:
+                delta_router.rollback_transaction()
             self.pager.release()
             raise
         finally:
@@ -3354,12 +3383,15 @@ class StreamedQwen38:
                 prefix_trace=staged.prefix_trace,
                 runtime_identity=runtime_identity,
                 mlp_page_transaction_owner=page_router,
+                delta_head_transaction_owner=delta_router,
             )
             return stage
         except Exception:
             self._pending_block_stage = None
             if page_router is not None:
                 page_router.rollback_transaction()
+            if delta_router is not None:
+                delta_router.rollback_transaction()
             raise
 
     def extend_continuation_block(
@@ -3382,6 +3414,7 @@ class StreamedQwen38:
         if pending is None or stage is not pending.handle:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         page_router = pending.mlp_page_transaction_owner
+        delta_router = pending.delta_head_transaction_owner
 
         # A matching handle is consumed exactly once.  No later validation or
         # compute failure may leave the old private transaction committable.
@@ -3510,12 +3543,15 @@ class StreamedQwen38:
                 prefix_trace=prefix_trace,
                 runtime_identity=runtime_identity,
                 mlp_page_transaction_owner=page_router,
+                delta_head_transaction_owner=delta_router,
             )
             return next_stage
         except Exception:
             self._pending_block_stage = None
             if page_router is not None:
                 page_router.rollback_transaction()
+            if delta_router is not None:
+                delta_router.rollback_transaction()
             raise
         finally:
             self.pager.release()
@@ -3532,6 +3568,9 @@ class StreamedQwen38:
         page_router = pending.mlp_page_transaction_owner
         if page_router is not None:
             page_router.rollback_transaction()
+        delta_router = pending.delta_head_transaction_owner
+        if delta_router is not None:
+            delta_router.rollback_transaction()
         self.pager.release()
 
     def _reconstruct_continuation_prefix_states(
@@ -3640,11 +3679,14 @@ class StreamedQwen38:
         if pending is None or stage is not pending.handle:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         page_router = pending.mlp_page_transaction_owner
+        delta_router = pending.delta_head_transaction_owner
 
-        def rollback_page_route() -> None:
+        def rollback_coordinate_routes() -> None:
             self._pending_block_stage = None
             if page_router is not None:
                 page_router.rollback_transaction()
+            if delta_router is not None:
+                delta_router.rollback_transaction()
 
         row = pending.evidence
         stage_width = row.end_pos - row.start_pos
@@ -3655,29 +3697,29 @@ class StreamedQwen38:
         if width == stage_width:
             return self.commit_continuation_block(stage)
         if self._state_poisoned:
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("decoder state is poisoned; call reset_state()")
         if self._next_position != row.start_pos:
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("continuation block base state changed")
         if self._state_batch_size != len(row.input_token_ids):
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("continuation block batch state changed")
         if len(row.input_token_ids) != 1 or row.end_pos > self.max_seq_len:
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("continuation block exceeds runtime bounds")
         if self._continuation_block_runtime_identity() != pending.runtime_identity:
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("continuation block runtime configuration changed")
         if tuple(pending.hidden.shape) != (1, stage_width, self.config.dim):
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("continuation block hidden shape is invalid")
         if (
             not pending.hidden.is_floating_point()
             or not self._on_pager_device(pending.hidden)
             or pending.hidden.dtype != self.pager.compute_dtype
         ):
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError(
                 "continuation block hidden device/dtype is invalid"
             )
@@ -3691,7 +3733,7 @@ class StreamedQwen38:
                 graft_history=pending.graft_history,
             )
         except Exception:
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise
 
         self._pending_block_stage = None
@@ -3711,11 +3753,27 @@ class StreamedQwen38:
         except Exception:
             if page_router is not None:
                 page_router.rollback_transaction()
+            if delta_router is not None:
+                delta_router.rollback_transaction()
             raise
         end_pos = row.start_pos + width
         hidden = pending_hidden[:, :width]
-        if page_router is not None:
-            page_router.commit_transaction(accepted_rows=width)
+        try:
+            if delta_router is not None:
+                delta_router.commit_transaction(accepted_rows=width)
+        except Exception:
+            if page_router is not None:
+                page_router.rollback_transaction()
+            raise
+        try:
+            if page_router is not None:
+                page_router.commit_transaction(accepted_rows=width)
+        except Exception:
+            if delta_router is not None:
+                delta_router.revert_committed_transaction()
+            raise
+        if delta_router is not None:
+            delta_router.finalize_transaction()
         self._layer_states = list(states)
         self._next_position = end_pos
         self._state_batch_size = 1
@@ -3761,46 +3819,49 @@ class StreamedQwen38:
         if pending is None or stage is not pending.handle:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         page_router = pending.mlp_page_transaction_owner
+        delta_router = pending.delta_head_transaction_owner
 
-        def rollback_page_route() -> None:
+        def rollback_coordinate_routes() -> None:
             self._pending_block_stage = None
             if page_router is not None:
                 page_router.rollback_transaction()
+            if delta_router is not None:
+                delta_router.rollback_transaction()
 
         row = pending.evidence
         if self._state_poisoned:
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("decoder state is poisoned; call reset_state()")
         if self._next_position != row.start_pos:
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("continuation block base state changed")
         if self._state_batch_size != len(row.input_token_ids):
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("continuation block batch state changed")
         if (
             len(row.input_token_ids) > self.max_batch_size
             or row.end_pos > self.max_seq_len
         ):
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError(
                 "continuation block exceeds current runtime bounds"
             )
         if self._continuation_block_runtime_identity() != pending.runtime_identity:
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("continuation block runtime configuration changed")
         if tuple(pending.hidden.shape) != (
             len(row.input_token_ids),
             row.end_pos - row.start_pos,
             self.config.dim,
         ):
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError("continuation block hidden shape is invalid")
         if (
             not pending.hidden.is_floating_point()
             or not self._on_pager_device(pending.hidden)
             or pending.hidden.dtype != self.pager.compute_dtype
         ):
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise Qwen38RuntimeError(
                 "continuation block hidden device/dtype is invalid"
             )
@@ -3814,13 +3875,27 @@ class StreamedQwen38:
                 graft_history=pending.graft_history,
             )
         except Exception:
-            rollback_page_route()
+            rollback_coordinate_routes()
             raise
 
         committed_states = list(pending.layer_states)
         self._pending_block_stage = None
-        if page_router is not None:
-            page_router.commit_transaction()
+        try:
+            if delta_router is not None:
+                delta_router.commit_transaction()
+        except Exception:
+            if page_router is not None:
+                page_router.rollback_transaction()
+            raise
+        try:
+            if page_router is not None:
+                page_router.commit_transaction()
+        except Exception:
+            if delta_router is not None:
+                delta_router.revert_committed_transaction()
+            raise
+        if delta_router is not None:
+            delta_router.finalize_transaction()
         self._layer_states = committed_states
         self._next_position = row.end_pos
         self._state_batch_size = len(row.input_token_ids)
@@ -3914,11 +3989,11 @@ class StreamedQwen38:
             # of whether continuation compute commits or poisons, so release its
             # complete private cache before building replacement layer states.
             pending = self._pending_block_stage
-            if (
-                pending is not None
-                and pending.mlp_page_transaction_owner is not None
-            ):
-                pending.mlp_page_transaction_owner.rollback_transaction()
+            if pending is not None:
+                if pending.mlp_page_transaction_owner is not None:
+                    pending.mlp_page_transaction_owner.rollback_transaction()
+                if pending.delta_head_transaction_owner is not None:
+                    pending.delta_head_transaction_owner.rollback_transaction()
             self._pending_block_stage = None
             del pending
         staged: StatefulLayerRangeResult | None = None

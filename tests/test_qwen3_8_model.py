@@ -726,6 +726,57 @@ class Qwen38ModelTests(unittest.TestCase):
             def snapshot_identity():
                 return {"schema": "test-page-router/v1"}
 
+        class DeltaRouter:
+            def __init__(self, width: int) -> None:
+                self.width = width
+                self.commits = 0
+                self.finalizes = 0
+                self.reverts = 0
+
+            @staticmethod
+            def supports_layer(layer: int) -> bool:
+                return layer == 0
+
+            @staticmethod
+            def snapshot_identity(*, transport_neutral: bool = False):
+                return {"layers": [0], "transport_neutral": transport_neutral}
+
+            @staticmethod
+            def begin_transaction() -> None:
+                pass
+
+            def commit_transaction(self, *, accepted_rows=None) -> None:
+                self.commits += 1
+
+            def finalize_transaction(self) -> None:
+                self.finalizes += 1
+
+            def revert_committed_transaction(self) -> None:
+                self.reverts += 1
+
+            @staticmethod
+            def rollback_transaction() -> None:
+                pass
+
+            @staticmethod
+            def reset_session() -> None:
+                pass
+
+            def project(self, mixed, _name: str, *, layer: int):
+                return torch.zeros(
+                    (*mixed.shape[:-1], self.width),
+                    dtype=mixed.dtype,
+                )
+
+            def project_many(self, mixed, _name: str, *, layer: int):
+                return tuple(
+                    torch.zeros(
+                        (*row.shape[:-1], self.width),
+                        dtype=row.dtype,
+                    )
+                    for row in mixed
+                )
+
         router = PageRouter()
         model = StreamedQwen38(
             self.config,
@@ -751,13 +802,19 @@ class Qwen38ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(Qwen38RuntimeError, "stale"):
             model.discard_continuation_block(stale)
 
+        delta = DeltaRouter(self.config.dim)
+        model.delta_head_router = delta
         stage = model.stage_continuation_block([[9, 10]])
         cursor = model.next_position
         router.fail_commit = True
         with self.assertRaisesRegex(RuntimeError, "page commit failed"):
             model.commit_continuation_prefix(stage, 1)
         self.assertEqual(model.next_position, cursor)
+        self.assertEqual(delta.commits, 1)
+        self.assertEqual(delta.reverts, 1)
+        self.assertEqual(delta.finalizes, 0)
         router.fail_commit = False
+        model.delta_head_router = None
 
         stage = model.stage_continuation_block([[11]])
         replacement = PageRouter()
@@ -967,6 +1024,7 @@ class Qwen38ModelTests(unittest.TestCase):
                 self.width = width
                 self.single = []
                 self.many = []
+                self.events = []
 
             @staticmethod
             def supports_layer(layer: int) -> bool:
@@ -975,6 +1033,24 @@ class Qwen38ModelTests(unittest.TestCase):
             @staticmethod
             def snapshot_identity(*, transport_neutral: bool = False):
                 return {"layers": [0], "transport_neutral": transport_neutral}
+
+            def begin_transaction(self) -> None:
+                self.events.append(("begin",))
+
+            def commit_transaction(self, *, accepted_rows=None) -> None:
+                self.events.append(("commit", accepted_rows))
+
+            def finalize_transaction(self) -> None:
+                self.events.append(("finalize",))
+
+            def revert_committed_transaction(self) -> None:
+                self.events.append(("revert",))
+
+            def rollback_transaction(self) -> None:
+                self.events.append(("rollback",))
+
+            def reset_session(self) -> None:
+                self.events.append(("reset",))
 
             def project(self, mixed, name: str, *, layer: int):
                 self.single.append((layer, name, tuple(mixed.shape)))
@@ -1013,6 +1089,15 @@ class Qwen38ModelTests(unittest.TestCase):
                 )
             ],
         )
+
+        discarded = model.stage_continuation_block([[10, 11]])
+        model.discard_continuation_block(discarded)
+        committed = model.stage_continuation_block([[10, 11]])
+        model.commit_continuation_prefix(committed, 1)
+
+        self.assertIn(("rollback",), router.events)
+        self.assertIn(("commit", 1), router.events)
+        self.assertEqual(router.events.count(("begin",)), 2)
         stage = model.stage_continuation_block([[7, 6]])
         self.assertEqual(
             router.many[-1][:2],

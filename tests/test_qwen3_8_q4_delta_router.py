@@ -170,9 +170,9 @@ class PackedDeltaHeadRouterTests(unittest.TestCase):
                 all(len(row) == 48 for row in layer_state["counts"])
             )
             self.assertEqual(layer_state["counts"][0][0], 1)
-            self.assertEqual(layer_state["previous"], list(range(32)))
+            self.assertNotIn("previous", layer_state)
+            self.assertNotIn("overlap_ema", layer_state)
             self.assertEqual(layer_state["transitions"], 1)
-            self.assertEqual(layer_state["overlap_ema"], 1.0)
             router.close()
 
             restored = PackedDeltaHeadRouter(
@@ -193,16 +193,16 @@ class PackedDeltaHeadRouterTests(unittest.TestCase):
                 selected_ids,
                 [
                     head * 4 + offset
-                    for head in range(24)
+                    for head in range(32)
                     for offset in range(4)
                 ],
             )
             metrics = restored.metrics()
             self.assertEqual(metrics["calls"], first_metrics["calls"] + 1)
             self.assertEqual(metrics["rows"], first_metrics["rows"] + 1)
-            self.assertEqual(metrics["transitions"], 2)
-            self.assertEqual(metrics["width_32"], 1)
-            self.assertEqual(metrics["width_24"], 1)
+            self.assertEqual(metrics["transitions"], 1)
+            self.assertEqual(metrics["width_32"], 2)
+            self.assertEqual(metrics["width_24"], 0)
 
     def test_state_namespaces_cover_identity_and_do_not_collide_with_packed_mlp(
         self,
@@ -313,6 +313,81 @@ class PackedDeltaHeadRouterTests(unittest.TestCase):
         self.assertEqual(metrics["calls"], 1)
         self.assertEqual(metrics["rows"], 3)
         self.assertEqual(metrics["transitions"], 2)
+
+    def test_rejected_transaction_keeps_physical_work_but_not_route_learning(
+        self,
+    ) -> None:
+        bank = _ExactSelectedBlockBank()
+        router = PackedDeltaHeadRouter(
+            bank,  # type: ignore[arg-type]
+            active_layers=(2,),
+            max_selected_heads=32,
+        )
+        staged = _head_values(batch=1, sequence=3)
+
+        router.begin_transaction()
+        router.project(staged, bank.name, layer=2)
+        during = router.metrics()
+        router.rollback_transaction()
+        after = router.metrics()
+
+        self.assertEqual(during["rows"], 3)
+        self.assertEqual(during["logical_bytes_saved"], after["logical_bytes_saved"])
+        self.assertEqual(after["transitions"], 0)
+        router.project(_head_values(batch=1, sequence=1), bank.name, layer=2)
+        self.assertEqual(router.metrics()["transitions"], 0)
+        router.close()
+
+    def test_partial_transaction_commits_only_accepted_rows_and_reset_is_local(
+        self,
+    ) -> None:
+        bank = _ExactSelectedBlockBank()
+        router = PackedDeltaHeadRouter(
+            bank,  # type: ignore[arg-type]
+            active_layers=(2,),
+            max_selected_heads=32,
+        )
+
+        router.begin_transaction()
+        router.project(
+            _head_values(batch=1, sequence=4),
+            bank.name,
+            layer=2,
+        )
+        router.commit_transaction(accepted_rows=2)
+        router.finalize_transaction()
+        self.assertEqual(router.metrics()["transitions"], 1)
+
+        router.project(_head_values(batch=1, sequence=1), bank.name, layer=2)
+        self.assertEqual(router.metrics()["transitions"], 2)
+        router.reset_session()
+        router.project(_head_values(batch=1, sequence=1), bank.name, layer=2)
+        self.assertEqual(router.metrics()["transitions"], 2)
+        self.assertEqual(bank.calls[-1][1].shape[-1], 32 * 4)
+        router.close()
+
+    def test_coordinated_commit_can_revert_before_finalization(self) -> None:
+        bank = _ExactSelectedBlockBank()
+        router = PackedDeltaHeadRouter(
+            bank,  # type: ignore[arg-type]
+            active_layers=(2,),
+            max_selected_heads=32,
+        )
+        router.begin_transaction()
+        router.project(
+            _head_values(batch=1, sequence=3),
+            bank.name,
+            layer=2,
+        )
+
+        router.commit_transaction(accepted_rows=2)
+        self.assertEqual(router.metrics()["transitions"], 1)
+        router.revert_committed_transaction()
+
+        self.assertEqual(router.metrics()["transitions"], 0)
+        router.begin_transaction()
+        router.rollback_transaction()
+        router.close()
 
     def test_ties_are_lower_index_stable_and_close_does_not_close_the_bank(
         self,

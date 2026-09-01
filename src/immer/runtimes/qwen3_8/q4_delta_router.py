@@ -21,8 +21,8 @@ from ..ooe.math_core import sinkhorn_project
 from .q4 import Q4Bank, Q4_BLOCK_SIZE
 
 
-PACKED_DELTA_HEAD_ROUTER_SCHEMA = "immer.qwen3.8-packed-delta-head-router/v1"
-PACKED_DELTA_HEAD_STATE_SCHEMA = "immer.qwen3.8-packed-delta-head-markov/v1"
+PACKED_DELTA_HEAD_ROUTER_SCHEMA = "immer.qwen3.8-packed-delta-head-router/v2"
+PACKED_DELTA_HEAD_STATE_SCHEMA = "immer.qwen3.8-packed-delta-head-markov/v2"
 
 _ROUTE_POLICY = "mean-square+sinkhorn-first-order/v1"
 _STATE_MODE = "delta-head-out-proj"
@@ -55,6 +55,13 @@ class _LayerState:
             overlap_ema=self.overlap_ema,
             transitions=self.transitions,
         )
+
+
+@dataclass(slots=True)
+class _DeltaHeadTransaction:
+    base: dict[int, _LayerState]
+    working: dict[int, _LayerState]
+    routes: dict[int, list[tuple[int, ...]]]
 
 
 class PackedDeltaHeadRouter:
@@ -134,6 +141,8 @@ class PackedDeltaHeadRouter:
         }
         self._width_counts = {width: 0 for width in actions}
         self._sinkhorn_cache: dict[int, np.ndarray] = {}
+        self._transaction: _DeltaHeadTransaction | None = None
+        self._committed_rollback: tuple[dict[int, _LayerState], int] | None = None
         self._lock = threading.RLock()
         self._dirty = False
         self._closed = False
@@ -203,6 +212,9 @@ class PackedDeltaHeadRouter:
             "state_persistent": self.state_path is not None,
             "value_heads": self.value_heads,
             "width_actions": list(self.width_actions),
+            "transactional_prefix_commit": True,
+            "request_session_reset": True,
+            "coordinated_commit_rollback": True,
         }
         if not transport_neutral:
             root = getattr(self.bank, "root", None)
@@ -435,7 +447,17 @@ class PackedDeltaHeadRouter:
         with self._lock:
             if self._closed:
                 raise PackedDeltaHeadRouterError("packed DeltaNet head router is closed")
-            working = self._states[layer].clone()
+            if self._committed_rollback is not None:
+                raise PackedDeltaHeadRouterError(
+                    "packed DeltaNet head commit awaits finalization"
+                )
+            transaction = self._transaction
+            source_state = (
+                self._states[layer]
+                if transaction is None
+                else transaction.working[layer]
+            )
+            working = source_state.clone()
             width = self._choose_width(working)
             routes, sinkhorn_refreshes = self._routes(
                 flat,
@@ -466,8 +488,15 @@ class PackedDeltaHeadRouter:
                 total_rows * payload_bytes * width // self.value_heads
             )
             full_bytes = total_rows * payload_bytes
-            transition_delta = working.transitions - self._states[layer].transitions
-            self._states[layer] = working
+            if transaction is None:
+                transition_delta = (
+                    working.transitions - self._states[layer].transitions
+                )
+                self._states[layer] = working
+                self._counters["transitions"] += transition_delta
+            else:
+                transaction.working[layer] = working
+                transaction.routes[layer].extend(routes)
             self._counters["calls"] += 1
             self._counters["rows"] += total_rows
             self._counters["full_equivalent_bytes"] += full_bytes
@@ -479,7 +508,6 @@ class PackedDeltaHeadRouter:
                 total_rows * width * self.blocks_per_head
             )
             self._counters["sinkhorn_projections"] += sinkhorn_refreshes
-            self._counters["transitions"] += transition_delta
             self._width_counts[width] += 1
             self._dirty = True
 
@@ -515,6 +543,127 @@ class PackedDeltaHeadRouter:
             raise TypeError("project_many mixed values must be a tuple")
         return self._project(mixed, name, layer=layer)
 
+    def begin_transaction(self) -> None:
+        """Stage Markov head-route learning until target prefix commit."""
+
+        with self._lock:
+            if self._closed:
+                raise PackedDeltaHeadRouterError(
+                    "packed DeltaNet head router is closed"
+                )
+            if self._transaction is not None:
+                raise PackedDeltaHeadRouterError(
+                    "packed DeltaNet head transaction is already active"
+                )
+            if self._committed_rollback is not None:
+                raise PackedDeltaHeadRouterError(
+                    "packed DeltaNet head commit awaits finalization"
+                )
+            base = {
+                layer: state.clone() for layer, state in self._states.items()
+            }
+            self._transaction = _DeltaHeadTransaction(
+                base=base,
+                working={layer: state.clone() for layer, state in base.items()},
+                routes={layer: [] for layer in self.active_layers},
+            )
+            self._sinkhorn_cache.clear()
+
+    def commit_transaction(self, *, accepted_rows: int | None = None) -> None:
+        """Commit only the target-confirmed row prefix from one staged block."""
+
+        with self._lock:
+            transaction = self._transaction
+            if transaction is None:
+                raise PackedDeltaHeadRouterError(
+                    "no packed DeltaNet head transaction is active"
+                )
+            row_counts = {len(rows) for rows in transaction.routes.values()}
+            if len(row_counts) != 1:
+                raise PackedDeltaHeadRouterError(
+                    "packed DeltaNet transaction layer widths disagree"
+                )
+            total_rows = next(iter(row_counts), 0)
+            width = total_rows if accepted_rows is None else accepted_rows
+            if (
+                isinstance(width, bool)
+                or not isinstance(width, int)
+                or not 0 <= width <= total_rows
+            ):
+                raise ValueError("accepted_rows lies outside the staged Delta rows")
+            committed: dict[int, _LayerState] = {}
+            transition_delta = 0
+            for layer in self.active_layers:
+                state = transaction.base[layer].clone()
+                for route in transaction.routes[layer][:width]:
+                    self._observe(state, route)
+                committed[layer] = state
+                transition_delta += (
+                    state.transitions - transaction.base[layer].transitions
+                )
+            self._committed_rollback = (
+                {
+                    layer: state.clone()
+                    for layer, state in transaction.base.items()
+                },
+                self._counters["transitions"],
+            )
+            self._states = committed
+            self._counters["transitions"] += transition_delta
+            self._transaction = None
+            self._sinkhorn_cache.clear()
+            self._dirty = True
+
+    def finalize_transaction(self) -> None:
+        """Release the rollback point after every coordinated owner commits."""
+
+        with self._lock:
+            if self._committed_rollback is None:
+                raise PackedDeltaHeadRouterError(
+                    "no packed DeltaNet head commit awaits finalization"
+                )
+            self._committed_rollback = None
+
+    def revert_committed_transaction(self) -> None:
+        """Restore the pre-commit policy when another owner fails to commit."""
+
+        with self._lock:
+            rollback = self._committed_rollback
+            if rollback is None:
+                return
+            states, transitions = rollback
+            self._states = {
+                layer: state.clone() for layer, state in states.items()
+            }
+            self._counters["transitions"] = transitions
+            self._committed_rollback = None
+            self._sinkhorn_cache.clear()
+            self._dirty = True
+
+    def rollback_transaction(self) -> None:
+        """Discard all uncommitted route learning after target rejection."""
+
+        with self._lock:
+            if self._transaction is None:
+                return
+            self._transaction = None
+            self._sinkhorn_cache.clear()
+
+    def reset_session(self) -> None:
+        """Clear request-local route history while retaining learned counts."""
+
+        with self._lock:
+            if self._closed:
+                raise PackedDeltaHeadRouterError(
+                    "packed DeltaNet head router is closed"
+                )
+            self._transaction = None
+            self.revert_committed_transaction()
+            for state in self._states.values():
+                state.previous = ()
+                state.overlap_ema = 0.0
+            self._sinkhorn_cache.clear()
+
     def _state_document(self) -> dict[str, object]:
         return {
             "counters": dict(self._counters),
@@ -522,8 +671,6 @@ class PackedDeltaHeadRouter:
             "layers": {
                 str(layer): {
                     "counts": state.counts.tolist(),
-                    "overlap_ema": state.overlap_ema,
-                    "previous": list(state.previous),
                     "transitions": state.transitions,
                 }
                 for layer, state in sorted(self._states.items())
@@ -577,8 +724,6 @@ class PackedDeltaHeadRouter:
             row = layers[str(layer)]
             if not isinstance(row, dict) or set(row) != {
                 "counts",
-                "overlap_ema",
-                "previous",
                 "transitions",
             }:
                 raise PackedDeltaHeadRouterStateError(
@@ -604,24 +749,9 @@ class PackedDeltaHeadRouter:
                 raise PackedDeltaHeadRouterStateError(
                     "packed DeltaNet transition counts are invalid"
                 )
-            previous = row["previous"]
-            overlap_ema = row["overlap_ema"]
             transitions = row["transitions"]
             if (
-                not isinstance(previous, list)
-                or len(previous) > self.max_selected_heads
-                or any(
-                    isinstance(head, bool)
-                    or not isinstance(head, int)
-                    or not 0 <= head < self.value_heads
-                    for head in previous
-                )
-                or len(set(previous)) != len(previous)
-                or isinstance(overlap_ema, bool)
-                or not isinstance(overlap_ema, (int, float))
-                or not math.isfinite(float(overlap_ema))
-                or not 0.0 <= float(overlap_ema) <= 1.0
-                or isinstance(transitions, bool)
+                isinstance(transitions, bool)
                 or not isinstance(transitions, int)
                 or transitions < 0
             ):
@@ -630,8 +760,8 @@ class PackedDeltaHeadRouter:
                 )
             restored[layer] = _LayerState(
                 counts=np.asarray(counts, dtype=np.int64),
-                previous=tuple(previous),
-                overlap_ema=float(overlap_ema),
+                previous=(),
+                overlap_ema=0.0,
                 transitions=transitions,
             )
 
@@ -729,6 +859,9 @@ class PackedDeltaHeadRouter:
         with self._lock:
             if self._closed:
                 return
+            self._transaction = None
+            self.revert_committed_transaction()
+            self._sinkhorn_cache.clear()
             self._flush_locked()
             self._closed = True
 
