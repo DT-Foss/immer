@@ -2743,6 +2743,7 @@ class Qwen38CausalChat:
         if not draft_enabled:
             direct_progress = self._direct_generation_progress(runtime)
             direct_options = dict(generation_options)
+            direct_options.pop("draft_enabled", None)
             direct_options.pop("draft_window_ceiling", None)
             if direct_progress is not None:
                 direct_options["progress"] = direct_progress

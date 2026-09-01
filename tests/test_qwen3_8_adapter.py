@@ -2140,6 +2140,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertTrue(result.ok, result.reason)
         self.assertNotIn("draft", result.evidence)
+        self.assertNotIn("draft_enabled", runtime.model.calls[-1][1])
         self.assertEqual(
             result.evidence["inference_action_directive"]["applied"],
             {
