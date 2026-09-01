@@ -362,6 +362,48 @@ def _compact_generation_receipt(
             ):
                 raise Qwen38ChatError(f"generation evidence {key} is invalid")
             compact[key] = float(item)
+    forward_contract = evidence.get("forward_contract")
+    if forward_contract is not None:
+        expected_fields = {
+            "accepted_draft_tokens",
+            "emitted_tokens",
+            "prefill_forward_passes",
+            "round_forward_passes",
+            "rounds",
+            "schema",
+        }
+        if (
+            not isinstance(forward_contract, Mapping)
+            or set(forward_contract) != expected_fields
+            or forward_contract.get("schema")
+            != "immer.qwen3.8-rolling-forward-contract/v1"
+        ):
+            raise Qwen38ChatError("rolling forward contract is invalid")
+        contract = dict(forward_contract)
+        raw_forward_passes = compact["forward_passes"]
+        if (
+            isinstance(raw_forward_passes, bool)
+            or not isinstance(raw_forward_passes, int)
+            or raw_forward_passes < 0
+        ):
+            raise Qwen38ChatError(
+                "generation evidence forward_passes is invalid"
+            )
+        for key in expected_fields - {"schema"}:
+            item = contract[key]
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                raise Qwen38ChatError(
+                    f"rolling forward contract {key} is invalid"
+                )
+        if (
+            contract["accepted_draft_tokens"] > contract["emitted_tokens"]
+            or contract["emitted_tokens"] != len(generated_ids)
+            or contract["prefill_forward_passes"]
+            + contract["round_forward_passes"]
+            != raw_forward_passes
+        ):
+            raise Qwen38ChatError("rolling forward contract totals are invalid")
+        compact["forward_contract"] = contract
     for key in ("forward_passes", "source_body_bytes", "linear_calls", "state_bytes"):
         item = compact[key]
         if isinstance(item, bool) or not isinstance(item, int) or item < 0:
@@ -653,18 +695,32 @@ def _anchor_hit_evidence(
     forward_executed = generation["forward_passes"]
     suffix_tokens = prompt_tokens - prefix_tokens
     prefill_sweeps_executed = int(suffix_tokens > 0)
-    processed_generation_tokens = max(
-        0,
-        generation["generated_tokens"] - (1 - final_commit),
-    )
-    minimum_generation_forwards = (
-        processed_generation_tokens
-        + StreamedQwen38.MAX_CONTINUATION_BLOCK_WIDTH
-        - 1
-    ) // StreamedQwen38.MAX_CONTINUATION_BLOCK_WIDTH
-    minimum_forwards = prefill_sweeps_executed + minimum_generation_forwards
-    if forward_executed < minimum_forwards:
-        raise Qwen38ChatError("anchor generation forward count is inconsistent")
+    forward_contract = generation.get("forward_contract")
+    if isinstance(forward_contract, Mapping):
+        if (
+            forward_contract.get("schema")
+            != "immer.qwen3.8-rolling-forward-contract/v1"
+            or forward_contract.get("prefill_forward_passes")
+            != prefill_sweeps_executed
+            or forward_contract.get("emitted_tokens")
+            != generation["generated_tokens"]
+            or forward_contract.get("prefill_forward_passes", 0)
+            + forward_contract.get("round_forward_passes", 0)
+            != forward_executed
+        ):
+            raise Qwen38ChatError(
+                "anchor rolling forward contract is inconsistent"
+            )
+    else:
+        expected_forwards = (
+            generation["generated_tokens"]
+            + prefill_sweeps_executed
+            - (1 - final_commit)
+        )
+        if forward_executed != expected_forwards:
+            raise Qwen38ChatError(
+                "anchor generation forward count is inconsistent"
+            )
     forward_passes_saved = 1 - prefill_sweeps_executed
     forward_baseline = forward_executed + forward_passes_saved
     snapshot_artifact_bytes = (
@@ -2705,6 +2761,48 @@ class Qwen38CausalChat:
                 raise Qwen38ChatError(
                     "rolling execution window differs from its Markov selection"
                 )
+            round_rows = tuple(evidence.rounds)
+            detailed_rounds = all(
+                hasattr(row, "accepted_prefix_length")
+                and hasattr(row, "emitted_token_ids")
+                and hasattr(row, "forward_passes")
+                for row in round_rows
+            )
+            prefill_forward_passes = int(
+                getattr(evidence, "prefill_forward_passes", 0)
+            )
+            rolling_forward_contract = {
+                "accepted_draft_tokens": (
+                    sum(row.accepted_prefix_length for row in round_rows)
+                    if detailed_rounds
+                    else evidence.accepted_draft_tokens
+                ),
+                "emitted_tokens": (
+                    sum(len(row.emitted_token_ids) for row in round_rows)
+                    if detailed_rounds
+                    else len(generated.token_ids)
+                ),
+                "prefill_forward_passes": prefill_forward_passes,
+                "round_forward_passes": (
+                    sum(row.forward_passes for row in round_rows)
+                    if detailed_rounds
+                    else evidence.forward_passes - prefill_forward_passes
+                ),
+                "rounds": len(round_rows),
+                "schema": "immer.qwen3.8-rolling-forward-contract/v1",
+            }
+            if (
+                rolling_forward_contract["accepted_draft_tokens"]
+                != evidence.accepted_draft_tokens
+                or rolling_forward_contract["emitted_tokens"]
+                != len(generated.token_ids)
+                or rolling_forward_contract["prefill_forward_passes"]
+                + rolling_forward_contract["round_forward_passes"]
+                != evidence.forward_passes
+            ):
+                raise Qwen38ChatError(
+                    "rolling generation aggregates differ from their rounds"
+                )
             export_carry = getattr(provider, "export_mtp_carry", None)
             if callable(export_carry):
                 combined = (*prompt_ids, *generated.token_ids)
@@ -2730,6 +2828,7 @@ class Qwen38CausalChat:
                 "state_bytes": runtime.model.state_bytes,
                 "stopped_on_eos": evidence.stopped_on_eos,
                 "final_state_committed": evidence.final_state_committed,
+                "forward_contract": rolling_forward_contract,
             }
             # Preserve the realized target receipt before optional provider
             # accounting.  A successful metrics read below replaces this with
@@ -2790,6 +2889,7 @@ class Qwen38CausalChat:
                 "state_bytes": runtime.model.state_bytes,
                 "stopped_on_eos": evidence.stopped_on_eos,
                 "final_state_committed": evidence.final_state_committed,
+                "forward_contract": rolling_forward_contract,
             }
             fast_request = self._record_fast_mlp_request(
                 runtime,

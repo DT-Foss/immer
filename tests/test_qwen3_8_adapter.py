@@ -2583,6 +2583,14 @@ class Qwen38CausalChatTests(unittest.TestCase):
             prompt_tokens=2,
             generation={
                 "forward_passes": 3,
+                "forward_contract": {
+                    "accepted_draft_tokens": 2,
+                    "emitted_tokens": 5,
+                    "prefill_forward_passes": 0,
+                    "round_forward_passes": 3,
+                    "rounds": 3,
+                    "schema": "immer.qwen3.8-rolling-forward-contract/v1",
+                },
                 "generated_tokens": 5,
                 "linear_calls": 990,
                 "source_body_bytes": 123_456,
@@ -2595,6 +2603,33 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(evidence["forward_passes_executed"], 3)
         self.assertEqual(evidence["forward_passes_saved"], 1)
         self.assertEqual(evidence["forward_passes_baseline"], 4)
+
+        tampered = {
+            "forward_passes": 2,
+            "forward_contract": {
+                "accepted_draft_tokens": 2,
+                "emitted_tokens": 5,
+                "prefill_forward_passes": 0,
+                "round_forward_passes": 3,
+                "rounds": 3,
+                "schema": "immer.qwen3.8-rolling-forward-contract/v1",
+            },
+            "generated_tokens": 5,
+            "linear_calls": 990,
+            "source_body_bytes": 123_456,
+        }
+        with self.assertRaisesRegex(
+            Qwen38ChatError,
+            "rolling forward contract",
+        ):
+            _anchor_hit_evidence(
+                _RESTORED_ANCHOR,
+                prompt_tokens=2,
+                generation=tampered,
+                restore_seconds=0.25,
+                n_layers=64,
+                final_state_committed=False,
+            )
 
     def test_anchor_miss_preserves_the_existing_generation_path(self) -> None:
         model = _AnchorModel()
