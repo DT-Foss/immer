@@ -740,6 +740,112 @@ def _full_attention_work(
     )
 
 
+def full_attention_kv_state(
+    projected_key: torch.Tensor,
+    projected_value: torch.Tensor,
+    *,
+    k_norm_weight: torch.Tensor,
+    num_key_value_heads: int,
+    head_dim: int,
+    position_ids: torch.Tensor | None = None,
+    state: AttentionState | None = None,
+    rope_theta: float = 10_000_000.0,
+    rotary_dim: int | None = None,
+    partial_rotary_factor: float = 0.25,
+    mrope_section: Sequence[int] | None = None,
+    mrope_interleaved: bool = True,
+    rms_norm_eps: float = 1e-6,
+) -> AttentionState:
+    """Append exact Qwen K/V state without computing Q, attention, O, or MLP."""
+
+    key_projection = _floating_tensor(projected_key, "projected_key", ndim=3)
+    value_projection = _floating_tensor(projected_value, "projected_value", ndim=3)
+    kv_heads = _positive_int(num_key_value_heads, "num_key_value_heads")
+    width = _positive_int(head_dim, "head_dim")
+    if key_projection.shape[:2] != value_projection.shape[:2]:
+        raise ValueError("key/value projections must share batch and sequence axes")
+    _same_device_dtype(key_projection, value_projection, "projected_value")
+    expected_features = kv_heads * width
+    if (
+        key_projection.shape[-1] != expected_features
+        or value_projection.shape[-1] != expected_features
+    ):
+        raise ValueError("key/value projection width differs from the KV layout")
+    batch_size, sequence_length = key_projection.shape[:2]
+    if batch_size <= 0 or sequence_length <= 0:
+        raise ValueError("key/value projections require non-empty axes")
+
+    key = key_projection.reshape(
+        batch_size,
+        sequence_length,
+        kv_heads,
+        width,
+    )
+    value = value_projection.reshape_as(key)
+    key = rms_norm(key, k_norm_weight, rms_norm_eps).transpose(1, 2)
+    value = value.transpose(1, 2)
+
+    past_length = 0
+    if state is not None:
+        if not isinstance(state, AttentionState):
+            raise TypeError("state must be an AttentionState")
+        expected = (batch_size, kv_heads, state.length, width)
+        if tuple(state.key.shape) != expected or tuple(state.value.shape) != expected:
+            raise ValueError("attention state shape differs from the KV projection")
+        if state.crsa_log_usage is not None:
+            raise ValueError("K/V-only continuation cannot update CRSA usage")
+        _same_device_dtype(key, state.key, "state.key")
+        _same_device_dtype(value, state.value, "state.value")
+        past_length = state.length
+
+    if rotary_dim is None:
+        factor = _positive_float(partial_rotary_factor, "partial_rotary_factor")
+        resolved_rotary_dim = int(width * factor)
+    else:
+        resolved_rotary_dim = _positive_int(rotary_dim, "rotary_dim")
+    if resolved_rotary_dim > width or resolved_rotary_dim % 2:
+        raise ValueError("rotary_dim must be even and no larger than head_dim")
+    if position_ids is None:
+        positions = torch.arange(
+            past_length,
+            past_length + sequence_length,
+            device=key.device,
+            dtype=torch.long,
+        ).expand(batch_size, -1)
+    else:
+        positions = position_ids
+        if not isinstance(positions, torch.Tensor):
+            raise TypeError("position_ids must be a torch tensor")
+        if positions.ndim == 2 and tuple(positions.shape) != (
+            batch_size,
+            sequence_length,
+        ):
+            raise ValueError("position_ids shape differs from the KV projection")
+        if positions.ndim == 3 and tuple(positions.shape) != (
+            3,
+            batch_size,
+            sequence_length,
+        ):
+            raise ValueError("three-axis position_ids shape differs from KV projection")
+        if positions.ndim not in {2, 3}:
+            raise ValueError("position_ids must have two or three axes")
+        if positions.device != key.device:
+            positions = positions.to(key.device)
+    cosine, sine = rope_cos_sin(
+        positions,
+        resolved_rotary_dim,
+        theta=rope_theta,
+        mrope_section=mrope_section,
+        mrope_interleaved=mrope_interleaved,
+        dtype=key.dtype,
+    )
+    _, key = apply_rotary_pos_emb(key, key, cosine, sine)
+    if state is not None:
+        key = torch.cat((state.key, key), dim=2)
+        value = torch.cat((state.value, value), dim=2)
+    return AttentionState(key=key, value=value)
+
+
 def _full_attention_output(
     work: _FullAttentionWork,
     probabilities: torch.Tensor,

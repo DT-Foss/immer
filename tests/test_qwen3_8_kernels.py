@@ -527,6 +527,85 @@ class Qwen38KernelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires alpha=1"):
             Qwen38NativeHeadCrsa(alpha=0.5, replace_base_softmax=True)
 
+    def test_kv_only_state_matches_full_attention_without_q_or_output_work(self) -> None:
+        from immer.runtimes.qwen3_8.kernels import (
+            AttentionState,
+            full_attention_core,
+            full_attention_kv_state,
+        )
+
+        torch.manual_seed(197)
+        batch, sequence, heads, kv_heads, width = 2, 5, 24, 4, 4
+        query_gate = torch.randn(batch, sequence, 2 * heads * width)
+        key = torch.randn(batch, sequence, kv_heads * width)
+        value = torch.randn(batch, sequence, kv_heads * width)
+        q_norm = torch.randn(width) * 0.05
+        k_norm = torch.randn(width) * 0.05
+        common = dict(
+            q_norm_weight=q_norm,
+            k_norm_weight=k_norm,
+            num_attention_heads=heads,
+            num_key_value_heads=kv_heads,
+            head_dim=width,
+            rotary_dim=2,
+            rope_theta=1_000.0,
+        )
+        _, full_state = full_attention_core(
+            query_gate,
+            key,
+            value,
+            **common,
+        )
+        kv_state = full_attention_kv_state(
+            key,
+            value,
+            k_norm_weight=k_norm,
+            num_key_value_heads=kv_heads,
+            head_dim=width,
+            rotary_dim=2,
+            rope_theta=1_000.0,
+        )
+        self.assertTrue(torch.equal(kv_state.key, full_state.key))
+        self.assertTrue(torch.equal(kv_state.value, full_state.value))
+
+        prefix = full_attention_kv_state(
+            key[:, :3],
+            value[:, :3],
+            k_norm_weight=k_norm,
+            num_key_value_heads=kv_heads,
+            head_dim=width,
+            rotary_dim=2,
+            rope_theta=1_000.0,
+        )
+        split = full_attention_kv_state(
+            key[:, 3:],
+            value[:, 3:],
+            state=prefix,
+            k_norm_weight=k_norm,
+            num_key_value_heads=kv_heads,
+            head_dim=width,
+            rotary_dim=2,
+            rope_theta=1_000.0,
+        )
+        self.assertTrue(torch.equal(split.key, full_state.key))
+        self.assertTrue(torch.equal(split.value, full_state.value))
+
+        with self.assertRaisesRegex(ValueError, "cannot update CRSA"):
+            full_attention_kv_state(
+                key[:, 3:],
+                value[:, 3:],
+                state=AttentionState(
+                    key=prefix.key,
+                    value=prefix.value,
+                    crsa_log_usage=torch.zeros(batch, 4, 3),
+                ),
+                k_norm_weight=k_norm,
+                num_key_value_heads=kv_heads,
+                head_dim=width,
+                rotary_dim=2,
+                rope_theta=1_000.0,
+            )
+
     def test_full_attention_fork_prefill_is_bit_exact_and_shares_only_kv(
         self,
     ) -> None:

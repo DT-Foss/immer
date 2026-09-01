@@ -178,6 +178,7 @@ from .kernels import (
     AttentionState,
     DeltaNetProbe,
     DeltaNetState,
+    full_attention_kv_state,
     gated_delta_net_postconv_core,
 )
 from .local_draft import (
@@ -511,6 +512,7 @@ __all__ = [
     "CONSENSUS_SNAPSHOT_SCHEMA",
     "COVERAGE_MATRIX_SCHEMA",
     "DeltaNetState",
+    "full_attention_kv_state",
     "DeltaNetProbe",
     "DeltaNetProbeRecorder",
     "DELTANET_COMPARISON_SCHEMA",
