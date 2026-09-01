@@ -122,6 +122,7 @@ from .mtp_draft import (
     QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
     Qwen35MtpCarry,
     Qwen35MtpDraftProvider,
+    qwen35_mtp_carry_identity,
 )
 from .native_crsa import Qwen38NativeHeadCrsa
 from .hybrid_draft import (
@@ -1274,6 +1275,14 @@ def _anchor_hit_evidence(
         receipt["snapshot_manifest_bytes"]
         + receipt["snapshot_payload_bytes"]
         + (receipt["seed_hidden_bytes"] if exact_prefix else 0)
+        + restored.mtp_carry_bytes
+    )
+    mtp_carry_status = (
+        "restored"
+        if restored.mtp_carry is not None
+        else "ignored-non-mtp"
+        if restored.mtp_carry_ignored
+        else "legacy-none"
     )
     return {
         "schema": "immer.qwen3.8-anchor-execution/v1",
@@ -1284,6 +1293,8 @@ def _anchor_hit_evidence(
         "prefix_tokens": prefix_tokens,
         "suffix_tokens": suffix_tokens,
         "restore_seconds": restore_seconds,
+        "mtp_carry_bytes": restored.mtp_carry_bytes,
+        "mtp_carry_status": mtp_carry_status,
         # The cache first hashes every selected artifact, then the native
         # loader reads it again to reconstruct state.  Exact-prefix seeds are
         # likewise authenticated once and decoded once.
@@ -2596,9 +2607,12 @@ class Qwen38CausalChat:
             DRAFT_WINDOW_ACTIONS
         ):
             raise ValueError("adaptive draft-window ceiling must admit at least K=4")
-        if draft_mode not in {None, "hybrid", "markov"} and anchor_cache is not None:
+        if (
+            draft_mode not in {None, "hybrid", "markov", "mtp"}
+            and anchor_cache is not None
+        ):
             raise ValueError(
-                "anchor restore requires direct, Markov, or hybrid drafting"
+                "anchor restore requires direct, Markov, MTP, or hybrid drafting"
             )
         if fast_mlp_root is not None and not isinstance(fast_mlp_root, (str, Path)):
             raise TypeError("fast_mlp_root must be a local path or None")
@@ -4147,15 +4161,27 @@ class Qwen38CausalChat:
         if generation_options.get("draft_enabled") is False:
             return None
         mode = self._draft_mode
-        if generation_options.get("restored_prefix_length") is None:
+        restored_prefix_length = generation_options.get("restored_prefix_length")
+        if restored_prefix_length is None:
             return mode
-        carry = self._conversation_mtp_carry
-        carry_matches = (
-            isinstance(carry, Qwen35MtpCarry)
-            and carry is self._validated_conversation_mtp_carry
-            and carry.history == self._conversation_prefix_token_ids
-            and len(carry.history) == generation_options["restored_prefix_length"]
+        restored_carry = generation_options.get("restored_mtp_carry")
+        restored_carry_bytes = generation_options.get("restored_mtp_carry_bytes")
+        restored_carry_matches = (
+            isinstance(restored_carry, Qwen35MtpCarry)
+            and isinstance(restored_carry_bytes, int)
+            and not isinstance(restored_carry_bytes, bool)
+            and restored_carry_bytes > 0
+            and len(restored_carry.history) == restored_prefix_length
+            and restored_carry.next_position == restored_prefix_length - 1
         )
+        conversation_carry = self._conversation_mtp_carry
+        conversation_carry_matches = (
+            isinstance(conversation_carry, Qwen35MtpCarry)
+            and conversation_carry is self._validated_conversation_mtp_carry
+            and conversation_carry.history == self._conversation_prefix_token_ids
+            and len(conversation_carry.history) == restored_prefix_length
+        )
+        carry_matches = restored_carry_matches or conversation_carry_matches
         if mode == "hybrid":
             return "hybrid" if carry_matches else "markov"
         if mode == "mtp":
@@ -4184,6 +4210,21 @@ class Qwen38CausalChat:
         delta_before = None if delta_router is None else delta_router.metrics()
         exact_head = getattr(runtime, "exact_head_index", None)
         exact_before = None if exact_head is None else exact_head.metrics()
+        restored_mtp_carry = generation_options.get("restored_mtp_carry")
+        if isinstance(restored_mtp_carry, Qwen35MtpCarry):
+            restored_prefix_length = generation_options.get(
+                "restored_prefix_length"
+            )
+            if (
+                isinstance(restored_prefix_length, bool)
+                or not isinstance(restored_prefix_length, int)
+                or restored_prefix_length <= 0
+                or restored_mtp_carry.history
+                != tuple(prompt_ids[:restored_prefix_length])
+            ):
+                raise Qwen38ChatError(
+                    "request-local MTP carry differs from the restored prompt prefix"
+                )
         configured_draft_mode = self._draft_mode
         effective_draft_mode = self._draft_mode_for_request(generation_options)
         adaptive_selection = self._draft_window_selection
@@ -4246,6 +4287,8 @@ class Qwen38CausalChat:
             direct_options = dict(generation_options)
             direct_options.pop("draft_enabled", None)
             direct_options.pop("draft_window_ceiling", None)
+            direct_options.pop("restored_mtp_carry", None)
+            direct_options.pop("restored_mtp_carry_bytes", None)
             if direct_progress is not None:
                 direct_options["progress"] = direct_progress
             generated, evidence = runtime.model.generate_greedy(
@@ -4278,7 +4321,10 @@ class Qwen38CausalChat:
         rolling_source_start = _runtime_source_body_bytes(runtime)
         restored_prefix_length = generation_options.get("restored_prefix_length")
         initial_mtp_carry = (
-            self._conversation_mtp_carry
+            restored_mtp_carry
+            if isinstance(restored_mtp_carry, Qwen35MtpCarry)
+            and effective_draft_mode in {"hybrid", "mtp"}
+            else self._conversation_mtp_carry
             if restored_prefix_length is not None
             and effective_draft_mode in {"hybrid", "mtp"}
             else None
@@ -7045,37 +7091,172 @@ class Qwen38CausalChat:
         if not prefix:
             return {"status": "no-shared-prefix"}
         started = time.perf_counter()
+        mtp_configured = self._draft_mode in {"hybrid", "mtp"}
+        mtp_carry: Qwen35MtpCarry | None = None
+        mtp_error: str | None = None
+        mtp_linear_calls = 0
+        mtp_source_body_bytes = 0
+        mtp_seconds = 0.0
+        hidden: torch.Tensor | None = None
+        forwards: Sequence[object] = ()
+
+        def mtp_fields(
+            *,
+            anchor: AnchorReceipt | None = None,
+        ) -> dict[str, Any]:
+            descriptor = None if anchor is None else anchor.mtp_carry
+            status = (
+                "not-configured"
+                if not mtp_configured
+                else "charge-error"
+                if mtp_error is not None or descriptor is None
+                else "stored"
+            )
+            fields: dict[str, Any] = {
+                "mtp_carry_bytes": 0 if descriptor is None else descriptor.bytes,
+                "mtp_carry_status": status,
+                "mtp_linear_calls": mtp_linear_calls,
+                "mtp_seconds": mtp_seconds,
+                "mtp_source_body_bytes": mtp_source_body_bytes,
+            }
+            if mtp_error is not None:
+                fields["mtp_error"] = mtp_error
+            return fields
+
         try:
             hidden, forwards = runtime.model.prefill(
                 [prefix],
                 reset=True,
                 tokenwise=False,
             )
+            if mtp_configured:
+                mtp_started = time.perf_counter()
+                provider: Qwen35MtpDraftProvider | None = None
+                try:
+                    provider = Qwen35MtpDraftProvider(
+                        runtime.model.config,
+                        runtime.model.pager,
+                        eos_token_ids=(IM_END_TOKEN_ID, END_OF_TEXT_TOKEN_ID),
+                        head_block_rows=self._head_block_rows,
+                        proposal_width=self._draft_window - 1,
+                        state_path=self._mtp_draft_state_path,
+                    )
+                    provider.begin_request_state(prefix, hidden)
+                    provider.observe_final(prefix)
+                    export_mtp_carry = getattr(provider, "export_mtp_carry", None)
+                    if not callable(export_mtp_carry):
+                        raise Qwen38ChatError(
+                            "MTP anchor charger lacks completed carry export"
+                        )
+                    candidate = export_mtp_carry(prefix)
+                    if (
+                        not isinstance(candidate, Qwen35MtpCarry)
+                        or candidate.history != prefix
+                        or candidate.next_position != len(prefix) - 1
+                        or not torch.equal(
+                            candidate.last_target_hidden,
+                            hidden[:, -1:],
+                        )
+                    ):
+                        raise Qwen38ChatError(
+                            "MTP anchor charger returned an invalid carry"
+                        )
+                    mtp_carry = candidate
+                except Exception as exc:
+                    mtp_error = f"{type(exc).__module__}.{type(exc).__qualname__}"
+                    mtp_carry = None
+                finally:
+                    if provider is not None:
+                        try:
+                            metrics = provider.metrics()
+                            mtp_linear_calls = max(
+                                0,
+                                int(getattr(metrics, "linear_calls", 0)),
+                            )
+                            mtp_source_body_bytes = max(
+                                0,
+                                int(getattr(metrics, "source_body_bytes", 0)),
+                            )
+                        except Exception as exc:
+                            if mtp_error is None:
+                                mtp_error = (
+                                    f"{type(exc).__module__}."
+                                    f"{type(exc).__qualname__}"
+                                )
+                                mtp_carry = None
+                        try:
+                            provider.close()
+                        except Exception as exc:
+                            if mtp_error is None:
+                                mtp_error = (
+                                    f"{type(exc).__module__}."
+                                    f"{type(exc).__qualname__}"
+                                )
+                                mtp_carry = None
+                    mtp_seconds = time.perf_counter() - mtp_started
             anchor = cache.store(
                 runtime.model,
                 prefix,
                 boundary_kind="custom",
                 seed_hidden=hidden[:, -1:],
+                mtp_carry=mtp_carry,
+                tokenizer_sha256=runtime.tokenizer_sha256,
             )
             return {
                 "cache_bytes": anchor.cache_bytes,
+                **mtp_fields(anchor=anchor),
                 "prefix_tokens": len(prefix),
                 "seconds": time.perf_counter() - started,
                 "status": "stored",
                 "target_forwards": len(forwards),
             }
-        except SemanticStateCacheConflict:
+        except SemanticStateCacheConflict as conflict:
+            if mtp_carry is not None and hidden is not None:
+                try:
+                    anchor = cache.upgrade_mtp_carry(
+                        prefix,
+                        mtp_carry=mtp_carry,
+                        tokenizer_sha256=runtime.tokenizer_sha256,
+                        seed_hidden=hidden[:, -1:],
+                    )
+                except Exception as exc:
+                    mtp_error = f"{type(exc).__module__}.{type(exc).__qualname__}"
+                    mtp_carry = None
+                    return {
+                        **mtp_fields(),
+                        "error": mtp_error,
+                        "prefix_tokens": len(prefix),
+                        "seconds": time.perf_counter() - started,
+                        "status": "upgrade-error",
+                        "target_forwards": len(forwards),
+                    }
+                else:
+                    return {
+                        "cache_bytes": anchor.cache_bytes,
+                        **mtp_fields(anchor=anchor),
+                        "prefix_tokens": len(prefix),
+                        "seconds": time.perf_counter() - started,
+                        "status": "upgraded",
+                        "target_forwards": len(forwards),
+                    }
             return {
+                **mtp_fields(),
+                "error": f"{type(conflict).__module__}.{type(conflict).__qualname__}",
                 "prefix_tokens": len(prefix),
                 "seconds": time.perf_counter() - started,
                 "status": "concurrent-store",
+                "target_forwards": len(forwards),
             }
         except Exception as exc:
+            if mtp_configured and mtp_error is None:
+                mtp_error = f"{type(exc).__module__}.{type(exc).__qualname__}"
             return {
+                **mtp_fields(),
                 "error": f"{type(exc).__module__}.{type(exc).__qualname__}",
                 "prefix_tokens": len(prefix),
                 "seconds": time.perf_counter() - started,
                 "status": "error",
+                "target_forwards": len(forwards),
             }
         finally:
             runtime.model.reset_state(release=True)
@@ -7441,8 +7622,15 @@ class Qwen38CausalChat:
             len(active_mtp_carry.history)
             if reused_prefix_tokens
             and isinstance(active_mtp_carry, Qwen35MtpCarry)
+            and active_mtp_carry is self._validated_conversation_mtp_carry
             and active_mtp_carry.history == stored_prefix
             else 0
+        )
+        mtp_carry_bytes = (
+            active_mtp_carry.state_bytes if mtp_carry_reused_tokens else 0
+        )
+        mtp_carry_status = (
+            "conversation" if mtp_carry_reused_tokens else "none"
         )
 
         if self._draft_window_controller is not None:
@@ -7490,19 +7678,49 @@ class Qwen38CausalChat:
             before_restore = _anchor_model_state(runtime.model)
             if before_restore != (0, False, 0, None):
                 raise Qwen38ChatError("anchor restore requires an empty released model")
+            restore_options: dict[str, Any] = {
+                "restore_mtp_carry": self._draft_mode in {"hybrid", "mtp"},
+                "tokenizer_sha256": runtime.tokenizer_sha256,
+            }
+            if self._draft_mode in {"hybrid", "mtp"}:
+                restore_options["expected_mtp_identity"] = (
+                    qwen35_mtp_carry_identity(
+                        runtime.model.config,
+                        runtime.model.pager,
+                    )
+                )
             restore_started = time.perf_counter()
             restored = self._anchor_cache.restore_deepest(
                 runtime.model,
                 prompt_ids,
+                **restore_options,
             )
             restore_seconds = time.perf_counter() - restore_started
+            if (
+                restored is not None
+                and self._draft_mode in {"hybrid", "mtp"}
+                and restored.mtp_carry is None
+            ):
+                anchor_charge = self._charge_template_anchor(runtime, prompt_ids)
+                retry_started = time.perf_counter()
+                restored = self._anchor_cache.restore_deepest(
+                    runtime.model,
+                    prompt_ids,
+                    **restore_options,
+                )
+                restore_seconds += time.perf_counter() - retry_started
             if restored is None:
                 anchor_charge = self._charge_template_anchor(runtime, prompt_ids)
-                if anchor_charge.get("status") in {"stored", "concurrent-store"}:
+                if anchor_charge.get("status") in {
+                    "stored",
+                    "upgraded",
+                    "concurrent-store",
+                }:
                     retry_started = time.perf_counter()
                     restored = self._anchor_cache.restore_deepest(
                         runtime.model,
                         prompt_ids,
+                        **restore_options,
                     )
                     restore_seconds += time.perf_counter() - retry_started
             if restored is None:
@@ -7559,6 +7777,26 @@ class Qwen38CausalChat:
                         "restored_seed_hidden": restored.seed_hidden,
                     }
                 )
+                if restored.mtp_carry is not None:
+                    if (
+                        self._draft_mode not in {"hybrid", "mtp"}
+                        or restored.mtp_carry.history
+                        != tuple(prompt_ids[:prefix_length])
+                        or restored.mtp_carry.next_position != prefix_length - 1
+                        or restored.mtp_carry_bytes <= 0
+                    ):
+                        raise Qwen38ChatError(
+                            "restored MTP carry differs from the anchor prefix"
+                        )
+                    generation_options.update(
+                        {
+                            "restored_mtp_carry": restored.mtp_carry,
+                            "restored_mtp_carry_bytes": restored.mtp_carry_bytes,
+                        }
+                    )
+                    mtp_carry_reused_tokens = prefix_length
+                    mtp_carry_bytes = restored.mtp_carry_bytes
+                    mtp_carry_status = "restored-anchor"
 
         q4_before = _runtime_q4_metrics(runtime)
         mlp_page_router = getattr(runtime, "mlp_page_router", None)
@@ -7955,9 +8193,9 @@ class Qwen38CausalChat:
         conversation_evidence = {
             "history_messages": len(history),
             "history_turns": len(history) // 2,
-            "mtp_carry_bytes": 0,
+            "mtp_carry_bytes": mtp_carry_bytes,
             "mtp_carry_reused_tokens": mtp_carry_reused_tokens,
-            "mtp_carry_status": "reused" if mtp_carry_reused_tokens else "none",
+            "mtp_carry_status": mtp_carry_status,
             "prompt_suffix_tokens": len(prompt_ids) - reused_prefix_tokens,
             "reuse_hits": self._conversation_reuse_hits,
             "reuse_misses": self._conversation_reuse_misses,
@@ -8413,10 +8651,9 @@ class Qwen38CausalChat:
                 if isinstance(carry, Qwen35MtpCarry) and carry.history == retained:
                     self._conversation_mtp_carry = carry
                     self._validated_conversation_mtp_carry = carry
-                    conversation_evidence["mtp_carry_bytes"] = carry.state_bytes
-                    conversation_evidence["mtp_carry_status"] = (
-                        "reused+stored" if mtp_carry_reused_tokens else "stored"
-                    )
+                    if conversation_evidence["mtp_carry_status"] == "none":
+                        conversation_evidence["mtp_carry_bytes"] = carry.state_bytes
+                        conversation_evidence["mtp_carry_status"] = "conversation"
                 else:
                     self._conversation_mtp_carry = None
                     self._validated_conversation_mtp_carry = None

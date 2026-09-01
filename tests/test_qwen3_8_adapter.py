@@ -110,6 +110,7 @@ from immer.runtimes.qwen3_8.mtp_draft import (
     QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
     Qwen35MtpCarry,
 )
+from immer.runtimes.qwen3_8.mtp_carry_snapshot import MtpCarrySidecarDescriptor
 from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
 from immer.runtimes.qwen3_8.semantic_atlas import GraphRevision, ModelPin
 from immer.runtimes.qwen3_8.semantic_state_cache import (
@@ -372,6 +373,34 @@ _RESTORED_ANCHOR = RestoredAnchor(
     query_length=2,
     exact_prefix=True,
     seed_hidden=_ANCHOR_SEED,
+)
+_ANCHOR_MTP_DESCRIPTOR = MtpCarrySidecarDescriptor(
+    basename=f"{'4' * 64}.qwen35-mtp-carry",
+    bytes=256,
+    file_sha256="4" * 64,
+    identity_sha256="5" * 64,
+    tensor_manifest_sha256="6" * 64,
+)
+_ANCHOR_MTP_CARRY = Qwen35MtpCarry(
+    schema="fixture-mtp-carry/v1",
+    identity=("fixture-mtp-runtime",),
+    history=(11, 12),
+    next_position=1,
+    state=None,
+    last_target_hidden=_ANCHOR_SEED.clone(),
+)
+_ANCHOR_MTP_VALUES = _ANCHOR_RECEIPT.to_document()
+_ANCHOR_MTP_VALUES.pop("receipt_sha256")
+_ANCHOR_MTP_VALUES.pop("schema")
+_ANCHOR_MTP_VALUES["mtp_carry"] = _ANCHOR_MTP_DESCRIPTOR
+_ANCHOR_MTP_RECEIPT = AnchorReceipt.create(**_ANCHOR_MTP_VALUES)
+_RESTORED_ANCHOR_MTP = RestoredAnchor(
+    anchor=_ANCHOR_MTP_RECEIPT,
+    query_length=2,
+    exact_prefix=True,
+    seed_hidden=_ANCHOR_SEED,
+    mtp_carry=_ANCHOR_MTP_CARRY,
+    mtp_carry_bytes=_ANCHOR_MTP_DESCRIPTOR.bytes,
 )
 
 
@@ -821,7 +850,7 @@ def _anchor_cache(
 ):
     cache = object.__new__(SemanticStateAnchorCache)
 
-    def restore(model, _token_ids):
+    def restore(model, _token_ids, **_restore_options):
         if miss:
             return None
         model.next_position = 2
@@ -1721,9 +1750,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
         cache = _anchor_cache()
         restore = cache.restore_deepest.side_effect
 
-        def assert_attached(target, token_ids):
+        def assert_attached(target, token_ids, **restore_options):
             self.assertIsNotNone(target.layer_contextual_continuation_identity)
-            return restore(target, token_ids)
+            return restore(target, token_ids, **restore_options)
 
         cache.restore_deepest.side_effect = assert_attached
         with tempfile.TemporaryDirectory() as temporary:
@@ -5436,9 +5465,97 @@ class Qwen38CausalChatTests(unittest.TestCase):
             hybrid._draft_mode_for_request({"restored_prefix_length": 17}),
             "hybrid",
         )
+        hybrid._conversation_mtp_carry = None
+        hybrid._validated_conversation_mtp_carry = None
+        hybrid._conversation_prefix_token_ids = ()
+        self.assertEqual(
+            hybrid._draft_mode_for_request(
+                {
+                    "restored_mtp_carry": carry,
+                    "restored_mtp_carry_bytes": 128,
+                    "restored_prefix_length": 17,
+                }
+            ),
+            "hybrid",
+        )
+        self.assertEqual(
+            mtp._draft_mode_for_request(
+                {
+                    "restored_mtp_carry": carry,
+                    "restored_mtp_carry_bytes": 128,
+                    "restored_prefix_length": 17,
+                }
+            ),
+            "mtp",
+        )
 
         hybrid.close()
         mtp.close()
+
+    def test_private_restored_mtp_options_never_reach_direct_generation(
+        self,
+    ) -> None:
+        runtime = _Runtime()
+        chat = _chat(
+            runtime,
+            draft_mode="mtp",
+            q4_root="/q4",
+            max_new_tokens=1,
+        )
+
+        chat._generate_locked(
+            runtime,
+            (11, 12),
+            {
+                "eos_token_ids": (IM_END_TOKEN_ID,),
+                "head_block_rows": 17,
+                "max_new_tokens": 1,
+                "prefill_tokenwise": False,
+                "restored_mtp_carry": _ANCHOR_MTP_CARRY,
+                "restored_mtp_carry_bytes": _ANCHOR_MTP_DESCRIPTOR.bytes,
+                "restored_prefix_length": 2,
+                "restored_seed_hidden": _ANCHOR_SEED,
+            },
+        )
+
+        options = runtime.model.calls[0][1]
+        self.assertNotIn("restored_mtp_carry", options)
+        self.assertNotIn("restored_mtp_carry_bytes", options)
+        self.assertEqual(options["restored_prefix_length"], 2)
+        chat.close()
+
+        foreign = Qwen35MtpCarry(
+            schema=_ANCHOR_MTP_CARRY.schema,
+            identity=_ANCHOR_MTP_CARRY.identity,
+            history=(21, 22),
+            next_position=1,
+            state=None,
+            last_target_hidden=_ANCHOR_SEED,
+        )
+        rejected_runtime = _Runtime()
+        rejected = _chat(
+            rejected_runtime,
+            draft_mode="mtp",
+            q4_root="/q4",
+            max_new_tokens=1,
+        )
+        with self.assertRaisesRegex(Qwen38ChatError, "restored prompt prefix"):
+            rejected._generate_locked(
+                rejected_runtime,
+                (11, 12),
+                {
+                    "eos_token_ids": (IM_END_TOKEN_ID,),
+                    "head_block_rows": 17,
+                    "max_new_tokens": 1,
+                    "prefill_tokenwise": False,
+                    "restored_mtp_carry": foreign,
+                    "restored_mtp_carry_bytes": 128,
+                    "restored_prefix_length": 2,
+                    "restored_seed_hidden": _ANCHOR_SEED,
+                },
+            )
+        self.assertEqual(rejected_runtime.model.calls, [])
+        rejected.close()
 
     def test_hybrid_accepts_anchor_restore_and_downgrades_without_mtp_carry(
         self,
@@ -5744,7 +5861,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIs(baseline.status, ExecutionStatus.OK)
         self.assertIs(cached.status, ExecutionStatus.OK)
         self.assertEqual(cached.output, baseline.output)
-        cache.restore_deepest.assert_called_once_with(model, (11, 12))
+        cache.restore_deepest.assert_called_once_with(
+            model,
+            (11, 12),
+            restore_mtp_carry=False,
+            tokenizer_sha256=_DIGEST,
+        )
         options = model.calls[0][1]
         self.assertEqual(options["restored_prefix_length"], 2)
         self.assertIs(
@@ -5766,6 +5888,223 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(anchor["checkpoint_source_body_bytes_read"], 600)
         self.assertEqual(anchor["checkpoint_linear_calls_executed"], 66)
         self.assertEqual(anchor["anchor"], _ANCHOR_RECEIPT.to_document())
+        self.assertEqual(model.reset_calls, [True])
+
+    def test_authenticated_anchor_mtp_carry_is_request_local_and_keeps_mode(
+        self,
+    ) -> None:
+        model = _AnchorModel()
+        q4_bank = SimpleNamespace(has=lambda _name: True)
+        model.pager = SimpleNamespace(q4_bank=q4_bank)
+        runtime = _Runtime(model=model)
+        runtime.q4_bank = q4_bank
+        cache = _anchor_cache(restored=_RESTORED_ANCHOR_MTP)
+        provider_metrics = SimpleNamespace(
+            source_body_bytes=0,
+            linear_calls=0,
+            last_confidence=0.0,
+            last_disagreement=0.0,
+            last_phrase_confidence=0.0,
+            last_phrase_support=0,
+            last_phrase_width=0,
+        )
+        provider = SimpleNamespace(
+            close=Mock(),
+            export_mtp_carry=Mock(return_value=_ANCHOR_MTP_CARRY),
+            metrics=Mock(return_value=provider_metrics),
+        )
+        row = SimpleNamespace(
+            accepted_prefix_length=0,
+            emitted_token_ids=(7, 8),
+            forward_passes=1,
+            proposed_token_ids=(),
+            provider_proposed_token_ids=(),
+            round_index=0,
+            round_policy=None,
+            target_token_ids=(7, 8),
+            window_size=3,
+        )
+        rolling = SimpleNamespace(
+            token_ids=(7, 8),
+            evidence=SimpleNamespace(
+                accepted_draft_tokens=0,
+                adaptive_windows=False,
+                final_state_committed=False,
+                forward_passes=1,
+                generated_token_ids=(7, 8),
+                linear_calls=0,
+                prefill_forward_passes=0,
+                prompt_token_ids=(11, 12),
+                rounds=(row,),
+                schema="fixture.anchor-mtp-generation/v1",
+                seconds=0.1,
+                source_body_bytes=0,
+                state_bytes=_ANCHOR_RECEIPT.state_bytes,
+                stopped_on_eos=False,
+                used_window_sizes=(3,),
+                window_size=3,
+            ),
+        )
+        decoder = SimpleNamespace(generate_rolling=Mock(return_value=rolling))
+        chat = _chat(
+            runtime,
+            anchor_cache=cache,
+            draft_mode="mtp",
+            q4_root="/q4",
+        )
+
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.qwen35_mtp_carry_identity",
+                return_value=_ANCHOR_MTP_CARRY.identity,
+            ),
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen35MtpDraftProvider",
+                return_value=provider,
+            ) as provider_constructor,
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+                return_value=decoder,
+            ),
+        ):
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        cache.restore_deepest.assert_called_once_with(
+            model,
+            (11, 12),
+            restore_mtp_carry=True,
+            tokenizer_sha256=_DIGEST,
+            expected_mtp_identity=_ANCHOR_MTP_CARRY.identity,
+        )
+        self.assertIs(
+            provider_constructor.call_args.kwargs["initial_carry"],
+            _ANCHOR_MTP_CARRY,
+        )
+        provider.export_mtp_carry.assert_called_once_with((11, 12))
+        self.assertEqual(result.evidence["draft"]["configured_mode"], "mtp")
+        self.assertEqual(result.evidence["draft"]["mode"], "mtp")
+        self.assertFalse(
+            result.evidence["draft"]["state_reuse_provider_downgrade"]
+        )
+        self.assertEqual(
+            result.evidence["conversation"]["mtp_carry_status"],
+            "restored-anchor",
+        )
+        self.assertEqual(
+            result.evidence["conversation"]["mtp_carry_bytes"],
+            _ANCHOR_MTP_DESCRIPTOR.bytes,
+        )
+        self.assertEqual(
+            result.evidence["conversation"]["mtp_carry_reused_tokens"],
+            2,
+        )
+        anchor = result.evidence["anchor_cache"]
+        self.assertEqual(anchor["mtp_carry_status"], "restored")
+        self.assertEqual(anchor["mtp_carry_bytes"], _ANCHOR_MTP_DESCRIPTOR.bytes)
+        self.assertNotIn("restored_mtp_carry", result.evidence)
+        self.assertIsNone(chat._conversation_mtp_carry)
+        chat.close()
+
+    def test_template_anchor_charge_exports_exact_mtp_carry_without_target_work(
+        self,
+    ) -> None:
+        cache = object.__new__(SemanticStateAnchorCache)
+        cache.root = Path("/fixture-cache")
+        cache.store = Mock(return_value=_ANCHOR_MTP_RECEIPT)
+        model = _Model()
+        hidden = torch.tensor([[[1.0], [3.0]]])
+        forwards = (object(), object())
+        model.prefill = Mock(return_value=(hidden, forwards))
+        runtime = _Runtime(model=model)
+        provider = SimpleNamespace(
+            begin_request_state=Mock(),
+            close=Mock(),
+            export_mtp_carry=Mock(return_value=_ANCHOR_MTP_CARRY),
+            metrics=Mock(
+                return_value=SimpleNamespace(
+                    linear_calls=4,
+                    source_body_bytes=33,
+                )
+            ),
+            observe_final=Mock(),
+        )
+        chat = _chat(
+            runtime,
+            anchor_cache=cache,
+            draft_mode="mtp",
+            q4_root="/q4",
+        )
+
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen35MtpDraftProvider",
+            return_value=provider,
+        ):
+            receipt = chat._charge_template_anchor(runtime, (11, 12, 13))
+
+        model.prefill.assert_called_once_with(
+            [(11, 12)],
+            reset=True,
+            tokenwise=False,
+        )
+        provider.begin_request_state.assert_called_once_with((11, 12), hidden)
+        provider.observe_final.assert_called_once_with((11, 12))
+        provider.export_mtp_carry.assert_called_once_with((11, 12))
+        provider.close.assert_called_once_with()
+        store_options = cache.store.call_args.kwargs
+        self.assertIs(store_options["mtp_carry"], _ANCHOR_MTP_CARRY)
+        self.assertEqual(store_options["tokenizer_sha256"], _DIGEST)
+        self.assertTrue(torch.equal(store_options["seed_hidden"], hidden[:, -1:]))
+        self.assertEqual(receipt["status"], "stored")
+        self.assertEqual(receipt["target_forwards"], len(forwards))
+        self.assertEqual(receipt["mtp_carry_status"], "stored")
+        self.assertEqual(receipt["mtp_carry_bytes"], _ANCHOR_MTP_DESCRIPTOR.bytes)
+        self.assertEqual(receipt["mtp_source_body_bytes"], 33)
+        self.assertEqual(receipt["mtp_linear_calls"], 4)
+        self.assertGreaterEqual(receipt["mtp_seconds"], 0.0)
+        self.assertEqual(model.reset_calls, [True])
+
+    def test_template_anchor_mtp_failure_stores_legacy_anchor_and_keeps_target(
+        self,
+    ) -> None:
+        cache = object.__new__(SemanticStateAnchorCache)
+        cache.root = Path("/fixture-cache")
+        cache.store = Mock(return_value=_ANCHOR_RECEIPT)
+        model = _Model()
+        hidden = torch.tensor([[[1.0], [3.0]]])
+        model.prefill = Mock(return_value=(hidden, (object(),)))
+        runtime = _Runtime(model=model)
+        provider = SimpleNamespace(
+            begin_request_state=Mock(side_effect=RuntimeError("optional MTP failed")),
+            close=Mock(),
+            metrics=Mock(
+                return_value=SimpleNamespace(
+                    linear_calls=2,
+                    source_body_bytes=19,
+                )
+            ),
+        )
+        chat = _chat(
+            runtime,
+            anchor_cache=cache,
+            draft_mode="hybrid",
+            q4_root="/q4",
+        )
+
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen35MtpDraftProvider",
+            return_value=provider,
+        ):
+            receipt = chat._charge_template_anchor(runtime, (11, 12, 13))
+
+        self.assertEqual(receipt["status"], "stored")
+        self.assertEqual(receipt["mtp_carry_status"], "charge-error")
+        self.assertEqual(receipt["mtp_carry_bytes"], 0)
+        self.assertEqual(receipt["mtp_source_body_bytes"], 19)
+        self.assertEqual(receipt["mtp_linear_calls"], 2)
+        self.assertIn("RuntimeError", receipt["mtp_error"])
+        self.assertIsNone(cache.store.call_args.kwargs["mtp_carry"])
+        provider.close.assert_called_once_with()
         self.assertEqual(model.reset_calls, [True])
 
     def test_anchor_restore_failure_never_falls_back_and_resets_state(self) -> None:
@@ -5866,6 +6205,33 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 n_layers=64,
                 final_state_committed=False,
             )
+
+    def test_anchor_evidence_distinguishes_an_ignored_mtp_sidecar(self) -> None:
+        from immer.runtimes.qwen3_8.adapter import _anchor_hit_evidence
+
+        ignored = RestoredAnchor(
+            anchor=_ANCHOR_MTP_RECEIPT,
+            query_length=2,
+            exact_prefix=True,
+            seed_hidden=_ANCHOR_SEED,
+            mtp_carry_ignored=True,
+        )
+        evidence = _anchor_hit_evidence(
+            ignored,
+            prompt_tokens=2,
+            generation={
+                "forward_passes": 0,
+                "generated_tokens": 1,
+                "linear_calls": 0,
+                "source_body_bytes": 0,
+            },
+            restore_seconds=0.1,
+            n_layers=64,
+            final_state_committed=False,
+        )
+
+        self.assertEqual(evidence["mtp_carry_status"], "ignored-non-mtp")
+        self.assertEqual(evidence["mtp_carry_bytes"], 0)
 
     def test_anchor_miss_preserves_the_existing_generation_path(self) -> None:
         model = _AnchorModel()
