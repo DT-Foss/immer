@@ -126,6 +126,31 @@ class InferenceActionReceiptTests(unittest.TestCase):
         self.assertEqual(receipt.actions, ("parametric_program",))
         self.assertEqual(receipt.target_forwards, 0)
 
+    def test_exact_anchor_restore_is_a_continuation_battery_action(self) -> None:
+        economics = _economics("battery")
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "anchor_cache": {
+                    "forward_passes_saved": 1,
+                    "prompt_token_layer_evaluations_saved": 640,
+                    "status": "hit",
+                }
+            },
+        )
+        actions = executed_actions_from_result(result, economics)
+        self.assertEqual(
+            actions,
+            (
+                "continuation_battery",
+                "dynamic_mlp_pages",
+                "qwen_target",
+                "target_verified_draft",
+            ),
+        )
+
 
 class InferenceActionBankTests(unittest.TestCase):
     def test_observe_restart_duplicate_and_ranking(self) -> None:

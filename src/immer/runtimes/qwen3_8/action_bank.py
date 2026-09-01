@@ -92,16 +92,30 @@ def executed_actions_from_result(
     if not isinstance(result, Result):
         raise TypeError("result must be Result")
     actions = _actions(economics)
-    if actions != ("stored_result",):
-        return actions
     evidence = result.evidence if isinstance(result.evidence, Mapping) else {}
     receipt = evidence.get("receipt")
     body = receipt if isinstance(receipt, Mapping) else {}
     qwen = body.get("qwen")
-    if isinstance(qwen, Mapping) and qwen.get("component") == (
-        "immer.markov-parametric-template"
-    ):
-        return ("parametric_program",)
+    if actions == ("stored_result",):
+        if isinstance(qwen, Mapping) and qwen.get("component") == (
+            "immer.markov-parametric-template"
+        ):
+            return ("parametric_program",)
+        return actions
+    execution = qwen if isinstance(qwen, Mapping) else evidence
+    anchor = execution.get("anchor_cache")
+    conversation = execution.get("conversation")
+    battery_hit = (
+        isinstance(anchor, Mapping) and anchor.get("status") == "hit"
+    ) or (
+        isinstance(conversation, Mapping)
+        and conversation.get("reuse_status") == "hit"
+        and isinstance(conversation.get("reused_prefix_tokens"), int)
+        and not isinstance(conversation.get("reused_prefix_tokens"), bool)
+        and conversation.get("reused_prefix_tokens", 0) > 0
+    )
+    if battery_hit:
+        actions = tuple(sorted({*actions, "continuation_battery"}))
     return actions
 
 

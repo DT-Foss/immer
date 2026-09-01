@@ -3290,6 +3290,37 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIsNone(options["draft_mode"])
         self.assertIsNone(options["markov_draft_state_path"])
 
+    def test_cli_deployment_mounts_existing_continuation_battery(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            anchor = Path(temporary) / "anchors"
+            anchor.mkdir()
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ANCHOR_CACHE", anchor),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        cache = constructor.call_args.kwargs["anchor_cache"]
+        self.assertIsInstance(cache, SemanticStateAnchorCache)
+        self.assertEqual(cache.root, anchor)
+
     def test_cli_deployment_enables_passive_economics_by_default(self) -> None:
         qwen = _chat(_Runtime())
         with tempfile.TemporaryDirectory() as temporary:

@@ -429,6 +429,46 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             )
             if key in runtime_metrics
         }
+    conversation = evidence.get("conversation")
+    if isinstance(conversation, dict):
+        summary["conversation"] = {
+            key: conversation[key]
+            for key in (
+                "history_turns",
+                "prompt_suffix_tokens",
+                "reuse_status",
+                "reused_prefix_tokens",
+                "state_retained_tokens",
+            )
+            if key in conversation
+        }
+    anchor_cache = evidence.get("anchor_cache")
+    if isinstance(anchor_cache, dict):
+        compact_anchor = {
+            key: anchor_cache[key]
+            for key in (
+                "checkpoint_read_sweeps_saved",
+                "forward_passes_saved",
+                "prefix_tokens",
+                "prefill_weight_sweeps_saved",
+                "prompt_token_layer_evaluations_saved",
+                "status",
+            )
+            if key in anchor_cache
+        }
+        anchor = anchor_cache.get("anchor")
+        if isinstance(anchor, dict):
+            compact_anchor["anchor"] = {
+                key: anchor[key]
+                for key in (
+                    "prefix_length",
+                    "prefix_sha256",
+                    "receipt_sha256",
+                    "state_bytes",
+                )
+                if key in anchor
+            }
+        summary["anchor_cache"] = compact_anchor
     q4 = evidence.get("q4")
     if isinstance(q4, dict):
         request = q4.get("request")

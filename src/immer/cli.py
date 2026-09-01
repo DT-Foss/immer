@@ -127,6 +127,9 @@ _QWEN38_DEPLOYMENT_INFERENCE_ECONOMICS = (
 _QWEN38_DEPLOYMENT_SERVICE_SOCKET = (
     _QWEN38_DEPLOYMENT_STATE / "qwen3.8-service.sock"
 )
+_QWEN38_DEPLOYMENT_ANCHOR_CACHE = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-chat-prefix-anchors"
+)
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v47"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v28"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
@@ -1565,6 +1568,12 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             anchor_cache_path = None
         else:
             anchor_cache_path = args.qwen38_anchor_cache
+            if (
+                anchor_cache_path is None
+                and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+                and _QWEN38_DEPLOYMENT_ANCHOR_CACHE.is_dir()
+            ):
+                anchor_cache_path = str(_QWEN38_DEPLOYMENT_ANCHOR_CACHE)
         args.qwen38_anchor_cache = anchor_cache_path
         runtime_code_revision = _qwen38_runtime_code_revision()
         warm_runtime_code_revision = (
