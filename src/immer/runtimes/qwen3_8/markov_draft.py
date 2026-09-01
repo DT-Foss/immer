@@ -49,8 +49,9 @@ try:
 except ImportError:  # pragma: no cover - production targets are POSIX.
     fcntl = None  # type: ignore[assignment]
 
-MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v13"
-MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v48"
+MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v14"
+MARKOV_DRAFT_PROVIDER_ABI = "immer.qwen3.8-markov-draft-provider/v49"
+V13_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v13"
 V12_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v12"
 V11_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v11"
 V10_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v10"
@@ -63,9 +64,10 @@ V4_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v4"
 V3_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v3"
 V2_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v2"
 LEGACY_MARKOV_DRAFT_STATE_SCHEMA = "immer.qwen3.8-markov-draft-state/v1"
-MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v37"
+MARKOV_DRAFT_METRICS_SCHEMA = "immer.qwen3.8-markov-draft-metrics/v38"
 MARKOV_RICCI_WORKING_SET_POLICY = "o1-priority+ricci-age-whole-answer/v1"
-_STATE_PREFIX = b"IMMD\x0d"
+_STATE_PREFIX = b"IMMD\x0e"
+_V13_STATE_PREFIX = b"IMMD\x0d"
 _V12_STATE_PREFIX = b"IMMD\x0c"
 _V11_STATE_PREFIX = b"IMMD\x0b"
 _V10_STATE_PREFIX = b"IMMD\x0a"
@@ -80,6 +82,7 @@ _V2_STATE_PREFIX = b"IMMD\x02"
 _LEGACY_STATE_PREFIX = b"IMMD\x01"
 _STATE_PREFIXES = (
     _STATE_PREFIX,
+    _V13_STATE_PREFIX,
     _V12_STATE_PREFIX,
     _V11_STATE_PREFIX,
     _V10_STATE_PREFIX,
@@ -99,8 +102,9 @@ _EPISODE_TOKEN = "<episode>"
 _HEX = frozenset("0123456789abcdef")
 _MAX_IMPORTED_EPISODE_DIGESTS = 65_536
 _MAX_PROPOSAL_POSITIONS = 16
-_PLANNER_NAMES = ("beam", "council", "phrase", "markov", "mtp")
+_PLANNER_NAMES = ("beam", "council", "phrase", "markov", "mtp", "qwen35")
 _INTERNAL_PLANNER_COUNT = 3
+_V13_PLANNER_COUNT = 5
 _V12_PLANNER_COUNT = 3
 _PLANNING_DIAGNOSTIC_FIELDS = (
     "_predictions",
@@ -1498,6 +1502,7 @@ class MarkovDraftState:
             or value.get("schema")
             not in {
                 MARKOV_DRAFT_STATE_SCHEMA,
+                V13_MARKOV_DRAFT_STATE_SCHEMA,
                 V12_MARKOV_DRAFT_STATE_SCHEMA,
                 V11_MARKOV_DRAFT_STATE_SCHEMA,
                 V10_MARKOV_DRAFT_STATE_SCHEMA,
@@ -1543,13 +1548,19 @@ class MarkovDraftState:
             )
         except TypeError as exc:
             raise MarkovDraftError("Markov draft state values are invalid") from exc
-        if schema == V12_MARKOV_DRAFT_STATE_SCHEMA:
+        legacy_planner_count = {
+            V13_MARKOV_DRAFT_STATE_SCHEMA: _V13_PLANNER_COUNT,
+            V12_MARKOV_DRAFT_STATE_SCHEMA: _V12_PLANNER_COUNT,
+        }.get(schema)
+        if legacy_planner_count is not None:
             if (
-                len(planner_observations) != _V12_PLANNER_COUNT
-                or len(planner_hits) != _V12_PLANNER_COUNT
+                len(planner_observations) != legacy_planner_count
+                or len(planner_hits) != legacy_planner_count
             ):
-                raise MarkovDraftError("Markov v12 planner width changed")
-            missing = len(_PLANNER_NAMES) - _V12_PLANNER_COUNT
+                raise MarkovDraftError(
+                    f"Markov {schema.rsplit('/', 1)[-1]} planner width changed"
+                )
+            missing = len(_PLANNER_NAMES) - legacy_planner_count
             zeros = (0,) * _MAX_PROPOSAL_POSITIONS
             planner_observations = planner_observations + (zeros,) * missing
             planner_hits = planner_hits + (zeros,) * missing
@@ -1604,6 +1615,7 @@ class MarkovDraftState:
                         legacy=value.get("schema")
                         not in {
                             MARKOV_DRAFT_STATE_SCHEMA,
+                            V13_MARKOV_DRAFT_STATE_SCHEMA,
                             V12_MARKOV_DRAFT_STATE_SCHEMA,
                             V11_MARKOV_DRAFT_STATE_SCHEMA,
                             V10_MARKOV_DRAFT_STATE_SCHEMA,
@@ -1613,16 +1625,21 @@ class MarkovDraftState:
                         plan_memory=value.get("schema")
                         in {
                             MARKOV_DRAFT_STATE_SCHEMA,
+                            V13_MARKOV_DRAFT_STATE_SCHEMA,
                             V12_MARKOV_DRAFT_STATE_SCHEMA,
                             V11_MARKOV_DRAFT_STATE_SCHEMA,
                         },
                         planner_memory=value.get("schema")
                         in {
                             MARKOV_DRAFT_STATE_SCHEMA,
+                            V13_MARKOV_DRAFT_STATE_SCHEMA,
                             V12_MARKOV_DRAFT_STATE_SCHEMA,
                         },
                         legacy_planner_count=(
-                            _V12_PLANNER_COUNT
+                            _V13_PLANNER_COUNT
+                            if value.get("schema")
+                            == V13_MARKOV_DRAFT_STATE_SCHEMA
+                            else _V12_PLANNER_COUNT
                             if value.get("schema")
                             == V12_MARKOV_DRAFT_STATE_SCHEMA
                             else None
@@ -4019,8 +4036,14 @@ class FingerprintRollingK4DraftProvider:
 
     @staticmethod
     def _provider_planner_index(provider: str) -> int:
-        if not isinstance(provider, str) or provider not in {"markov", "mtp"}:
-            raise MarkovDraftError("provider planner must be markov or mtp")
+        if not isinstance(provider, str) or provider not in {
+            "markov",
+            "mtp",
+            "qwen35",
+        }:
+            raise MarkovDraftError(
+                "provider planner must be markov, mtp, or qwen35"
+            )
         return _PLANNER_NAMES.index(provider)
 
     def provider_policy_score(

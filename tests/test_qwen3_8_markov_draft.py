@@ -767,12 +767,12 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_lengths, (3,))
         self.assertEqual(len(provider.metrics().expert_weights), 8)
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
-        self.assertEqual(migrated.planner_observations, ((0,) * 16,) * 5)
-        self.assertEqual(migrated.planner_hits, ((0,) * 16,) * 5)
+        self.assertEqual(migrated.planner_observations, ((0,) * 16,) * 6)
+        self.assertEqual(migrated.planner_hits, ((0,) * 16,) * 6)
 
-    def test_v2_council_state_migrates_to_v13_planner_memory(self) -> None:
+    def test_v2_council_state_migrates_to_v14_planner_memory(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         state = seed._state
         seed.close()
@@ -812,13 +812,13 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_final((1, 2, 3, 4))
         provider.close()
 
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
         self.assertEqual(len(migrated.dialects), 1)
-        self.assertEqual(migrated.planner_observations, ((0,) * 16,) * 5)
-        self.assertEqual(migrated.planner_hits, ((0,) * 16,) * 5)
+        self.assertEqual(migrated.planner_observations, ((0,) * 16,) * 6)
+        self.assertEqual(migrated.planner_hits, ((0,) * 16,) * 6)
 
-    def test_v3_dialect_state_migrates_episode_bindings_to_v13(self) -> None:
+    def test_v3_dialect_state_migrates_episode_bindings_to_v14(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -857,9 +857,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.episode_dialects, (None,))
         provider.observe_final((1, 2, 3, 4))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
 
-    def test_v4_state_migrates_empty_import_inventory_to_v13(self) -> None:
+    def test_v4_state_migrates_empty_import_inventory_to_v14(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -896,9 +896,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider.imported_episode_sha256s(), ())
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
 
-    def test_v5_state_migrates_unknown_prompt_boundaries_to_v13(self) -> None:
+    def test_v5_state_migrates_unknown_prompt_boundaries_to_v14(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -934,9 +934,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(provider._state.episode_prompt_lengths, (None,))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
 
-    def test_v6_state_migrates_zeroed_position_expert_memory_to_v13(self) -> None:
+    def test_v6_state_migrates_zeroed_position_expert_memory_to_v14(self) -> None:
         encoded = MarkovDraftState(
             vocab_size=32,
             max_history_tokens=64,
@@ -974,9 +974,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             all(not any(row) for row in provider._state.horizon_expert_observations)
         )
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
 
-    def test_v7_state_migrates_dialect_position_memory_to_v13(self) -> None:
+    def test_v7_state_migrates_dialect_position_memory_to_v14(self) -> None:
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         seed.observe_final((1, 2, 3))
         document = json.loads(zlib.decompress(seed._state.to_bytes()[5:]))
@@ -1013,9 +1013,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(len(dialect.horizon_observations), 16)
         self.assertTrue(all(not any(row) for row in dialect.horizon_observations))
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
 
-    def test_v8_state_migrates_zeroed_lookahead_outcomes_to_v13(self) -> None:
+    def test_v8_state_migrates_zeroed_lookahead_outcomes_to_v14(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
         provider.close()
@@ -1054,9 +1054,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._state.lookahead_hits, (0,) * 16)
         self.assertEqual(provider._state.lookahead_greedy_hits, (0,) * 16)
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
 
-    def test_v9_state_migrates_neutral_plan_reliability_to_v13(self) -> None:
+    def test_v9_state_migrates_neutral_plan_reliability_to_v14(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
         provider.close()
@@ -1084,9 +1084,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         self.assertEqual(provider.metrics().horizon_self_reliability, (1.0,) * 16)
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
 
-    def test_v10_state_migrates_neutral_dialect_plan_memory_to_v13(self) -> None:
+    def test_v10_state_migrates_neutral_dialect_plan_memory_to_v14(self) -> None:
         context = tuple((1, 2, 3, 4) * 8)
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         seed.observe_final(context)
@@ -1118,9 +1118,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider.metrics().active_dialect_similarity, 1.0)
         self.assertEqual(provider.metrics().horizon_self_reliability, (1.0,) * 16)
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
 
-    def test_v11_state_migrates_neutral_planner_skill_to_v13(self) -> None:
+    def test_v11_state_migrates_neutral_planner_skill_to_v14(self) -> None:
         context = tuple((1, 2, 3, 4) * 8)
         seed = FingerprintRollingK4DraftProvider(vocab_size=32)
         seed.observe_final(context)
@@ -1139,7 +1139,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         path.write_bytes(b"IMMD\x0b" + zlib.compress(raw, level=9))
 
         migrated = MarkovDraftState.from_bytes(path.read_bytes())
-        neutral = ((0,) * 16,) * 5
+        neutral = ((0,) * 16,) * 6
         self.assertEqual(migrated.planner_observations, neutral)
         self.assertEqual(migrated.planner_hits, neutral)
         self.assertEqual(migrated.dialects[0].planner_observations, neutral)
@@ -1153,12 +1153,12 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         metrics = provider.metrics()
         self.assertEqual(
             metrics.planner_names,
-            ("beam", "council", "phrase", "markov", "mtp"),
+            ("beam", "council", "phrase", "markov", "mtp", "qwen35"),
         )
-        self.assertEqual(metrics.planner_reliability, ((1.0,) * 16,) * 5)
+        self.assertEqual(metrics.planner_reliability, ((1.0,) * 16,) * 6)
         self.assertEqual(metrics.active_dialect_planner_observations, neutral)
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
 
     def test_v11_rejects_malformed_global_plan_reliability_shape(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
@@ -1223,7 +1223,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         with self.assertRaisesRegex(MarkovDraftError, "values are invalid"):
             MarkovDraftState.from_bytes(b"IMMD\x0b" + zlib.compress(raw, level=9))
 
-    def test_v12_state_adds_neutral_provider_rows_when_migrating_to_v13(
+    def test_v12_state_adds_neutral_provider_rows_when_migrating_to_v14(
         self,
     ) -> None:
         context = tuple((1, 2, 3, 4) * 8)
@@ -1255,13 +1255,16 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         neutral = (0,) * 16
         self.assertEqual(migrated.planner_observations[1][0], 7)
         self.assertEqual(migrated.planner_hits[1][0], 5)
-        self.assertEqual(migrated.planner_observations[3:], (neutral, neutral))
-        self.assertEqual(migrated.planner_hits[3:], (neutral, neutral))
+        self.assertEqual(
+            migrated.planner_observations[3:],
+            (neutral, neutral, neutral),
+        )
+        self.assertEqual(migrated.planner_hits[3:], (neutral, neutral, neutral))
         self.assertEqual(migrated.dialects[0].planner_observations[2][1], 9)
         self.assertEqual(migrated.dialects[0].planner_hits[2][1], 4)
         self.assertEqual(
             migrated.dialects[0].planner_observations[3:],
-            (neutral, neutral),
+            (neutral, neutral, neutral),
         )
 
         provider = FingerprintRollingK4DraftProvider(
@@ -1269,18 +1272,68 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             state_path=path,
         )
         provider.close()
-        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0d"))
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
 
-    def test_v13_rejects_malformed_global_planner_matrix(self) -> None:
+    def test_v13_state_adds_neutral_qwen35_row_when_migrating_to_v14(
+        self,
+    ) -> None:
+        context = tuple((1, 2, 3, 4) * 8)
+        seed = FingerprintRollingK4DraftProvider(vocab_size=32)
+        seed.observe_final(context)
+        document = json.loads(zlib.decompress(seed._state.to_bytes()[5:]))
+        seed.close()
+        document["schema"] = "immer.qwen3.8-markov-draft-state/v13"
+        document["planner_observations"] = document["planner_observations"][:5]
+        document["planner_hits"] = document["planner_hits"][:5]
+        document["planner_observations"][3][2] = 11
+        document["planner_hits"][3][2] = 8
+        document["planner_observations"][4][1] = 13
+        document["planner_hits"][4][1] = 7
+        for dialect in document["dialects"]:
+            dialect["planner_observations"] = dialect["planner_observations"][:5]
+            dialect["planner_hits"] = dialect["planner_hits"][:5]
+            dialect["planner_observations"][4][3] = 17
+            dialect["planner_hits"][4][3] = 12
+        raw = json.dumps(
+            document,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        path = self.root / "v13-state.bin"
+        path.write_bytes(b"IMMD\x0d" + zlib.compress(raw, level=9))
+
+        migrated = MarkovDraftState.from_bytes(path.read_bytes())
+        neutral = (0,) * 16
+        self.assertEqual(migrated.planner_observations[3][2], 11)
+        self.assertEqual(migrated.planner_hits[3][2], 8)
+        self.assertEqual(migrated.planner_observations[4][1], 13)
+        self.assertEqual(migrated.planner_hits[4][1], 7)
+        self.assertEqual(migrated.planner_observations[5], neutral)
+        self.assertEqual(migrated.planner_hits[5], neutral)
+        self.assertEqual(migrated.dialects[0].planner_observations[4][3], 17)
+        self.assertEqual(migrated.dialects[0].planner_hits[4][3], 12)
+        self.assertEqual(migrated.dialects[0].planner_observations[5], neutral)
+        self.assertEqual(migrated.dialects[0].planner_hits[5], neutral)
+
+        provider = FingerprintRollingK4DraftProvider(
+            vocab_size=32,
+            state_path=path,
+        )
+        provider.close()
+        self.assertTrue(path.read_bytes().startswith(b"IMMD\x0e"))
+
+    def test_v14_rejects_malformed_global_planner_matrix(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
         provider.close()
         zeros = [0] * 16
         malformed_rows = (
-            ("row-count", [zeros] * 4),
-            ("row-width", [[0] * 15, zeros, zeros, zeros, zeros]),
-            ("boolean", [[False] + [0] * 15, zeros, zeros, zeros, zeros]),
-            ("scalar-row", [0, zeros, zeros, zeros, zeros]),
+            ("row-count", [zeros] * 5),
+            ("row-width", [[0] * 15, zeros, zeros, zeros, zeros, zeros]),
+            ("boolean", [[False] + [0] * 15, zeros, zeros, zeros, zeros, zeros]),
+            ("scalar-row", [0, zeros, zeros, zeros, zeros, zeros]),
             ("scalar-matrix", 0),
         )
         for label, rows in malformed_rows:
@@ -1299,17 +1352,17 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                     "values are invalid",
                 ):
                     MarkovDraftState.from_bytes(
-                        b"IMMD\x0d" + zlib.compress(raw, level=9)
+                        b"IMMD\x0e" + zlib.compress(raw, level=9)
                     )
 
-    def test_v13_rejects_malformed_nested_dialect_planner_matrix(self) -> None:
+    def test_v14_rejects_malformed_nested_dialect_planner_matrix(self) -> None:
         provider = FingerprintRollingK4DraftProvider(vocab_size=32)
         provider.observe_final(tuple((1, 2, 3, 4) * 8))
         document = json.loads(zlib.decompress(provider._state.to_bytes()[5:]))
         provider.close()
         malformed = (
-            ("hit-exceeds-observation", [[1] + [0] * 15] + [[0] * 16] * 4),
-            ("scalar-row", [0] + [[0] * 16] * 4),
+            ("hit-exceeds-observation", [[1] + [0] * 15] + [[0] * 16] * 5),
+            ("scalar-row", [0] + [[0] * 16] * 5),
             ("scalar-matrix", 0),
         )
         for label, rows in malformed:
@@ -1325,7 +1378,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                 ).encode("utf-8")
                 with self.assertRaisesRegex(MarkovDraftError, "values are invalid"):
                     MarkovDraftState.from_bytes(
-                        b"IMMD\x0d" + zlib.compress(raw, level=9)
+                        b"IMMD\x0e" + zlib.compress(raw, level=9)
                     )
 
     def test_import_digest_survives_episode_eviction_and_prevents_replay(self) -> None:
@@ -1924,11 +1977,11 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         self.assertEqual(
             markov_module.MARKOV_DRAFT_PROVIDER_ABI,
-            "immer.qwen3.8-markov-draft-provider/v48",
+            "immer.qwen3.8-markov-draft-provider/v49",
         )
         self.assertEqual(
             metrics.schema,
-            "immer.qwen3.8-markov-draft-metrics/v37",
+            "immer.qwen3.8-markov-draft-metrics/v38",
         )
         self.assertEqual(metrics.horizon_self_reliability, (1.0,) * 16)
         self.assertTrue(
@@ -1939,7 +1992,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         provider.close()
 
-    def test_provider_policy_feedback_scores_and_persists_markov_mtp_rows(
+    def test_provider_policy_feedback_scores_and_persists_all_provider_rows(
         self,
     ) -> None:
         state_path = self.root / "provider-policy.bin"
@@ -1949,14 +2002,19 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         )
         self.assertEqual(provider.provider_policy_score("markov", 2), (0.5, False))
         self.assertEqual(provider.provider_policy_score("mtp", 2), (0.5, False))
+        self.assertEqual(provider.provider_policy_score("qwen35", 2), (0.5, False))
         self.assertEqual(
             provider.provider_prefix_probability("mtp", 2),
+            (0.0, False),
+        )
+        self.assertEqual(
+            provider.provider_prefix_probability("qwen35", 2),
             (0.0, False),
         )
         for invalid_provider in ("beam", ""):
             with (
                 self.subTest(callback="score", provider=invalid_provider),
-                self.assertRaisesRegex(MarkovDraftError, "markov or mtp"),
+                self.assertRaisesRegex(MarkovDraftError, "qwen35"),
             ):
                 provider.provider_policy_score(invalid_provider, 2)
         for position in (-1, 16, True):
@@ -1968,7 +2026,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
 
         prompt = (20, 21)
         provider.begin_request(prompt)
-        with self.assertRaisesRegex(MarkovDraftError, "markov or mtp"):
+        with self.assertRaisesRegex(MarkovDraftError, "qwen35"):
             provider.observe_provider_policy_feedback("phrase", 2, True)
         for position in (-1, 16, True):
             with (
@@ -1980,6 +2038,9 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         provider.observe_provider_policy_feedback("mtp", 2, False)
         provider.observe_provider_policy_feedback("mtp", 0, True)
         provider.observe_provider_policy_feedback("mtp", 1, False)
+        provider.observe_provider_policy_feedback("qwen35", 0, True)
+        provider.observe_provider_policy_feedback("qwen35", 1, True)
+        provider.observe_provider_policy_feedback("qwen35", 2, False)
 
         markov_score = provider.provider_policy_score("markov", 2)
         mtp_score = provider.provider_policy_score("mtp", 2)
@@ -1997,6 +2058,17 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             provider.provider_policy_score("mtp", 0)[0]
             * provider.provider_policy_score("mtp", 1)[0],
         )
+        qwen35_probability, qwen35_observed = (
+            provider.provider_prefix_probability("qwen35", 3)
+        )
+        self.assertTrue(qwen35_observed)
+        self.assertAlmostEqual(
+            qwen35_probability,
+            math.prod(
+                provider.provider_policy_score("qwen35", position)[0]
+                for position in range(3)
+            ),
+        )
         provider.observe_final((*prompt, 7))
 
         metrics = provider.metrics()
@@ -2004,10 +2076,17 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(metrics.planner_hits[3][2], 1)
         self.assertEqual(metrics.planner_observations[4][2], 1)
         self.assertEqual(metrics.planner_hits[4][2], 0)
+        self.assertEqual(metrics.planner_observations[5][:3], (1, 1, 1))
+        self.assertEqual(metrics.planner_hits[5][:3], (1, 1, 0))
         self.assertEqual(metrics.active_dialect_planner_observations[3][2], 1)
         self.assertEqual(metrics.active_dialect_planner_hits[3][2], 1)
         self.assertEqual(metrics.active_dialect_planner_observations[4][2], 1)
         self.assertEqual(metrics.active_dialect_planner_hits[4][2], 0)
+        self.assertEqual(
+            metrics.active_dialect_planner_observations[5][:3],
+            (1, 1, 1),
+        )
+        self.assertEqual(metrics.active_dialect_planner_hits[5][:3], (1, 1, 0))
         provider.close()
 
         restored = MarkovDraftState.from_bytes(state_path.read_bytes())
@@ -2015,10 +2094,17 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(restored.planner_hits[3][2], 1)
         self.assertEqual(restored.planner_observations[4][2], 1)
         self.assertEqual(restored.planner_hits[4][2], 0)
+        self.assertEqual(restored.planner_observations[5][:3], (1, 1, 1))
+        self.assertEqual(restored.planner_hits[5][:3], (1, 1, 0))
         self.assertEqual(restored.dialects[0].planner_observations[3][2], 1)
         self.assertEqual(restored.dialects[0].planner_hits[3][2], 1)
         self.assertEqual(restored.dialects[0].planner_observations[4][2], 1)
         self.assertEqual(restored.dialects[0].planner_hits[4][2], 0)
+        self.assertEqual(
+            restored.dialects[0].planner_observations[5][:3],
+            (1, 1, 1),
+        )
+        self.assertEqual(restored.dialects[0].planner_hits[5][:3], (1, 1, 0))
 
     def test_cold_tournament_keeps_beam_default_and_selected_diagnostics(self) -> None:
         provider = FingerprintRollingK4DraftProvider(
@@ -2065,7 +2151,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(provider._pending_planner, "beam")
         self.assertEqual(
             provider._pending_planner_candidates,
-            (beam_tokens, council_tokens, (), (), ()),
+            (beam_tokens, council_tokens, (), (), (), ()),
         )
         self.assertEqual(metrics.planner_tournament_calls, 1)
         self.assertEqual(metrics.planner_beam_selections, 1)
@@ -2092,8 +2178,22 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         neutral = (0,) * 16
         provider._state = replace(
             provider._state,
-            planner_observations=(neutral, observed, neutral, neutral, neutral),
-            planner_hits=(neutral, observed, neutral, neutral, neutral),
+            planner_observations=(
+                neutral,
+                observed,
+                neutral,
+                neutral,
+                neutral,
+                neutral,
+            ),
+            planner_hits=(
+                neutral,
+                observed,
+                neutral,
+                neutral,
+                neutral,
+                neutral,
+            ),
         )
         prompt = (20, 21)
         beam_tokens = (7, 8, 9, 10)
@@ -2170,7 +2270,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             )
             provider._state = replace(
                 provider._state,
-                planner_observations=(observed,) * 3 + (neutral, neutral),
+                planner_observations=(observed,) * 3 + (neutral, neutral, neutral),
                 planner_hits=planner_hits,
             )
 
@@ -2243,7 +2343,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                 total=4,
                 kind="atlas",
             ),
-            planner_hits=(neutral, neutral, observed, neutral, neutral),
+            planner_hits=(neutral, neutral, observed, neutral, neutral, neutral),
             expected="phrase",
         )
         phrase_loser = exercise(
@@ -2255,7 +2355,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
                 total=4,
                 kind="composition",
             ),
-            planner_hits=(neutral, observed, neutral, neutral, neutral),
+            planner_hits=(neutral, observed, neutral, neutral, neutral, neutral),
             expected="council",
         )
         self.assertEqual(phrase_winner.phrase_source, "atlas")
@@ -4797,11 +4897,13 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
             (1, 1, 1, 1, *zeros[4:]),
             zeros,
             zeros,
+            zeros,
         )
         expected_hits = (
             (1, 1, 0, *zeros[3:]),
             (1, 0, *zeros[2:]),
             (1, 1, 1, 0, *zeros[4:]),
+            zeros,
             zeros,
             zeros,
         )
@@ -4813,7 +4915,7 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(live.planner_trace_feedback_tokens, 9)
         self.assertEqual(
             live.active_dialect_planner_observations,
-            (zeros,) * 5,
+            (zeros,) * 6,
         )
 
         provider.observe_final(final)
@@ -4899,13 +5001,13 @@ class Qwen38MarkovDraftTests(unittest.TestCase):
         self.assertEqual(interim.planner_trace_feedback_tokens, 12)
         self.assertEqual(
             tuple(row[:4] for row in interim.planner_observations),
-            ((2, 1, 1, 0),) * 3 + ((0, 0, 0, 0),) * 2,
+            ((2, 1, 1, 0),) * 3 + ((0, 0, 0, 0),) * 3,
         )
 
         final_history = (*second_committed, 7, 7, 7)
         provider.observe_final(final_history)
         final = provider.metrics()
-        expected = ((2, 2, 2, 2),) * 3 + ((0, 0, 0, 0),) * 2
+        expected = ((2, 2, 2, 2),) * 3 + ((0, 0, 0, 0),) * 3
         self.assertEqual(final.planner_trace_active, 0)
         self.assertEqual(final.planner_trace_feedback_tokens, 24)
         self.assertEqual(
