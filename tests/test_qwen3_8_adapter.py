@@ -1947,7 +1947,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn(current, compatible)
         chat.close()
 
-    def test_hybrid_external_drafter_migrates_prior_window_economics(self) -> None:
+    def test_hybrid_external_drafter_preserves_window_economics_abi(self) -> None:
         runtime = _Runtime()
         chat = _chat(
             runtime,
@@ -1959,9 +1959,16 @@ class Qwen38CausalChatTests(unittest.TestCase):
         chat._bundle_receipt = _BUNDLE_RECEIPT
         chat._tokenizer_sha256 = _DIGEST
         chat._draft_window_controller = Mock()
-        previous = chat._draft_window_runtime_identity(
-            external_drafter_enabled=False,
+        prior_runtime = _Runtime()
+        prior = _chat(
+            prior_runtime,
+            draft_mode="hybrid",
+            q4_root="/q4",
         )
+        prior._runtime = prior_runtime
+        prior._bundle_receipt = _BUNDLE_RECEIPT
+        prior._tokenizer_sha256 = _DIGEST
+        previous = prior._draft_window_runtime_identity()
         deployed_previous = chat._draft_window_runtime_identity(
             markov_provider_abi=(
                 "immer.qwen3.8-markov-draft-provider/v48"
@@ -1969,16 +1976,15 @@ class Qwen38CausalChatTests(unittest.TestCase):
             hybrid_provider_abi=(
                 "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
             ),
-            external_drafter_enabled=False,
         )
         current = chat._draft_window_runtime_identity()
 
         compatible = chat._draft_window_compatible_previous_identities()
 
-        self.assertNotEqual(previous, current)
-        self.assertIn(previous, compatible)
-        self.assertIn(deployed_previous, compatible)
+        self.assertEqual(previous, current)
+        self.assertEqual(deployed_previous, current)
         self.assertNotIn(current, compatible)
+        prior.close()
         chat.close()
 
     def test_draft_window_migrates_from_authenticated_previous_context_bank(

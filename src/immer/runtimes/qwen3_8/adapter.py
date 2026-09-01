@@ -192,6 +192,9 @@ QWEN38_COMPONENT_TIMING_REQUEST_SCHEMA = "immer.qwen3.8-component-timing-request
 _DRAFT_WINDOW_HYBRID_ECONOMICS_ABI = (
     "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
 )
+_DRAFT_WINDOW_MARKOV_ECONOMICS_ABI = (
+    "immer.qwen3.8-markov-draft-provider/v48"
+)
 _QWEN38_COMPONENT_TIMING_BOUNDARIES = {
     "full_attention_core": "StreamedQwen38._full_attention",
     "deltanet_core": "StreamedQwen38._linear_attention",
@@ -3688,7 +3691,6 @@ class Qwen38CausalChat:
         contextual_continuation_enabled: bool | None = None,
         contextual_continuation_identity_sha256: str | None = None,
         layer_contextual_continuation_enabled: bool | None = None,
-        external_drafter_enabled: bool | None = None,
     ) -> str:
         bundle = self._bundle_receipt
         tokenizer_sha256 = self._tokenizer_sha256
@@ -3697,16 +3699,9 @@ class Qwen38CausalChat:
                 "draft-window identity requires a loaded target runtime"
             )
         if markov_provider_abi is None:
-            markov_provider_abi = MARKOV_DRAFT_PROVIDER_ABI
+            markov_provider_abi = _DRAFT_WINDOW_MARKOV_ECONOMICS_ABI
         if hybrid_provider_abi is None:
             hybrid_provider_abi = _DRAFT_WINDOW_HYBRID_ECONOMICS_ABI
-        external_enabled = (
-            self._draft_bundle_path is not None
-            if external_drafter_enabled is None
-            else external_drafter_enabled
-        )
-        if not isinstance(external_enabled, bool):
-            raise TypeError("external_drafter_enabled must be boolean or None")
         if self._draft_mode == "markov":
             provider: dict[str, Any] = {
                 "abi": markov_provider_abi,
@@ -3776,18 +3771,6 @@ class Qwen38CausalChat:
                 ).get("manifest_sha256"),
                 "selection": "round-wise-markov-first-mtp-fallback/v18",
             }
-            if external_enabled:
-                if self._draft_bundle_path is None:
-                    raise Qwen38ChatError(
-                        "draft-window identity lacks the external draft bundle"
-                    )
-                provider["qwen35"] = {
-                    "bundle_path": str(self._draft_bundle_path),
-                    "provider_abi": QWEN35_K4_DRAFT_PROVIDER_SCHEMA,
-                    "repo_id": QWEN35_DRAFTER_REPO_ID,
-                    "revision": QWEN35_DRAFTER_REVISION,
-                    "window_cap": 4,
-                }
         else:
             raise Qwen38ChatError("draft-window identity lacks a draft provider")
         if self._draft_mode in {"hybrid", "markov"} and self._markov_atlas is not None:
@@ -3894,23 +3877,6 @@ class Qwen38CausalChat:
             return ()
         identities: set[str] = set()
         if self._draft_mode in {"hybrid", "markov"}:
-            identities.add(
-                self._draft_window_runtime_identity(
-                    markov_provider_abi=(
-                        "immer.qwen3.8-markov-draft-provider/v48"
-                    ),
-                    hybrid_provider_abi=(
-                        "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
-                    ),
-                    external_drafter_enabled=False,
-                )
-            )
-            if self._draft_mode == "hybrid" and self._draft_bundle_path is not None:
-                identities.add(
-                    self._draft_window_runtime_identity(
-                        external_drafter_enabled=False,
-                    )
-                )
             if self._layer_contextual_continuation_state_path is not None:
                 identities.add(
                     self._draft_window_runtime_identity(
