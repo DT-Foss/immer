@@ -13,6 +13,7 @@ from unittest.mock import Mock, call, patch
 
 import torch
 
+from immer.knowledge.livecausal import LiveGraph
 from immer.cli import (
     _QWEN38_HYBRID_DRAFT_ABI,
     _QWEN38_MARKOV_DRAFT_ABI,
@@ -33,7 +34,10 @@ from immer.runtimes.ooe.result_cells import (
     attach_cold_qwen_generation_receipt,
     qwen_result_binding_evidence,
 )
+from immer.runtimes.ooe.compute_crystals import ComputeCrystal, ComputeCrystalBank
+from immer.runtimes.ooe.compute_graph import ComputeOperatorGraph, OperatorEdge
 from immer.runtimes.qwen3_8.adapter import (
+    LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA,
     QWEN38_CHAT_HISTORY_METADATA,
     QWEN38_CHAT_SESSION_METADATA,
     QWEN38_INFERENCE_ACTION_METADATA,
@@ -57,6 +61,10 @@ from immer.runtimes.qwen3_8.attention_output_crystal import (
 from immer.runtimes.qwen3_8.inference_economics import (
     InferenceEconomicsLedger,
 )
+from immer.runtimes.qwen3_8.layer_transition_crystal import (
+    LayerTransitionCrystalIdentity,
+    LayerTransitionProjectionIdentity,
+)
 from immer.runtimes.qwen3_8.markov_draft import MARKOV_DRAFT_PROVIDER_ABI
 from immer.runtimes.qwen3_8.mlp_page_coordinate import (
     MLP_PAGE_COORDINATE_EVIDENCE_SCHEMA,
@@ -67,7 +75,7 @@ from immer.runtimes.qwen3_8.mtp_draft import (
     Qwen35MtpCarry,
 )
 from immer.runtimes.qwen3_8.native_crsa import Qwen38NativeHeadCrsa
-from immer.runtimes.qwen3_8.semantic_atlas import ModelPin
+from immer.runtimes.qwen3_8.semantic_atlas import GraphRevision, ModelPin
 from immer.runtimes.qwen3_8.semantic_state_cache import (
     AnchorReceipt,
     RestoredAnchor,
@@ -77,6 +85,65 @@ from immer.runtimes.qwen3_8.semantic_state_cache import (
 
 
 _DIGEST = "a" * 64
+
+
+def _layer_transition_identity(
+    *,
+    model: str = "2",
+    q4: str = "3",
+    graph: str = "4",
+    atlas: str = "5",
+) -> LayerTransitionCrystalIdentity:
+    return LayerTransitionCrystalIdentity(
+        model_sha256=model if len(model) == 64 else model * 64,
+        q4_sha256=q4 if len(q4) == 64 else q4 * 64,
+        graph_revision_sha256=graph if len(graph) == 64 else graph * 64,
+        atlas_revision_sha256=atlas if len(atlas) == 64 else atlas * 64,
+        projection=LayerTransitionProjectionIdentity(
+            hidden_dim=8,
+            sketch_dim=3,
+            seed_sha256="1" * 64,
+        ),
+    )
+
+
+def _semantic_atlas_authority(root: Path) -> str:
+    atlas = LiveGraph(root)
+    atlas.append_segment(
+        [{"outcome_key": "promoted-layer-63", "trigger_key": "candidate-layer-63"}]
+    )
+    sequence, event_sha256 = atlas.store.revision()
+    ancestor_sha256 = GraphRevision(sequence, event_sha256).sha256
+    atlas.append_segment(
+        [{"outcome_key": "later-promotion", "trigger_key": "promoted-layer-63"}]
+    )
+    return ancestor_sha256
+
+
+def _compute_graph_authority(root: Path) -> str:
+    bank = ComputeCrystalBank(root)
+    crystal = ComputeCrystal.affine([[1.0]], [0.0])
+    bank.publish_crystal(crystal)
+    graph = ComputeOperatorGraph(bank)
+
+    def edge(source: str, target: str, ordinal: int) -> OperatorEdge:
+        return OperatorEdge(
+            source_state=source,
+            target_state=target,
+            crystal_sha256=crystal.sha256,
+            verifier_sha256=hashlib.sha256(
+                f"layer-transition-verifier-{ordinal}".encode()
+            ).hexdigest(),
+            evidence_sha256=hashlib.sha256(
+                f"layer-transition-evidence-{ordinal}".encode()
+            ).hexdigest(),
+        )
+
+    ancestor, _changed = graph.append_edge(edge("h63", "h64", 1))
+    graph.append_edge(edge("h64", "h65", 2))
+    return ancestor.sha256
+
+
 _BUNDLE_RECEIPT = {
     "checkpoint_bytes": 55_000_000_000,
     "graph_revision": [1, "e" * 64],
@@ -179,9 +246,13 @@ class _Model:
         if self.generation_error is not None:
             raise self.generation_error
         prompt_ids = tuple(prompt[0])
-        retained = len(self.generated) if kwargs.get("retain_final_state") else max(
-            0,
-            len(self.generated) - 1,
+        retained = (
+            len(self.generated)
+            if kwargs.get("retain_final_state")
+            else max(
+                0,
+                len(self.generated) - 1,
+            )
         )
         self.next_position = len(prompt_ids) + retained
         self.state_batch_size = 1
@@ -521,9 +592,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         ):
             runtime_identity = chat._draft_window_runtime_identity()
         self.assertEqual(
-            runtime_identity["provider"]["o1_markov_retention"][
-                "ppm_working_set"
-            ],
+            runtime_identity["provider"]["o1_markov_retention"]["ppm_working_set"],
             "o1-priority+ricci-age-whole-answer/v1",
         )
         chat.close()
@@ -543,9 +612,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 return SimpleNamespace(
                     state_path=path,
                     identity=identity,
-                    metrics=Mock(
-                        return_value=SimpleNamespace(to_dict=lambda: {})
-                    ),
+                    metrics=Mock(return_value=SimpleNamespace(to_dict=lambda: {})),
                 )
 
             chat = _chat(
@@ -658,9 +725,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             },
         )
         self.assertNotIn("hello", json.dumps(evidence, sort_keys=True))
-        runtime.model.set_attention_output_crystal_enabled.assert_called_once_with(
-            True
-        )
+        runtime.model.set_attention_output_crystal_enabled.assert_called_once_with(True)
         with patch(
             "immer.runtimes.qwen3_8.adapter._digest",
             side_effect=lambda value: value,
@@ -671,6 +736,483 @@ class Qwen38CausalChatTests(unittest.TestCase):
             identity.identity_sha256,
         )
         chat.close()
+
+    def test_layer_transition_crystal_constructor_rejects_invalid_mounts(self) -> None:
+        with self.assertRaisesRegex(ValueError, "require Q4"):
+            _chat(
+                _Runtime(),
+                layer_transition_crystal_state_path="/state/layer-63.json",
+            )
+        with self.assertRaisesRegex(ValueError, "bfloat16"):
+            _chat(
+                _Runtime(),
+                q4_root="/q4",
+                compute_dtype="float16",
+                layer_transition_crystal_state_path="/state/layer-63.json",
+            )
+        for invalid in (True, -0.1, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _chat(
+                    _Runtime(),
+                    q4_root="/q4",
+                    layer_transition_crystal_state_path="/state/layer-63.json",
+                    layer_transition_crystal_max_error_radius=invalid,
+                )
+        with self.assertRaisesRegex(ValueError, "requires.*state_path"):
+            _chat(
+                _Runtime(),
+                layer_transition_crystal_max_error_radius=0.25,
+            )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            atlas = root / "atlas"
+            compute = root / "compute"
+            atlas.mkdir()
+            compute.mkdir()
+            with self.assertRaisesRegex(ValueError, "requires.*atlas_path"):
+                _chat(
+                    _Runtime(),
+                    q4_root="/q4",
+                    layer_transition_crystal_state_path="/state/layer-63.json",
+                    layer_transition_crystal_compute_root=compute,
+                )
+            with self.assertRaisesRegex(ValueError, "requires.*compute_root"):
+                _chat(
+                    _Runtime(),
+                    q4_root="/q4",
+                    layer_transition_crystal_state_path="/state/layer-63.json",
+                    layer_transition_crystal_atlas_path=atlas,
+                )
+            with self.assertRaisesRegex(ValueError, "existing real directory"):
+                _chat(
+                    _Runtime(),
+                    q4_root="/q4",
+                    layer_transition_crystal_state_path="/state/layer-63.json",
+                    layer_transition_crystal_atlas_path=root / "missing-atlas",
+                    layer_transition_crystal_compute_root=compute,
+                )
+            linked_atlas = root / "linked-atlas"
+            linked_atlas.symlink_to(atlas, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "existing real directory"):
+                _chat(
+                    _Runtime(),
+                    q4_root="/q4",
+                    layer_transition_crystal_state_path="/state/layer-63.json",
+                    layer_transition_crystal_atlas_path=linked_atlas,
+                    layer_transition_crystal_compute_root=compute,
+                )
+
+    def test_layer_transition_crystal_loads_exact_state_and_attaches(self) -> None:
+        runtime = _Runtime()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            atlas = root / "atlas"
+            compute = root / "compute"
+            atlas_revision = _semantic_atlas_authority(atlas)
+            graph_revision = _compute_graph_authority(compute)
+            identity = _layer_transition_identity(
+                atlas=atlas_revision,
+                graph=graph_revision,
+            )
+            runtime.model.layer_transition_crystal_model_sha256 = Mock(
+                return_value=identity.model_sha256
+            )
+            runtime.model.layer_transition_crystal_q4_sha256 = Mock(
+                return_value=identity.q4_sha256
+            )
+            runtime.model.attach_layer_transition_crystal_bank = Mock()
+            opened = SimpleNamespace(identity=identity, crystals=())
+            configured = root / "private-layer-63.bin"
+            chat = _chat(
+                runtime,
+                q4_root="/q4",
+                layer_transition_crystal_state_path=configured,
+                layer_transition_crystal_atlas_path=atlas,
+                layer_transition_crystal_compute_root=compute,
+                layer_transition_crystal_max_error_radius=0.25,
+            )
+            with patch(
+                "immer.runtimes.qwen3_8.adapter.LayerTransitionCrystalBank.load",
+                return_value=opened,
+            ) as loader:
+                chat._load_locked()
+
+        loader.assert_called_once_with(configured.absolute())
+        runtime.model.layer_transition_crystal_model_sha256.assert_called_once_with()
+        runtime.model.layer_transition_crystal_q4_sha256.assert_called_once_with()
+        runtime.model.attach_layer_transition_crystal_bank.assert_called_once_with(
+            opened,
+            max_error_radius=0.25,
+            graph_revision_sha256=identity.graph_revision_sha256,
+            atlas_revision_sha256=identity.atlas_revision_sha256,
+        )
+        self.assertIs(chat._layer_transition_crystal_bank, opened)
+        self.assertIsNotNone(chat._layer_transition_crystal_atlas)
+        self.assertIsNotNone(chat._layer_transition_crystal_compute_graph)
+        chat.close()
+
+    def test_layer_transition_crystal_rejects_foreign_authorities_before_attach(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            atlas = root / "atlas"
+            compute = root / "compute"
+            atlas_revision = _semantic_atlas_authority(atlas)
+            graph_revision = _compute_graph_authority(compute)
+            identities = (
+                _layer_transition_identity(
+                    atlas="f" * 64,
+                    graph=graph_revision,
+                ),
+                _layer_transition_identity(
+                    atlas=atlas_revision,
+                    graph="f" * 64,
+                ),
+            )
+            for identity in identities:
+                with self.subTest(identity=identity.identity_sha256):
+                    runtime = _Runtime()
+                    runtime.model.attach_layer_transition_crystal_bank = Mock()
+                    chat = _chat(
+                        runtime,
+                        q4_root="/q4",
+                        layer_transition_crystal_state_path=root / "private.bin",
+                        layer_transition_crystal_atlas_path=atlas,
+                        layer_transition_crystal_compute_root=compute,
+                    )
+                    with (
+                        patch(
+                            "immer.runtimes.qwen3_8.adapter."
+                            "LayerTransitionCrystalBank.load",
+                            return_value=SimpleNamespace(
+                                identity=identity, crystals=()
+                            ),
+                        ),
+                        self.assertRaisesRegex(Qwen38ChatError, "foreign"),
+                    ):
+                        chat._load_locked()
+                    runtime.model.attach_layer_transition_crystal_bank.assert_not_called()
+                    chat.close()
+
+            identity = _layer_transition_identity(
+                atlas=atlas_revision,
+                graph=graph_revision,
+            )
+            runtime = _Runtime()
+            runtime.model.attach_layer_transition_crystal_bank = Mock()
+            chat = _chat(
+                runtime,
+                q4_root="/q4",
+                layer_transition_crystal_state_path=root / "private.bin",
+                layer_transition_crystal_atlas_path=atlas,
+                layer_transition_crystal_compute_root=compute,
+            )
+            forged = SimpleNamespace(
+                identity=identity,
+                crystals=(
+                    SimpleNamespace(
+                        source_compute_crystal_sha256="a" * 64,
+                        source_compute_edge_sha256="b" * 64,
+                    ),
+                ),
+            )
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.LayerTransitionCrystalBank.load",
+                    return_value=forged,
+                ),
+                self.assertRaisesRegex(Qwen38ChatError, "source lineage"),
+            ):
+                chat._load_locked()
+            runtime.model.attach_layer_transition_crystal_bank.assert_not_called()
+            chat.close()
+
+    def test_layer_transition_crystal_evidence_is_model_request_delta(self) -> None:
+        runtime = _Runtime()
+        runtime.model.set_layer_transition_crystal_enabled = Mock()
+        identity = _layer_transition_identity()
+        radius = 0.25
+
+        def metrics(values):
+            return {
+                "atlas_revision_sha256": identity.atlas_revision_sha256,
+                "attempts": values[0],
+                "enabled": True,
+                "exact_kv_state_updates": values[4],
+                "fallbacks": values[2],
+                "graph_revision_sha256": identity.graph_revision_sha256,
+                "identity_sha256": identity.identity_sha256,
+                "max_error_radius": radius,
+                "model_sha256": identity.model_sha256,
+                "packed_weight_bytes_avoided": values[6],
+                "physical_transitions": values[3],
+                "q4_sha256": identity.q4_sha256,
+                "replacements": values[1],
+                "schema": "immer.qwen3.8-layer-transition-crystal-metrics/v1",
+                "skipped_q4_matrix_calls": values[5],
+            }
+
+        runtime.model.layer_transition_crystal_metrics = Mock(
+            side_effect=(
+                metrics((10, 7, 3, 7, 7, 35, 70_000)),
+                metrics((12, 9, 3, 9, 9, 45, 90_000)),
+            )
+        )
+        chat = _chat(runtime)
+        chat._load_locked()
+        chat._layer_transition_crystal_state_path = Path("/state/layer-63.bin")
+        chat._layer_transition_crystal_max_error_radius = radius
+        chat._layer_transition_crystal_bank = SimpleNamespace(
+            identity=identity,
+            crystals=(),
+        )
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        evidence = result.evidence["layer_transition_crystal"]
+        self.assertEqual(
+            evidence["schema"],
+            LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA,
+        )
+        self.assertEqual(evidence["identity"], identity.to_record())
+        self.assertEqual(evidence["identity_sha256"], identity.identity_sha256)
+        self.assertTrue(evidence["request_applied"])
+        self.assertFalse(evidence["directive_selected"])
+        self.assertEqual(
+            evidence["request"],
+            {
+                "atlas_revision_sha256": identity.atlas_revision_sha256,
+                "attempts": 2,
+                "exact_kv_state_updates": 2,
+                "fallbacks": 0,
+                "graph_revision_sha256": identity.graph_revision_sha256,
+                "identity_sha256": identity.identity_sha256,
+                "max_error_radius": radius,
+                "model_sha256": identity.model_sha256,
+                "packed_weight_bytes_avoided": 20_000,
+                "physical_transitions": 2,
+                "q4_sha256": identity.q4_sha256,
+                "replacements": 2,
+                "skipped_q4_matrix_calls": 10,
+            },
+        )
+        self.assertNotIn("hello", json.dumps(evidence, sort_keys=True))
+        runtime.model.set_layer_transition_crystal_enabled.assert_called_once_with(True)
+        with patch(
+            "immer.runtimes.qwen3_8.adapter._digest",
+            side_effect=lambda value: value,
+        ):
+            policy = chat._result_cell_generation_policy_sha256(
+                layer_transition_crystal_applied=True
+            )
+        self.assertEqual(
+            policy["layer_transition_crystal"]["identity_sha256"],
+            identity.identity_sha256,
+        )
+        self.assertEqual(
+            policy["layer_transition_crystal"]["max_error_radius"],
+            radius.hex(),
+        )
+        self.assertTrue(policy["layer_transition_crystal"]["request_applied"])
+        chat.close()
+
+    def test_layer_transition_crystal_discovery_and_explicit_disable(self) -> None:
+        runtime = _Runtime()
+        runtime.model.set_layer_transition_crystal_enabled = Mock()
+        identity = _layer_transition_identity()
+        radius = 0.25
+
+        def stable_metrics():
+            return {
+                "atlas_revision_sha256": identity.atlas_revision_sha256,
+                "attempts": 0,
+                "enabled": True,
+                "exact_kv_state_updates": 0,
+                "fallbacks": 0,
+                "graph_revision_sha256": identity.graph_revision_sha256,
+                "identity_sha256": identity.identity_sha256,
+                "max_error_radius": radius,
+                "model_sha256": identity.model_sha256,
+                "packed_weight_bytes_avoided": 0,
+                "physical_transitions": 0,
+                "q4_sha256": identity.q4_sha256,
+                "replacements": 0,
+                "schema": "immer.qwen3.8-layer-transition-crystal-metrics/v1",
+                "skipped_q4_matrix_calls": 0,
+            }
+
+        runtime.model.layer_transition_crystal_metrics = Mock(
+            side_effect=stable_metrics
+        )
+        chat = _chat(runtime)
+        chat._load_locked()
+        chat._layer_transition_crystal_state_path = Path("/state/layer-63.bin")
+        chat._layer_transition_crystal_max_error_radius = radius
+        chat._layer_transition_crystal_bank = SimpleNamespace(
+            identity=identity,
+            crystals=(),
+        )
+
+        def directive(
+            actions: tuple[str, ...],
+            *,
+            disabled_actions: tuple[str, ...] = (),
+        ) -> InferenceActionDirective:
+            return InferenceActionDirective(
+                question_sha256=hashlib.sha256(b"hello").hexdigest(),
+                runtime_profile_sha256="2" * 64,
+                primary_actions=actions,
+                fallback_actions=actions,
+                draft_enabled=False,
+                source_signature_sha256s=("3" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+                disabled_actions=disabled_actions,
+            )
+
+        baseline = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {
+                    QWEN38_INFERENCE_ACTION_METADATA: directive(
+                        ("qwen_target",)
+                    ).to_document()
+                },
+            )
+        )
+        selected = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {
+                    QWEN38_INFERENCE_ACTION_METADATA: directive(
+                        ("layer_transition_crystal", "qwen_target")
+                    ).to_document()
+                },
+            )
+        )
+        disabled = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {
+                    QWEN38_INFERENCE_ACTION_METADATA: directive(
+                        ("qwen_target",),
+                        disabled_actions=("layer_transition_crystal",),
+                    ).to_document()
+                },
+            )
+        )
+
+        for result in (baseline, selected, disabled):
+            self.assertTrue(result.ok, result.reason)
+        baseline_applied = baseline.evidence["inference_action_directive"]["applied"]
+        selected_applied = selected.evidence["inference_action_directive"]["applied"]
+        disabled_applied = disabled.evidence["inference_action_directive"]["applied"]
+        self.assertTrue(baseline_applied["layer_transition_crystal"])
+        self.assertFalse(
+            baseline_applied["layer_transition_crystal_directive_selected"]
+        )
+        self.assertTrue(selected_applied["layer_transition_crystal"])
+        self.assertTrue(selected_applied["layer_transition_crystal_directive_selected"])
+        self.assertFalse(disabled_applied["layer_transition_crystal"])
+        self.assertTrue(
+            disabled_applied["layer_transition_crystal_explicitly_disabled"]
+        )
+        self.assertEqual(
+            runtime.model.set_layer_transition_crystal_enabled.call_args_list,
+            [call(True), call(True), call(False)],
+        )
+        chat.close()
+
+    def test_layer_transition_result_policy_is_path_neutral_and_budget_bound(
+        self,
+    ) -> None:
+        identity = _layer_transition_identity()
+
+        def policy(
+            path: str,
+            atlas: Path,
+            compute: Path,
+            radius: float,
+            *,
+            applied: bool,
+        ):
+            chat = _chat(
+                _Runtime(),
+                q4_root="/q4",
+                result_cell_code_revision="a" * 64,
+                layer_transition_crystal_state_path=path,
+                layer_transition_crystal_atlas_path=atlas,
+                layer_transition_crystal_compute_root=compute,
+                layer_transition_crystal_max_error_radius=radius,
+            )
+            chat._layer_transition_crystal_bank = SimpleNamespace(
+                identity=identity,
+                crystals=(),
+            )
+            with patch(
+                "immer.runtimes.qwen3_8.adapter._digest",
+                side_effect=lambda value: value,
+            ):
+                result = chat._result_cell_generation_policy_sha256(
+                    layer_transition_crystal_applied=applied
+                )
+            self.assertIsNone(
+                chat._result_cell_semantic_replay_receipt(
+                    question="hello",
+                    rendered_prompt="prompt",
+                    prompt_ids=(1,),
+                )
+            )
+            return result
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            atlas_a = root / "atlas-a"
+            atlas_b = root / "atlas-b"
+            compute_a = root / "compute-a"
+            compute_b = root / "compute-b"
+            for directory in (atlas_a, atlas_b, compute_a, compute_b):
+                directory.mkdir()
+            first = policy(
+                "/private/a.bin",
+                atlas_a,
+                compute_a,
+                0.25,
+                applied=True,
+            )
+            other_path = policy(
+                "/different/b.bin",
+                atlas_b,
+                compute_b,
+                0.25,
+                applied=True,
+            )
+            other_budget = policy(
+                "/private/a.bin",
+                atlas_a,
+                compute_a,
+                0.5,
+                applied=True,
+            )
+            disabled = policy(
+                "/private/a.bin",
+                atlas_a,
+                compute_a,
+                0.25,
+                applied=False,
+            )
+
+        self.assertEqual(first, other_path)
+        self.assertNotEqual(first, other_budget)
+        self.assertNotEqual(first, disabled)
+        self.assertNotIn("/private", json.dumps(first, sort_keys=True))
+        self.assertNotIn("/different", json.dumps(first, sort_keys=True))
+        self.assertNotIn(str(root), json.dumps(first, sort_keys=True))
 
     def test_mlp_page_coordinate_mounts_model_verified_identity(self) -> None:
         runtime = _Runtime()
@@ -735,9 +1277,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         runtime.model.mlp_page_coordinate_runtime_math_sha256.assert_called_once_with()
         runtime.model.set_delta_head_router.assert_called_once_with(None)
         runtime.mlp_page_router.snapshot_identity.assert_called_once_with()
-        runtime.model.attach_mlp_page_coordinate_bank.assert_called_once_with(
-            opened
-        )
+        runtime.model.attach_mlp_page_coordinate_bank.assert_called_once_with(opened)
         self.assertIs(chat._mlp_page_coordinate_bank, opened)
         chat.close()
 
@@ -863,20 +1403,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertTrue(baseline.ok, baseline.reason)
         self.assertTrue(selected.ok, selected.reason)
-        baseline_applied = baseline.evidence["inference_action_directive"][
-            "applied"
-        ]
-        selected_applied = selected.evidence["inference_action_directive"][
-            "applied"
-        ]
+        baseline_applied = baseline.evidence["inference_action_directive"]["applied"]
+        selected_applied = selected.evidence["inference_action_directive"]["applied"]
         self.assertTrue(baseline_applied["mlp_page_coordinate"])
-        self.assertFalse(
-            baseline_applied["mlp_page_coordinate_directive_selected"]
-        )
+        self.assertFalse(baseline_applied["mlp_page_coordinate_directive_selected"])
         self.assertTrue(selected_applied["mlp_page_coordinate"])
-        self.assertTrue(
-            selected_applied["mlp_page_coordinate_directive_selected"]
-        )
+        self.assertTrue(selected_applied["mlp_page_coordinate_directive_selected"])
         self.assertEqual(
             runtime.model.set_mlp_page_coordinate_enabled.call_args_list,
             [call(True), call(True)],
@@ -899,9 +1431,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             runtime.model.delta_head_router = router
             events.append(("delta", router))
 
-        runtime.model.set_mlp_page_coordinate_enabled = Mock(
-            side_effect=set_coordinate
-        )
+        runtime.model.set_mlp_page_coordinate_enabled = Mock(side_effect=set_coordinate)
         runtime.model.set_delta_head_router = Mock(side_effect=set_delta)
         router = SimpleNamespace(
             metrics=Mock(
@@ -1131,9 +1661,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(
             joint,
             {
-                "draft_feedback_schema": (
-                    "immer.qwen3.8-draft-window-feedback/v3"
-                ),
+                "draft_feedback_schema": ("immer.qwen3.8-draft-window-feedback/v3"),
                 "mlp_page_enabled": True,
                 "mlp_page_policy": (
                     "dynamic-page-transitions+coactivation+adaptive-width+"
@@ -1297,9 +1825,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             source = SimpleNamespace(
                 repo_id="Qwen/test",
                 revision="a" * 40,
-                metrics=Mock(
-                    return_value={"inventory_source_fingerprint": "b" * 64}
-                ),
+                metrics=Mock(return_value={"inventory_source_fingerprint": "b" * 64}),
             )
             mount = SimpleNamespace(
                 source=source,
@@ -1408,9 +1934,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             delta_options = delta_constructor.call_args.kwargs
             self.assertEqual(delta_options["active_layers"], (0,))
             self.assertEqual(delta_options["state_path"], root / "delta.json")
-            self.assertIsNone(
-                model_constructor.call_args.kwargs["delta_head_router"]
-            )
+            self.assertIsNone(model_constructor.call_args.kwargs["delta_head_router"])
             self.assertIs(runtime.delta_head_router, delta_router)
             self.assertIsNone(model.delta_head_router)
             runtime.close()
@@ -1662,9 +2186,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(router.events[2][1], reward["receipt_sha256"])
         self.assertAlmostEqual(router.events[2][2], expected)
         self.assertEqual(
-            result.evidence["mlp_page_route"]["request"][
-                "physical_pages_saved"
-            ],
+            result.evidence["mlp_page_route"]["request"]["physical_pages_saved"],
             224,
         )
         self.assertEqual(q4.calls, 2)
@@ -2005,7 +2527,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 range_markov_state_path="/state/ranges",
             )
 
-    def test_direct_markov_page_route_requires_q4_and_replaces_legacy_sparse(self) -> None:
+    def test_direct_markov_page_route_requires_q4_and_replaces_legacy_sparse(
+        self,
+    ) -> None:
         component = Qwen38CausalChat(
             "unused.causal",
             "unused-tokenizer.json",
@@ -2193,9 +2717,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         class ConversationModel(_Model):
             def generate_greedy(self, prompt, **kwargs):
                 self.generated = (
-                    (7, IM_END_TOKEN_ID)
-                    if not self.calls
-                    else (8, IM_END_TOKEN_ID)
+                    (7, IM_END_TOKEN_ID) if not self.calls else (8, IM_END_TOKEN_ID)
                 )
                 tokens, evidence = super().generate_greedy(prompt, **kwargs)
                 return tokens, {**evidence, "stopped_on_eos": True}
@@ -2514,6 +3036,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "attention_output_crystal_explicitly_disabled": False,
                 "draft_enabled": False,
                 "draft_window_ceiling": None,
+                "layer_transition_crystal": False,
+                "layer_transition_crystal_directive_selected": False,
+                "layer_transition_crystal_explicitly_disabled": False,
                 "lm_head_coordinate": False,
                 "lm_head_coordinate_directive_selected": False,
                 "lm_head_coordinate_explicitly_disabled": False,
@@ -2572,17 +3097,11 @@ class Qwen38CausalChatTests(unittest.TestCase):
             Request(
                 "chat",
                 "hello",
-                {
-                    QWEN38_INFERENCE_ACTION_METADATA: (
-                        unspecified.to_document()
-                    )
-                },
+                {QWEN38_INFERENCE_ACTION_METADATA: (unspecified.to_document())},
             )
         )
         self.assertTrue(
-            discovery_with_transferable_directive.evidence["prefix_sinkhorn"][
-                "active"
-            ]
+            discovery_with_transferable_directive.evidence["prefix_sinkhorn"]["active"]
         )
         self.assertEqual(model.prefix_activation_calls, [])
 
@@ -2640,12 +3159,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
             True,
         )
         self.assertNotEqual(
-            chat._result_cell_generation_policy_sha256(
-                prefix_sinkhorn_applied=False
-            ),
-            chat._result_cell_generation_policy_sha256(
-                prefix_sinkhorn_applied=True
-            ),
+            chat._result_cell_generation_policy_sha256(prefix_sinkhorn_applied=False),
+            chat._result_cell_generation_policy_sha256(prefix_sinkhorn_applied=True),
         )
         self.assertEqual(model.prefix_activation_calls, [False, True])
         chat.close()
@@ -2731,9 +3246,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 )
                 applied = result.evidence["inference_action_directive"]["applied"]
                 self.assertTrue(applied["mlp_head_coordinate"])
-                self.assertTrue(
-                    applied["mlp_head_coordinate_directive_selected"]
-                )
+                self.assertTrue(applied["mlp_head_coordinate_directive_selected"])
                 chat.close()
 
         runtime = _Runtime()
@@ -3051,9 +3564,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             hybrid._draft_mode_for_request({"restored_prefix_length": 17}),
             "markov",
         )
-        self.assertIsNone(
-            mtp._draft_mode_for_request({"restored_prefix_length": 17})
-        )
+        self.assertIsNone(mtp._draft_mode_for_request({"restored_prefix_length": 17}))
 
         prefix = tuple(range(17))
         carry = Qwen35MtpCarry(
@@ -3312,9 +3823,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 return_value=q4_sha,
             ):
                 result = chat.handle(Request("chat", "hello"))
-            semantic_document = result.evidence[
-                QWEN_SEMANTIC_REPLAY_EVIDENCE_KEY
-            ]
+            semantic_document = result.evidence[QWEN_SEMANTIC_REPLAY_EVIDENCE_KEY]
             adapter_semantics, adapter_key = parse_semantic_replay_receipt(
                 semantic_document
             )
@@ -3327,9 +3836,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             )
             with patch(
                 "immer.cli._path_sha256",
-                side_effect=lambda path: (
-                    q4_sha if path == manifest else _DIGEST
-                ),
+                side_effect=lambda path: q4_sha if path == manifest else _DIGEST,
             ):
                 cli_semantics = _qwen38_output_semantics(
                     args,
@@ -3345,9 +3852,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             cli_key = QwenSemanticReplayKey(
                 output_semantics_sha256=cli_semantics.sha256,
                 question_sha256=hashlib.sha256(b"hello").hexdigest(),
-                rendered_prompt_sha256=hashlib.sha256(
-                    rendered.encode()
-                ).hexdigest(),
+                rendered_prompt_sha256=hashlib.sha256(rendered.encode()).hexdigest(),
                 rendered_prompt_token_sha256=prompt_token_sha256((11, 12)),
                 system_prompt_sha256=hashlib.sha256(b"local system").hexdigest(),
             )
@@ -4050,6 +4555,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIn("cartography_probe.py", names)
         self.assertIn("adapter.py", names)
         self.assertIn("qwen_warm_growth.py", names)
+        self.assertNotIn("layer_transition_builder.py", names)
 
     def test_hybrid_warm_profile_binds_every_draft_provider_abi(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4327,6 +4833,220 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(enabled_a, enabled_b)
         self.assertNotEqual(enabled_a, disabled)
 
+    def test_layer_transition_profiles_bind_identity_budget_not_state_path(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            q4 = root / "q4"
+            q4.mkdir()
+            (q4 / "manifest.json").write_bytes(b"manifest")
+            tokenizer = root / "tokenizer.json"
+            tokenizer.write_bytes(b"tokenizer")
+            state_a = root / "layer-a.bin"
+            state_b = root / "layer-b.bin"
+            state_a.write_bytes(b"sealed-a")
+            state_b.write_bytes(b"sealed-b")
+            atlas_a = root / "atlas-a"
+            atlas_b = root / "atlas-b"
+            compute_a = root / "compute-a"
+            compute_b = root / "compute-b"
+            atlas_revision = _semantic_atlas_authority(atlas_a)
+            self.assertEqual(atlas_revision, _semantic_atlas_authority(atlas_b))
+            graph_revision = _compute_graph_authority(compute_a)
+            self.assertEqual(graph_revision, _compute_graph_authority(compute_b))
+            identity = _layer_transition_identity(
+                atlas=atlas_revision,
+                graph=graph_revision,
+            )
+            opened = SimpleNamespace(identity=identity, crystals=())
+            args = SimpleNamespace(
+                compute_dtype="auto",
+                device="auto",
+                draft_window=8,
+                head_block_rows=2048,
+                layer_transition_crystal_atlas=atlas_a,
+                layer_transition_crystal_compute_root=compute_a,
+                layer_transition_crystal_max_error_radius=0.25,
+                layer_transition_crystal_state=state_a,
+                max_context_tokens=2048,
+                max_new_tokens=64,
+                max_prompt_tokens=1024,
+                mlp_page_width=192,
+                q4_threads=None,
+                qwen38_anchor_cache=None,
+                system_prompt="",
+            )
+            warm_common = {
+                "args": args,
+                "tokenizer_path": tokenizer,
+                "q4_root": q4,
+                "fast_mlp_root": None,
+                "mlp_page_state_path": None,
+                "draft_mode": None,
+                "markov_atlas_path": None,
+                "markov_o1_retention_path": None,
+                "runtime_code_revision": "a" * 64,
+            }
+            service_common = {
+                "args": args,
+                "bundle_path": root / "bundle",
+                "tokenizer_path": tokenizer,
+                "q4_root": q4,
+                "fast_mlp_root": None,
+                "warm_root": None,
+                "draft_mode": None,
+                "markov_draft_state": None,
+                "mtp_draft_state": None,
+                "markov_atlas_path": None,
+                "markov_o1_retention_path": None,
+                "mlp_page_state_path": None,
+                "draft_window_state_path": None,
+                "runtime_code_revision": "a" * 64,
+            }
+            with patch(
+                "immer.runtimes.qwen3_8.layer_transition_crystal."
+                "LayerTransitionCrystalBank.load",
+                return_value=opened,
+            ):
+                warm_a = _qwen38_growing_warm_profile(**warm_common)
+                service_a = _qwen38_service_profile(**service_common)
+                self.assertIsNone(
+                    _qwen38_output_semantics(
+                        args,
+                        tokenizer_path=tokenizer,
+                        q4_root=q4,
+                        mlp_page_state_path=None,
+                    )
+                )
+                args.layer_transition_crystal_state = state_b
+                args.layer_transition_crystal_atlas = atlas_b
+                args.layer_transition_crystal_compute_root = compute_b
+                warm_b = _qwen38_growing_warm_profile(**warm_common)
+                service_b = _qwen38_service_profile(**service_common)
+                args.layer_transition_crystal_max_error_radius = 0.5
+                warm_other_budget = _qwen38_growing_warm_profile(**warm_common)
+                service_other_budget = _qwen38_service_profile(**service_common)
+            args.layer_transition_crystal_max_error_radius = 0.25
+            with patch(
+                "immer.runtimes.qwen3_8.layer_transition_crystal."
+                "LayerTransitionCrystalBank.load",
+                return_value=SimpleNamespace(
+                    identity=_layer_transition_identity(
+                        model="6",
+                        atlas=atlas_revision,
+                        graph=graph_revision,
+                    ),
+                    crystals=(),
+                ),
+            ):
+                warm_other_identity = _qwen38_growing_warm_profile(**warm_common)
+                service_other_identity = _qwen38_service_profile(**service_common)
+            args.layer_transition_crystal_state = None
+            args.layer_transition_crystal_atlas = None
+            args.layer_transition_crystal_compute_root = None
+            args.layer_transition_crystal_max_error_radius = 0.0
+            output_without_layer = _qwen38_output_semantics(
+                args,
+                tokenizer_path=tokenizer,
+                q4_root=q4,
+                mlp_page_state_path=None,
+            )
+
+        self.assertEqual(warm_a, warm_b)
+        self.assertEqual(service_a, service_b)
+        self.assertNotEqual(warm_a, warm_other_budget)
+        self.assertNotEqual(service_a, service_other_budget)
+        self.assertNotEqual(warm_a, warm_other_identity)
+        self.assertNotEqual(service_a, service_other_identity)
+        self.assertIsNotNone(output_without_layer)
+
+    def test_layer_transition_economics_identity_excludes_authority_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_a = root / "layer-a.bin"
+            state_b = root / "layer-b.bin"
+            state_a.write_bytes(b"sealed-a")
+            state_b.write_bytes(b"sealed-b")
+            atlas_a = root / "atlas-a"
+            atlas_b = root / "atlas-b"
+            compute_a = root / "compute-a"
+            compute_b = root / "compute-b"
+            atlas_revision = _semantic_atlas_authority(atlas_a)
+            self.assertEqual(atlas_revision, _semantic_atlas_authority(atlas_b))
+            graph_revision = _compute_graph_authority(compute_a)
+            self.assertEqual(graph_revision, _compute_graph_authority(compute_b))
+            identity = _layer_transition_identity(
+                atlas=atlas_revision,
+                graph=graph_revision,
+            )
+
+            def runtime_profile(
+                state: Path,
+                atlas: Path,
+                compute: Path,
+                economics: Path,
+            ) -> str:
+                output = io.StringIO()
+                with (
+                    patch(
+                        "immer.runtimes.qwen3_8.layer_transition_crystal."
+                        "LayerTransitionCrystalBank.load",
+                        return_value=SimpleNamespace(identity=identity, crystals=()),
+                    ),
+                    patch(
+                        "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                        return_value=_chat(_Runtime()),
+                    ),
+                    redirect_stdout(output),
+                ):
+                    code = main(
+                        [
+                            "chat",
+                            "hello",
+                            "--output",
+                            "json",
+                            "--raw-qwen",
+                            "--no-markov-draft",
+                            "--qwen38-causal-bundle",
+                            "/models/qwen.causal",
+                            "--qwen38-tokenizer",
+                            "/models/tokenizer.json",
+                            "--qwen38-q4",
+                            "/models/qwen-q4",
+                            "--layer-transition-crystal-state",
+                            str(state),
+                            "--layer-transition-crystal-atlas",
+                            str(atlas),
+                            "--layer-transition-crystal-compute-root",
+                            str(compute),
+                            "--inference-economics-state",
+                            str(economics),
+                        ]
+                    )
+                self.assertEqual(code, 0)
+                document = json.loads(output.getvalue())
+                return document["evidence"]["inference_economics"]["receipt"]["body"][
+                    "runtime_profile_sha256"
+                ]
+
+            profile_a = runtime_profile(
+                state_a,
+                atlas_a,
+                compute_a,
+                root / "economics-a",
+            )
+            profile_b = runtime_profile(
+                state_b,
+                atlas_b,
+                compute_b,
+                root / "economics-b",
+            )
+
+        self.assertEqual(profile_a, profile_b)
+
     def test_cli_explicit_layout_does_not_inherit_deployed_q4(self) -> None:
         qwen = _chat(_Runtime())
         with tempfile.TemporaryDirectory() as temporary:
@@ -4407,7 +5127,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
             str(deployed / "causal" / "q4-base-v2"),
         )
 
-    def test_cli_mounts_direct_markov_page_execution_without_legacy_fast_mlp(self) -> None:
+    def test_cli_mounts_direct_markov_page_execution_without_legacy_fast_mlp(
+        self,
+    ) -> None:
         qwen = _chat(_Runtime())
         with (
             patch.dict(
@@ -4461,8 +5183,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     deployed,
                 ),
                 patch(
-                    "immer.cli."
-                    "_QWEN38_DEPLOYMENT_ATTENTION_OUTPUT_CRYSTAL_STATE",
+                    "immer.cli._QWEN38_DEPLOYMENT_ATTENTION_OUTPUT_CRYSTAL_STATE",
                     attention_state,
                 ),
                 patch(
@@ -4769,9 +5490,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 ) as constructor,
                 redirect_stdout(io.StringIO()),
             ):
-                code = main(
-                    ["chat", "hello", "--raw-qwen", "--draft-mode", "markov"]
-                )
+                code = main(["chat", "hello", "--raw-qwen", "--draft-mode", "markov"])
 
         self.assertEqual(code, 0)
         options = constructor.call_args.kwargs
@@ -4958,7 +5677,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 single["evidence"]["inference_action_bank"]["status"],
                 "recorded",
             )
-            self.assertEqual(InferenceEconomicsLedger(economics).snapshot()["requests"], 1)
+            self.assertEqual(
+                InferenceEconomicsLedger(economics).snapshot()["requests"], 1
+            )
             action_root = economics.parent / "qwen-inference-action-bank-v1"
             self.assertEqual(InferenceActionBank(action_root).snapshot()["requests"], 1)
 
@@ -4998,12 +5719,13 @@ class Qwen38CausalChatTests(unittest.TestCase):
             self.assertEqual(len(rows), 2)
             self.assertTrue(
                 all(
-                    row["evidence"]["inference_economics"]["status"]
-                    == "recorded"
+                    row["evidence"]["inference_economics"]["status"] == "recorded"
                     for row in rows
                 )
             )
-            self.assertEqual(InferenceEconomicsLedger(economics).snapshot()["requests"], 3)
+            self.assertEqual(
+                InferenceEconomicsLedger(economics).snapshot()["requests"], 3
+            )
             self.assertEqual(InferenceActionBank(action_root).snapshot()["requests"], 3)
 
             interactive_runtime = _Runtime()
@@ -5314,9 +6036,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             ),
         )
         output = io.StringIO()
-        stream = io.StringIO(
-            "one\n/stats\ntwo\n/stats\nthree\n/stats\n/quit\n"
-        )
+        stream = io.StringIO("one\n/stats\ntwo\n/stats\nthree\n/stats\n/quit\n")
         with (
             patch(
                 "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
@@ -5346,8 +6066,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             output.getvalue().splitlines(),
             [
                 "markov",
-                "[1 tokens · Markov 1 tournaments B0/C1/P0, "
-                "2 counterfactual labels]",
+                "[1 tokens · Markov 1 tournaments B0/C1/P0, 2 counterfactual labels]",
                 "mtp",
                 "[1 tokens · 3 free MTP teacher labels]",
                 "malformed",
@@ -5618,9 +6337,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(
-            constructor.call_args.kwargs[
-                "attention_output_crystal_state_path"
-            ],
+            constructor.call_args.kwargs["attention_output_crystal_state_path"],
             "/state/attention-output.json",
         )
 
@@ -5643,6 +6360,116 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(conflict, 2)
+
+    def test_cli_wires_private_layer_transition_state_and_error_budget(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "layer-63.bin"
+            state.write_bytes(b"sealed-fixture")
+            atlas = root / "atlas"
+            compute = root / "compute"
+            identity = _layer_transition_identity(
+                atlas=_semantic_atlas_authority(atlas),
+                graph=_compute_graph_authority(compute),
+            )
+            with (
+                patch(
+                    "immer.runtimes.qwen3_8.layer_transition_crystal."
+                    "LayerTransitionCrystalBank.load",
+                    return_value=SimpleNamespace(identity=identity, crystals=()),
+                ),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--qwen38-q4",
+                        "/models/qwen-q4",
+                        "--layer-transition-crystal-state",
+                        str(state),
+                        "--layer-transition-crystal-atlas",
+                        str(atlas),
+                        "--layer-transition-crystal-compute-root",
+                        str(compute),
+                        "--layer-transition-crystal-max-error-radius",
+                        "0.25",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        options = constructor.call_args.kwargs
+        self.assertEqual(
+            options["layer_transition_crystal_state_path"],
+            str(state),
+        )
+        self.assertEqual(
+            options["layer_transition_crystal_atlas_path"],
+            str(atlas),
+        )
+        self.assertEqual(
+            options["layer_transition_crystal_compute_root"],
+            str(compute),
+        )
+        self.assertEqual(
+            options["layer_transition_crystal_max_error_radius"],
+            0.25,
+        )
+        with (
+            redirect_stderr(io.StringIO()),
+            redirect_stdout(io.StringIO()),
+            self.assertRaises(SystemExit) as invalid_radius,
+        ):
+            main(
+                [
+                    "chat",
+                    "hello",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                    "--qwen38-q4",
+                    "/models/qwen-q4",
+                    "--layer-transition-crystal-max-error-radius",
+                    "nan",
+                    "--raw-qwen",
+                    "--no-markov-draft",
+                ]
+            )
+        self.assertEqual(invalid_radius.exception.code, 2)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state_without_authorities = Path(temporary) / "layer-63.bin"
+            state_without_authorities.write_bytes(b"sealed-fixture")
+            with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+                missing_authority = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--qwen38-q4",
+                        "/models/qwen-q4",
+                        "--layer-transition-crystal-state",
+                        str(state_without_authorities),
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+        self.assertEqual(missing_authority, 2)
 
     def test_cli_wires_delta_heads_without_legacy_fast_mlp(self) -> None:
         qwen = _chat(_Runtime())

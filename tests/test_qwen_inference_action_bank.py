@@ -70,8 +70,45 @@ def _economics(
     )
 
 
+def _layer_transition_crystal_evidence(
+    *,
+    request_overrides: dict[str, object] | None = None,
+    evidence_overrides: dict[str, object] | None = None,
+) -> dict[str, object]:
+    evidence = {
+        "identity_sha256": _sha("layer-transition-identity"),
+        "model_sha256": _sha("layer-transition-model"),
+        "q4_sha256": _sha("layer-transition-q4"),
+        "graph_revision_sha256": _sha("layer-transition-graph"),
+        "atlas_revision_sha256": _sha("layer-transition-atlas"),
+    }
+    request = {
+        **evidence,
+        "attempts": 3,
+        "exact_kv_state_updates": 2,
+        "fallbacks": 1,
+        "max_error_radius": 0.25,
+        "packed_weight_bytes_avoided": 16_384,
+        "physical_transitions": 2,
+        "replacements": 2,
+        "skipped_q4_matrix_calls": 10,
+    }
+    if request_overrides:
+        request.update(request_overrides)
+    if evidence_overrides:
+        evidence.update(evidence_overrides)
+    return {
+        **evidence,
+        "max_error_radius": 0.25,
+        "request": request,
+        "schema": "immer.qwen3.8-layer-transition-crystal-evidence/v1",
+    }
+
+
 class InferenceActionReceiptTests(unittest.TestCase):
-    def test_normal_cold_request_becomes_one_content_addressed_action_vector(self) -> None:
+    def test_normal_cold_request_becomes_one_content_addressed_action_vector(
+        self,
+    ) -> None:
         receipt = InferenceActionReceipt.from_economics(_economics("one"))
         self.assertEqual(
             receipt.actions,
@@ -112,9 +149,7 @@ class InferenceActionReceiptTests(unittest.TestCase):
             "qwen3.8.fertig-chat",
             output="OMEGA",
             evidence={
-                "receipt": {
-                    "qwen": {"component": "immer.markov-parametric-template"}
-                }
+                "receipt": {"qwen": {"component": "immer.markov-parametric-template"}}
             },
         )
         actions = executed_actions_from_result(result, economics)
@@ -172,9 +207,7 @@ class InferenceActionReceiptTests(unittest.TestCase):
                         "base_softmax_head_rows_skipped": 12,
                         "base_softmax_probability_elements_skipped": 144,
                     },
-                    "schema": (
-                        "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
-                    ),
+                    "schema": ("immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"),
                 }
             },
         )
@@ -202,9 +235,7 @@ class InferenceActionReceiptTests(unittest.TestCase):
                         "alpha": 1.0,
                         "replace_base_softmax": True,
                     },
-                    "schema": (
-                        "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
-                    ),
+                    "schema": ("immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"),
                 }
             },
         )
@@ -309,9 +340,7 @@ class InferenceActionReceiptTests(unittest.TestCase):
                     output="answer",
                     evidence={
                         "delta_head_router": {
-                            "schema": (
-                                "immer.qwen3.8-packed-delta-head-router/v1"
-                            ),
+                            "schema": ("immer.qwen3.8-packed-delta-head-router/v1"),
                             "request": request,
                         }
                     },
@@ -523,6 +552,170 @@ class InferenceActionReceiptTests(unittest.TestCase):
             ("mlp_page_coordinate", "qwen_target"),
         )
 
+    def test_layer_transition_crystal_records_exact_transition_replay(self) -> None:
+        economics = _economics(
+            "layer-transition-crystal",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "receipt": {
+                    "qwen": {
+                        "layer_transition_crystal": (
+                            _layer_transition_crystal_evidence()
+                        )
+                    }
+                }
+            },
+        )
+
+        actions = executed_actions_from_result(result, economics)
+
+        self.assertEqual(
+            actions,
+            ("layer_transition_crystal", "qwen_target"),
+        )
+        receipt = InferenceActionReceipt.from_economics(
+            economics,
+            executed_actions=actions,
+        )
+        self.assertEqual(receipt.actions, actions)
+        self.assertEqual(receipt.saved_qwen_forwards, 0)
+
+    def test_layer_transition_crystal_requires_exact_positive_pinned_work(
+        self,
+    ) -> None:
+        economics = _economics(
+            "layer-transition-crystal-invalid",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        for field, invalid in (
+            ("attempts", 0),
+            ("replacements", 0),
+            ("physical_transitions", 0),
+            ("physical_transitions", True),
+            ("skipped_q4_matrix_calls", 0),
+            ("packed_weight_bytes_avoided", 0),
+            ("exact_kv_state_updates", 0),
+        ):
+            with self.subTest(field=field, invalid=invalid):
+                result = Result(
+                    ExecutionStatus.OK,
+                    "qwen3.8.causal-chat",
+                    output="answer",
+                    evidence={
+                        "layer_transition_crystal": (
+                            _layer_transition_crystal_evidence(
+                                request_overrides={field: invalid}
+                            )
+                        )
+                    },
+                )
+                self.assertNotIn(
+                    "layer_transition_crystal",
+                    executed_actions_from_result(result, economics),
+                )
+
+        for settlement in (
+            {"attempts": 0, "fallbacks": 0, "replacements": 0},
+            {"attempts": 2, "fallbacks": 1, "replacements": 2},
+            {"attempts": 3, "fallbacks": 1, "replacements": 1},
+        ):
+            with self.subTest(settlement=settlement):
+                result = Result(
+                    ExecutionStatus.OK,
+                    "qwen3.8.causal-chat",
+                    output="answer",
+                    evidence={
+                        "layer_transition_crystal": (
+                            _layer_transition_crystal_evidence(
+                                request_overrides=settlement
+                            )
+                        )
+                    },
+                )
+                self.assertNotIn(
+                    "layer_transition_crystal",
+                    executed_actions_from_result(result, economics),
+                )
+
+        for evidence_overrides, request_overrides in (
+            ({"identity_sha256": "not-a-sha"}, None),
+            (None, {"q4_sha256": "not-a-sha"}),
+            (
+                {"model_sha256": _sha("tampered-model")},
+                {"model_sha256": _sha("different-model")},
+            ),
+        ):
+            with self.subTest(
+                evidence_overrides=evidence_overrides,
+                request_overrides=request_overrides,
+            ):
+                result = Result(
+                    ExecutionStatus.OK,
+                    "qwen3.8.causal-chat",
+                    output="answer",
+                    evidence={
+                        "layer_transition_crystal": (
+                            _layer_transition_crystal_evidence(
+                                request_overrides=request_overrides,
+                                evidence_overrides=evidence_overrides,
+                            )
+                        )
+                    },
+                )
+                self.assertNotIn(
+                    "layer_transition_crystal",
+                    executed_actions_from_result(result, economics),
+                )
+
+        near_evidence = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "layer_transition_crystal": {
+                    **_layer_transition_crystal_evidence(),
+                    "schema": ("immer.qwen3.8-layer-transition-crystal-near/v1"),
+                }
+            },
+        )
+        self.assertNotIn(
+            "layer_transition_crystal",
+            executed_actions_from_result(near_evidence, economics),
+        )
+
+        zero_target = _economics(
+            "layer-transition-crystal-zero-target",
+            draft=False,
+            pages=False,
+            target=0,
+            saved=0,
+        )
+        self.assertNotIn(
+            "layer_transition_crystal",
+            executed_actions_from_result(
+                Result(
+                    ExecutionStatus.OK,
+                    "qwen3.8.causal-chat",
+                    output="answer",
+                    evidence={
+                        "layer_transition_crystal": (
+                            _layer_transition_crystal_evidence()
+                        )
+                    },
+                ),
+                zero_target,
+            ),
+        )
+
 
 class InferenceActionBankTests(unittest.TestCase):
     def test_explicit_prefix_disable_blocks_warm_replay_but_omission_does_not(
@@ -726,9 +919,7 @@ class InferenceActionBankTests(unittest.TestCase):
             output="answer",
             evidence={
                 "attention_output_crystal": {
-                    "schema": (
-                        "immer.qwen3.8-attention-output-crystal-evidence/v1"
-                    ),
+                    "schema": ("immer.qwen3.8-attention-output-crystal-evidence/v1"),
                     "request": {
                         "hits": 1,
                         "logical_projection_bytes_saved": 4_096,
@@ -963,6 +1154,80 @@ class InferenceActionBankTests(unittest.TestCase):
                 source_signature_sha256s=("3" * 64,),
                 support=1,
                 saved_qwen_forwards=0,
+            )
+
+    def test_layer_transition_crystal_is_safe_additive_same_runtime_replay(
+        self,
+    ) -> None:
+        crystal = _economics(
+            "layer-transition-runtime",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        draft = _economics("layer-transition-draft", saved=5)
+        actions = ("layer_transition_crystal", "qwen_target")
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            bank.observe(crystal, executed_actions=actions)
+            bank.observe(draft)
+            same = bank.recommend(
+                question_sha256=_sha("same-runtime transition question"),
+                runtime_profile_sha256=_sha("profile"),
+            )
+            other = bank.recommend(
+                question_sha256=_sha("other-runtime transition question"),
+                runtime_profile_sha256=_sha("other profile"),
+            )
+
+        assert same is not None
+        self.assertIn("layer_transition_crystal", same.primary_actions)
+        self.assertIn("target_verified_draft", same.primary_actions)
+        self.assertEqual(same.fallback_actions, same.primary_actions)
+        self.assertTrue(same.draft_enabled)
+        assert other is not None
+        self.assertNotIn("layer_transition_crystal", other.primary_actions)
+        self.assertEqual(
+            other.primary_actions,
+            ("dynamic_mlp_pages", "qwen_target", "target_verified_draft"),
+        )
+        disabled = InferenceActionDirective(
+            question_sha256=_sha("disabled layer transition"),
+            runtime_profile_sha256=_sha("profile"),
+            primary_actions=("qwen_target",),
+            fallback_actions=("qwen_target",),
+            draft_enabled=None,
+            source_signature_sha256s=("8" * 64,),
+            support=1,
+            saved_qwen_forwards=0,
+            disabled_actions=("layer_transition_crystal",),
+        )
+        self.assertEqual(
+            InferenceActionDirective.from_document(disabled.to_document()),
+            disabled,
+        )
+        with self.assertRaises(ValueError):
+            InferenceActionDirective(
+                question_sha256=_sha("invalid layer transition"),
+                runtime_profile_sha256=_sha("profile"),
+                primary_actions=("layer_transition_crystal",),
+                fallback_actions=("qwen_target",),
+                draft_enabled=None,
+                source_signature_sha256s=("9" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+            )
+        with self.assertRaisesRegex(ValueError, "conflict"):
+            InferenceActionDirective(
+                question_sha256=_sha("conflicting layer transition disable"),
+                runtime_profile_sha256=_sha("profile"),
+                primary_actions=("layer_transition_crystal", "qwen_target"),
+                fallback_actions=("qwen_target",),
+                draft_enabled=None,
+                source_signature_sha256s=("a" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+                disabled_actions=("layer_transition_crystal",),
             )
 
     def test_reconcile_recovers_a_missed_derived_event_and_tamper_is_hard(self) -> None:

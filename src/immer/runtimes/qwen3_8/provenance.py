@@ -18,6 +18,7 @@ _QWEN_RUNTIME_FILES = (
     "encoding.py",
     "graft.py",
     "kernels.py",
+    "layer_transition_crystal.py",
     "model.py",
     "mlp_page_coordinate.py",
     "mlp_page_markov.py",

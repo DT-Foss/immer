@@ -358,6 +358,14 @@ class Qwen38SnapshotTests(unittest.TestCase):
             "immer/runtimes/qwen3_8/mlp_page_coordinate.py",
             runtime_paths,
         )
+        self.assertIn(
+            "immer/runtimes/qwen3_8/layer_transition_crystal.py",
+            runtime_paths,
+        )
+        self.assertNotIn(
+            "immer/runtimes/qwen3_8/layer_transition_builder.py",
+            runtime_paths,
+        )
         self.assertIn("immer/runtimes/qwen3_8/native_crsa.py", runtime_paths)
         self.assertIn("immer/runtimes/qwen3_8/native_fork.py", runtime_paths)
 

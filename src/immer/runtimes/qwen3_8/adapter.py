@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 
+from ...knowledge.livecausal import LiveGraph
 from ...knowledge.range_markov import MarkovRangePrefetcher
 from ..o1_state.markov_retention import (
     O1_MARKOV_RETENTION_POLICY,
@@ -26,6 +27,8 @@ from ..o1_state.markov_retention import (
 )
 from ...contracts import ExecutionStatus, Request, Result
 from ..deepseek_v4.causal_weights import CausalWeightMount, LogicalModelIdentity
+from ..ooe.compute_crystals import ComputeCrystalBank
+from ..ooe.compute_graph import ComputeOperatorGraph, ComputeOperatorGraphState
 from .action_bank import InferenceActionBankError, InferenceActionDirective
 from .attention_output_crystal import (
     ATTENTION_OUTPUT_CRYSTAL_EVIDENCE_SCHEMA,
@@ -68,6 +71,10 @@ from .markov_draft import (
     FingerprintRollingK4DraftProvider,
 )
 from .markov_atlas import MarkovTokenAtlas
+from .layer_transition_crystal import (
+    LayerTransitionCrystalBank,
+    LayerTransitionCrystalIdentity,
+)
 from .mlp_page_markov import (
     MLP_PAGE_MARKOV_COMPATIBLE_PREDECESSORS,
     MLP_PAGE_MARKOV_POLICY,
@@ -106,6 +113,7 @@ from .semantic_state_cache import (
     SemanticStateCacheConflict,
     token_prefix_sha256,
 )
+from .semantic_atlas import GraphRevision
 
 
 _SHA256 = frozenset("0123456789abcdef")
@@ -133,6 +141,9 @@ _GENERATION_RECEIPT_FIELDS = (
     "stopped_on_eos",
 )
 RESULT_CELL_GENERATION_POLICY_SCHEMA = "immer.qwen3.8-result-cell-generation-policy/v1"
+LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA = (
+    "immer.qwen3.8-layer-transition-crystal-evidence/v1"
+)
 QWEN38_CHAT_HISTORY_METADATA = "qwen_chat_history"
 QWEN38_CHAT_SESSION_METADATA = "qwen_chat_session"
 QWEN38_INFERENCE_ACTION_METADATA = "qwen_inference_action_directive"
@@ -225,6 +236,114 @@ def _file_sha256(path: Path) -> str:
 
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and not (set(value) - _SHA256)
+
+
+def _require_existing_real_directory(path: Path, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"{label} must name an existing real directory") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"{label} must name an existing real directory")
+
+
+def _open_layer_transition_crystal_atlas(
+    path: Path,
+    *,
+    atlas_revision_sha256: str,
+) -> LiveGraph:
+    """Open and authenticate the live Atlas authority for one sealed bank."""
+
+    _require_existing_real_directory(
+        path,
+        "layer_transition_crystal_atlas_path",
+    )
+    try:
+        atlas = LiveGraph(path)
+        revision_history = atlas.store.revision_history()
+    except Exception as exc:
+        raise Qwen38ChatError(
+            "layer-transition Crystal Atlas authority is unavailable or unauthenticated"
+        ) from exc
+    if not any(
+        GraphRevision(sequence, event_sha256).sha256 == atlas_revision_sha256
+        for sequence, event_sha256 in revision_history
+    ):
+        raise Qwen38ChatError(
+            "layer-transition Crystal bank belongs to a foreign Atlas authority"
+        )
+    return atlas
+
+
+def _open_layer_transition_crystal_compute_graph(
+    path: Path,
+    *,
+    graph_revision_sha256: str,
+) -> tuple[ComputeOperatorGraph, ComputeOperatorGraphState]:
+    """Open and authenticate the Compute Crystal graph ancestor for one bank."""
+
+    _require_existing_real_directory(
+        path,
+        "layer_transition_crystal_compute_root",
+    )
+    try:
+        bank = ComputeCrystalBank(path)
+        graph = ComputeOperatorGraph(bank)
+        current = graph.state()
+        seen: set[str] = set()
+        while True:
+            current_sha256 = current.sha256
+            if current_sha256 in seen:
+                raise Qwen38ChatError(
+                    "layer-transition Compute graph history contains a cycle"
+                )
+            seen.add(current_sha256)
+            if current_sha256 == graph_revision_sha256:
+                return graph, current
+            previous_sha256 = current.previous_state_sha256
+            if previous_sha256 is None:
+                break
+            payload = bank.store.restore_state(
+                graph.history_state_name(previous_sha256)
+            )
+            previous = ComputeOperatorGraphState.from_bytes(payload)
+            if (
+                previous.sha256 != previous_sha256
+                or current.generation != previous.generation + 1
+                or current.previous_state_sha256 != previous.sha256
+            ):
+                raise Qwen38ChatError(
+                    "layer-transition Compute graph history is unauthenticated"
+                )
+            current = previous
+    except Qwen38ChatError:
+        raise
+    except Exception as exc:
+        raise Qwen38ChatError(
+            "layer-transition Compute graph authority is unavailable or unauthenticated"
+        ) from exc
+    raise Qwen38ChatError(
+        "layer-transition Crystal bank belongs to a foreign Compute graph authority"
+    )
+
+
+def _validate_layer_transition_compute_lineage(
+    bank: LayerTransitionCrystalBank,
+    state: ComputeOperatorGraphState,
+) -> None:
+    """Bind every promoted source crystal to its exact authenticated edge."""
+
+    edges = {edge.sha256: edge for edge in state.edges}
+    for crystal in bank.crystals:
+        source = crystal.source_compute_crystal_sha256
+        edge_sha256 = crystal.source_compute_edge_sha256
+        if source is None and edge_sha256 is None:
+            continue
+        edge = None if edge_sha256 is None else edges.get(edge_sha256)
+        if edge is None or source is None or edge.crystal_sha256 != source:
+            raise Qwen38ChatError(
+                "layer-transition Crystal source lineage differs from Compute graph"
+            )
 
 
 def _token_ids(value: object, label: str) -> tuple[int, ...]:
@@ -421,20 +540,15 @@ def _compact_generation_receipt(
             or not isinstance(raw_forward_passes, int)
             or raw_forward_passes < 0
         ):
-            raise Qwen38ChatError(
-                "generation evidence forward_passes is invalid"
-            )
+            raise Qwen38ChatError("generation evidence forward_passes is invalid")
         for key in expected_fields - {"schema"}:
             item = contract[key]
             if isinstance(item, bool) or not isinstance(item, int) or item < 0:
-                raise Qwen38ChatError(
-                    f"rolling forward contract {key} is invalid"
-                )
+                raise Qwen38ChatError(f"rolling forward contract {key} is invalid")
         if (
             contract["accepted_draft_tokens"] > contract["emitted_tokens"]
             or contract["emitted_tokens"] != len(generated_ids)
-            or contract["prefill_forward_passes"]
-            + contract["round_forward_passes"]
+            or contract["prefill_forward_passes"] + contract["round_forward_passes"]
             != raw_forward_passes
         ):
             raise Qwen38ChatError("rolling forward contract totals are invalid")
@@ -735,17 +849,13 @@ def _anchor_hit_evidence(
         if (
             forward_contract.get("schema")
             != "immer.qwen3.8-rolling-forward-contract/v1"
-            or forward_contract.get("prefill_forward_passes")
-            != prefill_sweeps_executed
-            or forward_contract.get("emitted_tokens")
-            != generation["generated_tokens"]
+            or forward_contract.get("prefill_forward_passes") != prefill_sweeps_executed
+            or forward_contract.get("emitted_tokens") != generation["generated_tokens"]
             or forward_contract.get("prefill_forward_passes", 0)
             + forward_contract.get("round_forward_passes", 0)
             != forward_executed
         ):
-            raise Qwen38ChatError(
-                "anchor rolling forward contract is inconsistent"
-            )
+            raise Qwen38ChatError("anchor rolling forward contract is inconsistent")
     else:
         expected_forwards = (
             generation["generated_tokens"]
@@ -753,9 +863,7 @@ def _anchor_hit_evidence(
             - (1 - final_commit)
         )
         if forward_executed != expected_forwards:
-            raise Qwen38ChatError(
-                "anchor generation forward count is inconsistent"
-            )
+            raise Qwen38ChatError("anchor generation forward count is inconsistent")
     forward_passes_saved = 1 - prefill_sweeps_executed
     forward_baseline = forward_executed + forward_passes_saved
     snapshot_artifact_bytes = (
@@ -866,6 +974,16 @@ class _OwnedRuntime:
         if callable(detach_mlp_page_coordinate):
             try:
                 detach_mlp_page_coordinate(None)
+            except Exception as exc:
+                failures.append(exc)
+        detach_layer_transition_crystal = getattr(
+            self.model,
+            "attach_layer_transition_crystal_bank",
+            None,
+        )
+        if callable(detach_layer_transition_crystal):
+            try:
+                detach_layer_transition_crystal(None)
             except Exception as exc:
                 failures.append(exc)
         self.model.mlp_sparse_executor = None
@@ -1347,6 +1465,10 @@ class Qwen38CausalChat:
         markov_o1_retention_path: str | Path | None = None,
         contextual_continuation_state_path: str | Path | None = None,
         attention_output_crystal_state_path: str | Path | None = None,
+        layer_transition_crystal_state_path: str | Path | None = None,
+        layer_transition_crystal_atlas_path: str | Path | None = None,
+        layer_transition_crystal_compute_root: str | Path | None = None,
+        layer_transition_crystal_max_error_radius: float = 0.0,
         mtp_draft_state_path: str | Path | None = None,
         draft_window_state_path: str | Path | None = None,
         fast_mlp_root: str | Path | None = None,
@@ -1521,6 +1643,43 @@ class Qwen38CausalChat:
             raise TypeError(
                 "attention_output_crystal_state_path must be a local path or None"
             )
+        if layer_transition_crystal_state_path is not None and not isinstance(
+            layer_transition_crystal_state_path,
+            (str, Path),
+        ):
+            raise TypeError(
+                "layer_transition_crystal_state_path must be a local path or None"
+            )
+        if layer_transition_crystal_atlas_path is not None and not isinstance(
+            layer_transition_crystal_atlas_path,
+            (str, Path),
+        ):
+            raise TypeError(
+                "layer_transition_crystal_atlas_path must be a local path or None"
+            )
+        if layer_transition_crystal_compute_root is not None and not isinstance(
+            layer_transition_crystal_compute_root,
+            (str, Path),
+        ):
+            raise TypeError(
+                "layer_transition_crystal_compute_root must be a local path or None"
+            )
+        if (
+            isinstance(layer_transition_crystal_max_error_radius, bool)
+            or not isinstance(
+                layer_transition_crystal_max_error_radius,
+                (int, float),
+            )
+            or not math.isfinite(float(layer_transition_crystal_max_error_radius))
+            or float(layer_transition_crystal_max_error_radius) < 0.0
+        ):
+            raise ValueError(
+                "layer_transition_crystal_max_error_radius must be finite and "
+                "non-negative"
+            )
+        layer_transition_crystal_max_error_radius = float(
+            layer_transition_crystal_max_error_radius
+        )
         if mtp_draft_state_path is not None and not isinstance(
             mtp_draft_state_path, (str, Path)
         ):
@@ -1585,12 +1744,67 @@ class Qwen38CausalChat:
             raise ValueError("contextual continuation Crystals require Q4 execution")
         if attention_output_crystal_state_path is not None and q4_root is None:
             raise ValueError("attention-output Crystals require Q4 execution")
+        if attention_output_crystal_state_path is not None and compute_dtype not in {
+            "auto",
+            "bfloat16",
+        }:
+            raise ValueError("attention-output Crystals require bfloat16 compute_dtype")
+        if layer_transition_crystal_state_path is not None and q4_root is None:
+            raise ValueError("layer-transition Crystals require Q4 execution")
+        if layer_transition_crystal_state_path is not None and compute_dtype not in {
+            "auto",
+            "bfloat16",
+        }:
+            raise ValueError("layer-transition Crystals require bfloat16 compute_dtype")
         if (
-            attention_output_crystal_state_path is not None
-            and compute_dtype not in {"auto", "bfloat16"}
+            layer_transition_crystal_state_path is None
+            and layer_transition_crystal_max_error_radius != 0.0
         ):
             raise ValueError(
-                "attention-output Crystals require bfloat16 compute_dtype"
+                "layer_transition_crystal_max_error_radius requires "
+                "layer_transition_crystal_state_path"
+            )
+        if (
+            layer_transition_crystal_state_path is not None
+            and layer_transition_crystal_atlas_path is None
+        ):
+            raise ValueError(
+                "layer_transition_crystal_state_path requires "
+                "layer_transition_crystal_atlas_path"
+            )
+        if (
+            layer_transition_crystal_state_path is not None
+            and layer_transition_crystal_compute_root is None
+        ):
+            raise ValueError(
+                "layer_transition_crystal_state_path requires "
+                "layer_transition_crystal_compute_root"
+            )
+        if (
+            layer_transition_crystal_state_path is None
+            and layer_transition_crystal_atlas_path is not None
+        ):
+            raise ValueError(
+                "layer_transition_crystal_atlas_path requires "
+                "layer_transition_crystal_state_path"
+            )
+        if (
+            layer_transition_crystal_state_path is None
+            and layer_transition_crystal_compute_root is not None
+        ):
+            raise ValueError(
+                "layer_transition_crystal_compute_root requires "
+                "layer_transition_crystal_state_path"
+            )
+        if layer_transition_crystal_atlas_path is not None:
+            _require_existing_real_directory(
+                Path(layer_transition_crystal_atlas_path).expanduser().absolute(),
+                "layer_transition_crystal_atlas_path",
+            )
+        if layer_transition_crystal_compute_root is not None:
+            _require_existing_real_directory(
+                Path(layer_transition_crystal_compute_root).expanduser().absolute(),
+                "layer_transition_crystal_compute_root",
             )
         if draft_mode not in {"hybrid", "mtp"} and mtp_draft_state_path is not None:
             raise ValueError("mtp_draft_state_path requires MTP or hybrid draft mode")
@@ -1642,9 +1856,7 @@ class Qwen38CausalChat:
                 or delta_head_active_layers
                 != tuple(sorted(set(delta_head_active_layers)))
                 or any(
-                    isinstance(layer, bool)
-                    or not isinstance(layer, int)
-                    or layer < 0
+                    isinstance(layer, bool) or not isinstance(layer, int) or layer < 0
                     for layer in delta_head_active_layers
                 )
             ):
@@ -1688,9 +1900,7 @@ class Qwen38CausalChat:
         if delta_head_state_path is not None and q4_root is None:
             raise ValueError("delta_head_state_path requires Q4 execution")
         if delta_head_active_layers is not None and delta_head_state_path is None:
-            raise ValueError(
-                "delta_head_active_layers requires delta_head_state_path"
-            )
+            raise ValueError("delta_head_active_layers requires delta_head_state_path")
         if mlp_page_state_path is not None:
             if q4_root is None:
                 raise ValueError("mlp_page_state_path requires Q4 execution")
@@ -1699,16 +1909,14 @@ class Qwen38CausalChat:
                     "MLP page routing and legacy Fast-MLP are mutually exclusive"
                 )
             if mlp_page_route_width >= 272:
-                raise ValueError("mlp_page_route_width must leave at least one page out")
+                raise ValueError(
+                    "mlp_page_route_width must leave at least one page out"
+                )
         if mlp_page_coordinate_state_path is not None:
             if q4_root is None or mlp_page_state_path is None:
-                raise ValueError(
-                    "MLP page coordinates require Q4 MLP page routing"
-                )
+                raise ValueError("MLP page coordinates require Q4 MLP page routing")
             if compute_dtype not in {"auto", "bfloat16"}:
-                raise ValueError(
-                    "MLP page coordinates require bfloat16 compute_dtype"
-                )
+                raise ValueError("MLP page coordinates require bfloat16 compute_dtype")
         if q4_root is not None and range_markov_state_path is not None:
             raise ValueError("Q4 execution replaces BF16 range prefetch")
         if result_cell_code_revision is not None and (
@@ -1781,6 +1989,24 @@ class Qwen38CausalChat:
             if attention_output_crystal_state_path is None
             else Path(attention_output_crystal_state_path).expanduser().absolute()
         )
+        self._layer_transition_crystal_state_path = (
+            None
+            if layer_transition_crystal_state_path is None
+            else Path(layer_transition_crystal_state_path).expanduser().absolute()
+        )
+        self._layer_transition_crystal_atlas_path = (
+            None
+            if layer_transition_crystal_atlas_path is None
+            else Path(layer_transition_crystal_atlas_path).expanduser().absolute()
+        )
+        self._layer_transition_crystal_compute_root = (
+            None
+            if layer_transition_crystal_compute_root is None
+            else Path(layer_transition_crystal_compute_root).expanduser().absolute()
+        )
+        self._layer_transition_crystal_max_error_radius = (
+            layer_transition_crystal_max_error_radius
+        )
         self._mtp_draft_state_path = (
             None
             if mtp_draft_state_path is None
@@ -1847,6 +2073,7 @@ class Qwen38CausalChat:
         self._last_exact_head_evidence: dict[str, Any] | None = None
         self._last_prefix_sinkhorn_evidence: dict[str, int] | None = None
         self._last_attention_output_crystal_evidence: dict[str, int] | None = None
+        self._last_layer_transition_crystal_evidence: dict[str, Any] | None = None
         self._last_mlp_page_coordinate_evidence: dict[str, int] | None = None
         self._draft_window_selection: DraftWindowSelection | None = None
         self._action_bank_draft_window_ceiling: int | None = None
@@ -1860,6 +2087,9 @@ class Qwen38CausalChat:
         self._markov_o1_retention: O1MarkovRetention | None = None
         self._contextual_continuation_bank: ContextualContinuationBank | None = None
         self._attention_output_crystal_bank: AttentionOutputCrystalBank | None = None
+        self._layer_transition_crystal_bank: LayerTransitionCrystalBank | None = None
+        self._layer_transition_crystal_atlas: LiveGraph | None = None
+        self._layer_transition_crystal_compute_graph: ComputeOperatorGraph | None = None
         self._mlp_page_coordinate_bank: MlpPageCoordinateBank | None = None
         self._conversation_session_id: str | None = None
         self._conversation_prefix_token_ids: tuple[int, ...] = ()
@@ -1877,12 +2107,18 @@ class Qwen38CausalChat:
         self,
         *,
         prefix_sinkhorn_applied: bool | None = None,
+        layer_transition_crystal_applied: bool | None = None,
     ) -> str:
         if prefix_sinkhorn_applied is not None and not isinstance(
             prefix_sinkhorn_applied,
             bool,
         ):
             raise TypeError("prefix_sinkhorn_applied must be boolean or null")
+        if layer_transition_crystal_applied is not None and not isinstance(
+            layer_transition_crystal_applied,
+            bool,
+        ):
+            raise TypeError("layer_transition_crystal_applied must be boolean or null")
         policy: dict[str, Any] = {
             "anchor_cache_enabled": self._anchor_cache is not None,
             "compute_dtype": self._compute_dtype,
@@ -1993,9 +2229,7 @@ class Qwen38CausalChat:
                         max(0, int(policy["draft_window"]) - 1),
                     ),
                     "provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
-                    "confidence": (
-                        "self-calibrating-dialect-council-lookahead/v9"
-                    ),
+                    "confidence": ("self-calibrating-dialect-council-lookahead/v9"),
                     "empirical_evidence_saturation": 8.0,
                     "composition": {
                         "atoms": ["literal", "relative-prompt-copy"],
@@ -2221,21 +2455,53 @@ class Qwen38CausalChat:
                     if prefix_sinkhorn_applied is None
                     else prefix_sinkhorn_applied
                 ),
-                "schema": (
-                    "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
-                ),
+                "schema": ("immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"),
             }
         if self._attention_output_crystal_state_path is not None:
             bank = self._attention_output_crystal_bank
             policy["attention_output_crystal"] = {
                 "enabled": True,
                 "evidence_schema": ATTENTION_OUTPUT_CRYSTAL_EVIDENCE_SCHEMA,
-                "identity": (
-                    None if bank is None else bank.identity.to_record()
-                ),
+                "identity": (None if bank is None else bank.identity.to_record()),
                 "identity_sha256": (
                     None if bank is None else bank.identity.identity_sha256
                 ),
+            }
+        if self._layer_transition_crystal_state_path is not None:
+            bank = self._layer_transition_crystal_bank
+            identity = None if bank is None else bank.identity
+            if layer_transition_crystal_applied is None:
+                runtime = self._runtime
+                layer_transition_crystal_applied = bool(
+                    bank is not None
+                    and (
+                        runtime is None
+                        or getattr(
+                            runtime.model,
+                            "layer_transition_crystal_enabled",
+                            True,
+                        )
+                    )
+                )
+            policy["layer_transition_crystal"] = {
+                "atlas_revision_sha256": (
+                    None if identity is None else identity.atlas_revision_sha256
+                ),
+                "evidence_schema": LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA,
+                "graph_revision_sha256": (
+                    None if identity is None else identity.graph_revision_sha256
+                ),
+                "identity": None if identity is None else identity.to_record(),
+                "identity_sha256": (
+                    None if identity is None else identity.identity_sha256
+                ),
+                "max_error_radius": (
+                    self._layer_transition_crystal_max_error_radius.hex()
+                ),
+                "model_sha256": (None if identity is None else identity.model_sha256),
+                "q4_sha256": None if identity is None else identity.q4_sha256,
+                "request_applied": layer_transition_crystal_applied,
+                "scope": "private-layer-63-k1/v1",
             }
         if self._q4_root is not None:
             policy["q4"] = {"enabled": True, "threads": self._q4_threads}
@@ -2251,18 +2517,14 @@ class Qwen38CausalChat:
                 "route_width": route_width,
                 "schema": MLP_PAGE_MARKOV_SCHEMA,
                 "terminal_reward": "o1+draft+page-savings-target-work/v1",
-                "width_actions": list(
-                    MlpPageMarkov.width_actions_for(route_width)
-                ),
+                "width_actions": list(MlpPageMarkov.width_actions_for(route_width)),
             }
         if self._mlp_page_coordinate_state_path is not None:
             bank = self._mlp_page_coordinate_bank
             policy["mlp_page_coordinate"] = {
                 "enabled": True,
                 "evidence_schema": MLP_PAGE_COORDINATE_EVIDENCE_SCHEMA,
-                "identity": (
-                    None if bank is None else bank.identity.to_record()
-                ),
+                "identity": (None if bank is None else bank.identity.to_record()),
                 "identity_sha256": (
                     None if bank is None else bank.identity.identity_sha256
                 ),
@@ -2384,10 +2646,7 @@ class Qwen38CausalChat:
             if contextual_continuation_enabled is None
             else contextual_continuation_enabled
         )
-        if (
-            self._draft_mode in {"hybrid", "markov"}
-            and context_enabled
-        ):
+        if self._draft_mode in {"hybrid", "markov"} and context_enabled:
             bank = self._contextual_continuation_bank
             provider["contextual_continuation_crystal"] = {
                 "identity_sha256": (
@@ -2400,14 +2659,10 @@ class Qwen38CausalChat:
             "draft_feedback_schema": DRAFT_WINDOW_FEEDBACK_SCHEMA,
             "mlp_page_enabled": self._mlp_page_state_path is not None,
             "mlp_page_policy": (
-                None
-                if self._mlp_page_state_path is None
-                else mlp_page_policy
+                None if self._mlp_page_state_path is None else mlp_page_policy
             ),
             "mlp_page_schema": (
-                None
-                if self._mlp_page_state_path is None
-                else mlp_page_schema
+                None if self._mlp_page_state_path is None else mlp_page_schema
             ),
             "o1_enabled": self._markov_o1_retention_path is not None,
             "policy": "o1+draft+page-savings-target-work/v1",
@@ -2436,6 +2691,7 @@ class Qwen38CausalChat:
         rendered_prompt: str,
         prompt_ids: tuple[int, ...],
         prefix_sinkhorn_applied: bool,
+        layer_transition_crystal_applied: bool,
     ) -> dict[str, Any] | None:
         code_revision = self._result_cell_code_revision
         if code_revision is None:
@@ -2476,6 +2732,7 @@ class Qwen38CausalChat:
             generation_policy_sha256=(
                 self._result_cell_generation_policy_sha256(
                     prefix_sinkhorn_applied=prefix_sinkhorn_applied,
+                    layer_transition_crystal_applied=(layer_transition_crystal_applied),
                 )
             ),
         )
@@ -2493,6 +2750,7 @@ class Qwen38CausalChat:
             or self._q4_root is None
             or self._delta_head_state_path is not None
             or self._native_head_crsa is not None
+            or self._layer_transition_crystal_state_path is not None
         ):
             return None
         from .cartography_probe import prompt_token_sha256
@@ -2516,9 +2774,7 @@ class Qwen38CausalChat:
         semantics = QwenOutputSemantics(
             repo_id=OFFICIAL_REPO_ID,
             revision=OFFICIAL_REVISION,
-            q4_manifest_file_sha256=_file_sha256(
-                self._q4_root / "manifest.json"
-            ),
+            q4_manifest_file_sha256=_file_sha256(self._q4_root / "manifest.json"),
             q4_native_abi=Q4_NATIVE_ABI,
             q4_bank_codec_abi=Q4_BANK_CODEC_ABI,
             tokenizer_sha256=tokenizer_sha256,
@@ -2604,7 +2860,11 @@ class Qwen38CausalChat:
         session_id: str | None,
     ) -> bool:
         prefix = self._conversation_prefix_token_ids
-        if session_id is None or self._conversation_session_id != session_id or not prefix:
+        if (
+            session_id is None
+            or self._conversation_session_id != session_id
+            or not prefix
+        ):
             return False
         next_position, poisoned, _state_bytes, batch_size = _anchor_model_state(
             runtime.model
@@ -2774,6 +3034,7 @@ class Qwen38CausalChat:
         self._last_exact_head_evidence = None
         self._last_prefix_sinkhorn_evidence = None
         self._last_attention_output_crystal_evidence = None
+        self._last_layer_transition_crystal_evidence = None
         self._last_mlp_page_coordinate_evidence = None
         fast_mount = getattr(runtime, "fast_mlp_mount", None)
         fast_before = None if fast_mount is None else fast_mount.metrics()
@@ -2803,26 +3064,21 @@ class Qwen38CausalChat:
             )
         )
         effective_directive_ceiling = (
-            None
-            if not eligible_directive_windows
-            else max(eligible_directive_windows)
+            None if not eligible_directive_windows else max(eligible_directive_windows)
         )
         controller_window_overridden = bool(
             effective_draft_mode is not None
             and effective_directive_ceiling is not None
             and (
                 adaptive_selection is None
-                or effective_directive_ceiling
-                != adaptive_selection.proposed_window
+                or effective_directive_ceiling != adaptive_selection.proposed_window
             )
         )
         if controller_window_overridden:
             adaptive_selection = None
             self._draft_window_selection = None
         self._action_bank_draft_window_ceiling = (
-            effective_directive_ceiling
-            if effective_draft_mode is not None
-            else None
+            effective_directive_ceiling if effective_draft_mode is not None else None
         )
         retention = self._markov_o1_retention
 
@@ -2901,7 +3157,9 @@ class Qwen38CausalChat:
                 atlas=self._markov_atlas,
                 episode_scorer=None if retention is None else score_episode,
                 episode_priority=None if retention is None else retention.priority,
-                episode_priority_store=None if retention is None else retention.remember,
+                episode_priority_store=None
+                if retention is None
+                else retention.remember,
                 contextual_continuation_bank=self._contextual_continuation_bank,
             )
         elif effective_draft_mode == "mtp":
@@ -2922,7 +3180,9 @@ class Qwen38CausalChat:
                 atlas=self._markov_atlas,
                 episode_scorer=None if retention is None else score_episode,
                 episode_priority=None if retention is None else retention.priority,
-                episode_priority_store=None if retention is None else retention.remember,
+                episode_priority_store=None
+                if retention is None
+                else retention.remember,
                 contextual_continuation_bank=self._contextual_continuation_bank,
             )
 
@@ -2995,9 +3255,7 @@ class Qwen38CausalChat:
                 and hasattr(row, "forward_passes")
                 for row in round_rows
             )
-            prefill_forward_passes = int(
-                getattr(evidence, "prefill_forward_passes", 0)
-            )
+            prefill_forward_passes = int(getattr(evidence, "prefill_forward_passes", 0))
             rolling_forward_contract = {
                 "accepted_draft_tokens": (
                     sum(row.accepted_prefix_length for row in round_rows)
@@ -3483,14 +3741,11 @@ class Qwen38CausalChat:
             None,
         )
         if not callable(metrics) or not callable(identity):
-            raise Qwen38ChatError(
-                "runtime model lacks Prefix-Sinkhorn action metrics"
-            )
+            raise Qwen38ChatError("runtime model lacks Prefix-Sinkhorn action metrics")
         record = metrics()
         if (
             not isinstance(record, Mapping)
-            or record.get("schema")
-            != "immer.qwen3.8-prefix-sinkhorn-action-metrics/v1"
+            or record.get("schema") != "immer.qwen3.8-prefix-sinkhorn-action-metrics/v1"
             or record.get("action_identity_sha256") != identity()
             or record.get("physical_replacement")
             is not self._native_head_crsa.physical_replacement
@@ -3502,14 +3757,8 @@ class Qwen38CausalChat:
             "base_softmax_probability_elements_skipped",
         ):
             value = record.get(field)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-            ):
-                raise Qwen38ChatError(
-                    f"Prefix-Sinkhorn action {field} is invalid"
-                )
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise Qwen38ChatError(f"Prefix-Sinkhorn action {field} is invalid")
             counters[field] = value
         return counters
 
@@ -3528,9 +3777,7 @@ class Qwen38CausalChat:
             )
         }
         if any(value < 0 for value in request.values()):
-            raise Qwen38ChatError(
-                "Prefix-Sinkhorn request counters moved backwards"
-            )
+            raise Qwen38ChatError("Prefix-Sinkhorn request counters moved backwards")
         self._last_prefix_sinkhorn_evidence = request
         return request
 
@@ -3541,14 +3788,10 @@ class Qwen38CausalChat:
         metrics = bank.metrics()
         to_dict = getattr(metrics, "to_dict", None)
         if not callable(to_dict):
-            raise Qwen38ChatError(
-                "attention-output Crystal metrics lack to_dict()"
-            )
+            raise Qwen38ChatError("attention-output Crystal metrics lack to_dict()")
         record = to_dict()
         if not isinstance(record, Mapping):
-            raise Qwen38ChatError(
-                "attention-output Crystal metrics are not a mapping"
-            )
+            raise Qwen38ChatError("attention-output Crystal metrics are not a mapping")
         identity_sha256 = record.get("identity_sha256")
         if identity_sha256 != bank.identity.identity_sha256:
             raise Qwen38ChatError(
@@ -3561,14 +3804,8 @@ class Qwen38CausalChat:
             "logical_projection_bytes_saved",
         ):
             value = record.get(field)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-            ):
-                raise Qwen38ChatError(
-                    f"attention-output Crystal {field} is invalid"
-                )
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise Qwen38ChatError(f"attention-output Crystal {field} is invalid")
             counters[field] = value
         return counters
 
@@ -3582,9 +3819,7 @@ class Qwen38CausalChat:
         fields = {
             "hits": "hit_count",
             "skipped_projection_calls": "skipped_projection_calls_saved",
-            "logical_projection_bytes_saved": (
-                "logical_projection_bytes_saved"
-            ),
+            "logical_projection_bytes_saved": ("logical_projection_bytes_saved"),
         }
         request = {
             output: int(after[source]) - int(before[source])
@@ -3597,6 +3832,107 @@ class Qwen38CausalChat:
         self._last_attention_output_crystal_evidence = request
         return request
 
+    def _layer_transition_crystal_metrics(
+        self,
+        runtime: Any,
+    ) -> dict[str, int] | None:
+        bank = self._layer_transition_crystal_bank
+        if bank is None:
+            return None
+        metrics = getattr(
+            runtime.model,
+            "layer_transition_crystal_metrics",
+            None,
+        )
+        if not callable(metrics):
+            raise Qwen38ChatError(
+                "runtime model lacks layer-transition Crystal metrics"
+            )
+        record = metrics()
+        if not isinstance(record, Mapping):
+            raise Qwen38ChatError("layer-transition Crystal metrics are not a mapping")
+        if record.get("schema") != (
+            "immer.qwen3.8-layer-transition-crystal-metrics/v1"
+        ):
+            raise Qwen38ChatError("layer-transition Crystal metrics schema is invalid")
+        identity = bank.identity
+        expected_pins = {
+            "atlas_revision_sha256": identity.atlas_revision_sha256,
+            "graph_revision_sha256": identity.graph_revision_sha256,
+            "identity_sha256": identity.identity_sha256,
+            "model_sha256": identity.model_sha256,
+            "q4_sha256": identity.q4_sha256,
+        }
+        if any(record.get(field) != value for field, value in expected_pins.items()):
+            raise Qwen38ChatError(
+                "layer-transition Crystal metrics changed runtime identity"
+            )
+        radius = record.get("max_error_radius")
+        if (
+            isinstance(radius, bool)
+            or not isinstance(radius, (int, float))
+            or not math.isfinite(float(radius))
+            or float(radius) != self._layer_transition_crystal_max_error_radius
+        ):
+            raise Qwen38ChatError(
+                "layer-transition Crystal metrics changed the error budget"
+            )
+        if not isinstance(record.get("enabled"), bool):
+            raise Qwen38ChatError("layer-transition Crystal enabled metric is invalid")
+        counters: dict[str, int] = {}
+        for field in (
+            "attempts",
+            "exact_kv_state_updates",
+            "fallbacks",
+            "packed_weight_bytes_avoided",
+            "physical_transitions",
+            "replacements",
+            "skipped_q4_matrix_calls",
+        ):
+            value = record.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise Qwen38ChatError(f"layer-transition Crystal {field} is invalid")
+            counters[field] = value
+        return counters
+
+    def _record_layer_transition_crystal_request(
+        self,
+        before: Mapping[str, int] | None,
+        after: Mapping[str, int] | None,
+    ) -> dict[str, Any] | None:
+        bank = self._layer_transition_crystal_bank
+        if before is None or after is None or bank is None:
+            return None
+        request: dict[str, Any] = {
+            field: int(after[field]) - int(before[field])
+            for field in (
+                "attempts",
+                "exact_kv_state_updates",
+                "fallbacks",
+                "packed_weight_bytes_avoided",
+                "physical_transitions",
+                "replacements",
+                "skipped_q4_matrix_calls",
+            )
+        }
+        if any(value < 0 for value in request.values()):
+            raise Qwen38ChatError(
+                "layer-transition Crystal request counters moved backwards"
+            )
+        identity = bank.identity
+        request.update(
+            {
+                "atlas_revision_sha256": identity.atlas_revision_sha256,
+                "graph_revision_sha256": identity.graph_revision_sha256,
+                "identity_sha256": identity.identity_sha256,
+                "max_error_radius": (self._layer_transition_crystal_max_error_radius),
+                "model_sha256": identity.model_sha256,
+                "q4_sha256": identity.q4_sha256,
+            }
+        )
+        self._last_layer_transition_crystal_evidence = request
+        return request
+
     def _mlp_page_coordinate_metrics(self) -> dict[str, int] | None:
         bank = self._mlp_page_coordinate_bank
         if bank is None:
@@ -3604,14 +3940,10 @@ class Qwen38CausalChat:
         metrics = bank.metrics()
         to_dict = getattr(metrics, "to_dict", None)
         if not callable(to_dict):
-            raise Qwen38ChatError(
-                "MLP page coordinate metrics lack to_dict()"
-            )
+            raise Qwen38ChatError("MLP page coordinate metrics lack to_dict()")
         record = to_dict()
         if not isinstance(record, Mapping):
-            raise Qwen38ChatError(
-                "MLP page coordinate metrics are not a mapping"
-            )
+            raise Qwen38ChatError("MLP page coordinate metrics are not a mapping")
         if record.get("identity_sha256") != bank.identity.identity_sha256:
             raise Qwen38ChatError(
                 "MLP page coordinate metrics changed runtime identity"
@@ -3623,14 +3955,8 @@ class Qwen38CausalChat:
             "logical_page_weight_bytes_saved",
         ):
             value = record.get(field)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value < 0
-            ):
-                raise Qwen38ChatError(
-                    f"MLP page coordinate {field} is invalid"
-                )
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise Qwen38ChatError(f"MLP page coordinate {field} is invalid")
             counters[field] = value
         return counters
 
@@ -3644,9 +3970,7 @@ class Qwen38CausalChat:
         fields = {
             "hits": "hit_count",
             "physical_pages_saved": "physical_pages_saved",
-            "logical_page_weight_bytes_saved": (
-                "logical_page_weight_bytes_saved"
-            ),
+            "logical_page_weight_bytes_saved": ("logical_page_weight_bytes_saved"),
         }
         request = {
             output: int(after[source]) - int(before[source])
@@ -3686,16 +4010,12 @@ class Qwen38CausalChat:
                 "active": (
                     self._native_head_crsa.active
                     if runtime is None
-                    else bool(
-                        getattr(runtime.model, "native_head_crsa_enabled", False)
-                    )
+                    else bool(getattr(runtime.model, "native_head_crsa_enabled", False))
                 ),
                 "available": self._native_head_crsa.active,
                 "configuration": asdict(self._native_head_crsa),
                 "operator_evidence_schema": self._native_head_crsa.evidence_schema,
-                "schema": (
-                    "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
-                ),
+                "schema": ("immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"),
             }
         if self._draft_runtime is not None:
             evidence["draft_bundle"] = dict(self._draft_runtime.bundle_receipt)
@@ -3735,9 +4055,7 @@ class Qwen38CausalChat:
         if range_prefetcher is not None:
             evidence["range_markov"] = range_prefetcher.metrics()
         if self._markov_o1_retention is not None:
-            evidence["o1_markov_retention"] = (
-                self._markov_o1_retention.metrics()
-            )
+            evidence["o1_markov_retention"] = self._markov_o1_retention.metrics()
         if self._contextual_continuation_bank is not None:
             evidence["contextual_continuation"] = (
                 self._contextual_continuation_bank.metrics().to_dict()
@@ -3748,6 +4066,18 @@ class Qwen38CausalChat:
                 "identity": identity.to_record(),
                 "identity_sha256": identity.identity_sha256,
                 "schema": ATTENTION_OUTPUT_CRYSTAL_EVIDENCE_SCHEMA,
+            }
+        if self._layer_transition_crystal_bank is not None:
+            identity = self._layer_transition_crystal_bank.identity
+            evidence["layer_transition_crystal"] = {
+                "atlas_revision_sha256": identity.atlas_revision_sha256,
+                "graph_revision_sha256": identity.graph_revision_sha256,
+                "identity": identity.to_record(),
+                "identity_sha256": identity.identity_sha256,
+                "max_error_radius": (self._layer_transition_crystal_max_error_radius),
+                "model_sha256": identity.model_sha256,
+                "q4_sha256": identity.q4_sha256,
+                "schema": LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA,
             }
         if self._mlp_page_coordinate_bank is not None:
             identity = self._mlp_page_coordinate_bank.identity
@@ -3849,9 +4179,7 @@ class Qwen38CausalChat:
                                 if self._native_head_crsa is None
                                 else asdict(self._native_head_crsa)
                             ),
-                            "schema": (
-                                "immer.qwen3.8-contextual-runtime-identity/v1"
-                            ),
+                            "schema": ("immer.qwen3.8-contextual-runtime-identity/v1"),
                         }
                     ),
                     model_sha256=_digest(
@@ -3920,6 +4248,86 @@ class Qwen38CausalChat:
                         "runtime model must attach attention-output Crystal banks"
                     )
                 attach_bank(attention_output_crystal_bank)
+            layer_transition_crystal_bank = None
+            layer_transition_crystal_atlas = None
+            layer_transition_crystal_compute_graph = None
+            if self._layer_transition_crystal_state_path is not None:
+                layer_transition_crystal_bank = LayerTransitionCrystalBank.load(
+                    self._layer_transition_crystal_state_path
+                )
+                identity = getattr(layer_transition_crystal_bank, "identity", None)
+                if not isinstance(identity, LayerTransitionCrystalIdentity):
+                    raise Qwen38ChatError(
+                        "layer-transition Crystal bank identity is invalid"
+                    )
+                atlas_path = self._layer_transition_crystal_atlas_path
+                if atlas_path is None:  # Constructor validation is fail-closed.
+                    raise Qwen38ChatError(
+                        "layer-transition Crystal bank lacks an Atlas authority"
+                    )
+                layer_transition_crystal_atlas = _open_layer_transition_crystal_atlas(
+                    atlas_path,
+                    atlas_revision_sha256=identity.atlas_revision_sha256,
+                )
+                compute_root = self._layer_transition_crystal_compute_root
+                if compute_root is None:  # Constructor validation is fail-closed.
+                    raise Qwen38ChatError(
+                        "layer-transition Crystal bank lacks a Compute graph authority"
+                    )
+                (
+                    layer_transition_crystal_compute_graph,
+                    layer_transition_crystal_compute_state,
+                ) = _open_layer_transition_crystal_compute_graph(
+                    compute_root,
+                    graph_revision_sha256=identity.graph_revision_sha256,
+                )
+                _validate_layer_transition_compute_lineage(
+                    layer_transition_crystal_bank,
+                    layer_transition_crystal_compute_state,
+                )
+                model_pin = getattr(
+                    model,
+                    "layer_transition_crystal_model_sha256",
+                    None,
+                )
+                q4_pin = getattr(
+                    model,
+                    "layer_transition_crystal_q4_sha256",
+                    None,
+                )
+                if not callable(model_pin) or not callable(q4_pin):
+                    raise TypeError(
+                        "runtime model lacks layer-transition Crystal identity pins"
+                    )
+                live_model_sha256 = model_pin()
+                live_q4_sha256 = q4_pin()
+                if not _is_sha256(live_model_sha256) or not _is_sha256(live_q4_sha256):
+                    raise Qwen38ChatError(
+                        "runtime model returned invalid layer-transition Crystal pins"
+                    )
+                if identity.model_sha256 != live_model_sha256:
+                    raise Qwen38ChatError(
+                        "layer-transition Crystal model pin differs from target"
+                    )
+                if identity.q4_sha256 != live_q4_sha256:
+                    raise Qwen38ChatError(
+                        "layer-transition Crystal Q4 pin differs from target"
+                    )
+                attach_bank = getattr(
+                    model,
+                    "attach_layer_transition_crystal_bank",
+                    None,
+                )
+                if not callable(attach_bank):
+                    raise TypeError(
+                        "runtime model must attach layer-transition Crystal banks"
+                    )
+                attach_bank(
+                    layer_transition_crystal_bank,
+                    max_error_radius=(self._layer_transition_crystal_max_error_radius),
+                    graph_revision_sha256=identity.graph_revision_sha256,
+                    atlas_revision_sha256=identity.atlas_revision_sha256,
+                )
             mlp_page_coordinate_bank = None
             if self._mlp_page_coordinate_state_path is not None:
                 configured_delta_router = getattr(
@@ -3944,14 +4352,11 @@ class Qwen38CausalChat:
                     None,
                 )
                 if not callable(runtime_math_identity):
-                    raise TypeError(
-                        "runtime model lacks MLP page coordinate identity"
-                    )
+                    raise TypeError("runtime model lacks MLP page coordinate identity")
                 runtime_math_sha256 = runtime_math_identity()
                 if not _is_sha256(runtime_math_sha256):
                     raise Qwen38ChatError(
-                        "runtime model returned an invalid MLP page "
-                        "coordinate identity"
+                        "runtime model returned an invalid MLP page coordinate identity"
                     )
                 q4_bank = getattr(runtime, "q4_bank", None)
                 if q4_bank is None:
@@ -3973,14 +4378,10 @@ class Qwen38CausalChat:
                     )
                 page_router_identity = snapshot_identity()
                 if not isinstance(page_router_identity, Mapping):
-                    raise Qwen38ChatError(
-                        "MLP page router identity is invalid"
-                    )
+                    raise Qwen38ChatError("MLP page router identity is invalid")
                 coordinate_identity = MlpPageCoordinateIdentity(
                     runtime_math_sha256=runtime_math_sha256,
-                    q4_identity_sha256=_transport_neutral_digest(
-                        dict(q4_identity)
-                    ),
+                    q4_identity_sha256=_transport_neutral_digest(dict(q4_identity)),
                     page_router_identity_sha256=_transport_neutral_digest(
                         dict(page_router_identity)
                     ),
@@ -4041,6 +4442,11 @@ class Qwen38CausalChat:
         self._markov_o1_retention = markov_o1_retention
         self._contextual_continuation_bank = contextual_continuation_bank
         self._attention_output_crystal_bank = attention_output_crystal_bank
+        self._layer_transition_crystal_bank = layer_transition_crystal_bank
+        self._layer_transition_crystal_atlas = layer_transition_crystal_atlas
+        self._layer_transition_crystal_compute_graph = (
+            layer_transition_crystal_compute_graph
+        )
         self._mlp_page_coordinate_bank = mlp_page_coordinate_bank
         return runtime
 
@@ -4165,8 +4571,7 @@ class Qwen38CausalChat:
             and "lm_head_coordinate" in action_directive.disabled_actions
         )
         lm_head_coordinate_applied = (
-            lm_head_index is not None
-            and not lm_head_coordinate_explicitly_disabled
+            lm_head_index is not None and not lm_head_coordinate_explicitly_disabled
         )
         restore_lm_head_index = None
         if lm_head_index is not None and lm_head_coordinate_explicitly_disabled:
@@ -4181,9 +4586,7 @@ class Qwen38CausalChat:
                 )
             restore_lm_head_index(None)
         delta_head_router = getattr(runtime, "delta_head_router", None)
-        delta_head_directive_selected = (
-            "mlp_head_coordinate" in effective_qwen_actions
-        )
+        delta_head_directive_selected = "mlp_head_coordinate" in effective_qwen_actions
         delta_head_applied = (
             delta_head_router is not None and delta_head_directive_selected
         )
@@ -4201,9 +4604,7 @@ class Qwen38CausalChat:
             set_delta_head_router(None)
 
         prefix_sinkhorn_configured = self._native_head_crsa is not None
-        prefix_sinkhorn_directive_selected = (
-            "prefix_sinkhorn" in effective_qwen_actions
-        )
+        prefix_sinkhorn_directive_selected = "prefix_sinkhorn" in effective_qwen_actions
         prefix_sinkhorn_explicitly_disabled = (
             action_directive is not None
             and "prefix_sinkhorn" in action_directive.disabled_actions
@@ -4276,9 +4677,11 @@ class Qwen38CausalChat:
         )
         set_attention_output_crystal_enabled = None
         if self._attention_output_crystal_bank is not None:
-            attention_output_crystal_applied = not delta_head_applied and (
-                not prefix_sinkhorn_configured or prefix_sinkhorn_applied
-            ) and not attention_output_crystal_explicitly_disabled
+            attention_output_crystal_applied = (
+                not delta_head_applied
+                and (not prefix_sinkhorn_configured or prefix_sinkhorn_applied)
+                and not attention_output_crystal_explicitly_disabled
+            )
             attention_output_crystal_directive_selected = (
                 "attention_output_crystal" in effective_qwen_actions
             )
@@ -4291,9 +4694,7 @@ class Qwen38CausalChat:
                 raise Qwen38ChatError(
                     "runtime model cannot select attention-output Crystal execution"
                 )
-            set_attention_output_crystal_enabled(
-                attention_output_crystal_applied
-            )
+            set_attention_output_crystal_enabled(attention_output_crystal_applied)
         mlp_page_coordinate_applied = False
         mlp_page_coordinate_directive_selected = False
         mlp_page_coordinate_explicitly_disabled = (
@@ -4301,9 +4702,11 @@ class Qwen38CausalChat:
             and "mlp_page_coordinate" in action_directive.disabled_actions
         )
         if self._mlp_page_coordinate_bank is not None:
-            mlp_page_coordinate_applied = not delta_head_applied and (
-                not prefix_sinkhorn_configured or prefix_sinkhorn_applied
-            ) and not mlp_page_coordinate_explicitly_disabled
+            mlp_page_coordinate_applied = (
+                not delta_head_applied
+                and (not prefix_sinkhorn_configured or prefix_sinkhorn_applied)
+                and not mlp_page_coordinate_explicitly_disabled
+            )
             mlp_page_coordinate_directive_selected = (
                 "mlp_page_coordinate" in effective_qwen_actions
             )
@@ -4317,6 +4720,28 @@ class Qwen38CausalChat:
                     "runtime model cannot select MLP page coordinate execution"
                 )
             set_mlp_page_coordinate_enabled(mlp_page_coordinate_applied)
+        layer_transition_crystal_directive_selected = (
+            "layer_transition_crystal" in effective_qwen_actions
+        )
+        layer_transition_crystal_explicitly_disabled = (
+            action_directive is not None
+            and "layer_transition_crystal" in action_directive.disabled_actions
+        )
+        layer_transition_crystal_applied = (
+            self._layer_transition_crystal_bank is not None
+            and not layer_transition_crystal_explicitly_disabled
+        )
+        if self._layer_transition_crystal_bank is not None:
+            set_layer_transition_crystal_enabled = getattr(
+                runtime.model,
+                "set_layer_transition_crystal_enabled",
+                None,
+            )
+            if not callable(set_layer_transition_crystal_enabled):
+                raise Qwen38ChatError(
+                    "runtime model cannot select layer-transition Crystal execution"
+                )
+            set_layer_transition_crystal_enabled(layer_transition_crystal_applied)
         if delta_head_applied:
             assert callable(set_delta_head_router)
             set_delta_head_router(delta_head_router)
@@ -4345,9 +4770,7 @@ class Qwen38CausalChat:
                 and prompt_ids[: len(stored_prefix)] == stored_prefix
             )
             state_matches = (
-                not poisoned
-                and batch_size == 1
-                and next_position == len(stored_prefix)
+                not poisoned and batch_size == 1 and next_position == len(stored_prefix)
             )
             if prefix_matches and state_matches:
                 reused_prefix_tokens = len(stored_prefix)
@@ -4563,9 +4986,7 @@ class Qwen38CausalChat:
                 raise
             self._pending_page_runtime_reward = None
             self._page_reward_retry_failed = False
-        mlp_page_before = (
-            None if mlp_page_router is None else mlp_page_router.metrics()
-        )
+        mlp_page_before = None if mlp_page_router is None else mlp_page_router.metrics()
         page_reward_begin = getattr(
             mlp_page_router,
             "begin_runtime_reward",
@@ -4581,8 +5002,9 @@ class Qwen38CausalChat:
                 retention_before_sequence = sequence
         physical_read_before = _linux_process_read_bytes()
         prefix_sinkhorn_before = self._prefix_sinkhorn_metrics(runtime)
-        attention_output_crystal_before = (
-            self._attention_output_crystal_metrics()
+        attention_output_crystal_before = self._attention_output_crystal_metrics()
+        layer_transition_crystal_before = self._layer_transition_crystal_metrics(
+            runtime
         )
         mlp_page_coordinate_before = self._mlp_page_coordinate_metrics()
         request_started = time.perf_counter()
@@ -4601,11 +5023,8 @@ class Qwen38CausalChat:
             runtime.model.reset_state(release=True)
             self._clear_conversation_binding()
             set_delta_head_router(None)
-            prefix_banks_compatible = (
-                self._native_head_crsa is None
-                or bool(
-                    getattr(runtime.model, "native_head_crsa_enabled", False)
-                )
+            prefix_banks_compatible = self._native_head_crsa is None or bool(
+                getattr(runtime.model, "native_head_crsa_enabled", False)
             )
             if (
                 self._attention_output_crystal_bank is not None
@@ -4621,10 +5040,7 @@ class Qwen38CausalChat:
                         "runtime model lost attention-output Crystal selection"
                     )
                 set_attention_output_crystal_enabled(True)
-            if (
-                self._mlp_page_coordinate_bank is not None
-                and prefix_banks_compatible
-            ):
+            if self._mlp_page_coordinate_bank is not None and prefix_banks_compatible:
                 set_mlp_page_coordinate_enabled = getattr(
                     runtime.model,
                     "set_mlp_page_coordinate_enabled",
@@ -4638,6 +5054,10 @@ class Qwen38CausalChat:
         self._record_attention_output_crystal_request(
             attention_output_crystal_before,
             self._attention_output_crystal_metrics(),
+        )
+        self._record_layer_transition_crystal_request(
+            layer_transition_crystal_before,
+            self._layer_transition_crystal_metrics(runtime),
         )
         self._record_prefix_sinkhorn_request(
             prefix_sinkhorn_before,
@@ -4656,9 +5076,7 @@ class Qwen38CausalChat:
                 mlp_page_persistence_error = (
                     f"{type(exc).__module__}.{type(exc).__qualname__}: {exc}"
                 )
-        mlp_page_after = (
-            None if mlp_page_router is None else mlp_page_router.metrics()
-        )
+        mlp_page_after = None if mlp_page_router is None else mlp_page_router.metrics()
         physical_read_after = _linux_process_read_bytes()
         generated_ids = _token_ids(raw_generated, "generated output")
         if len(generated_ids) > self._max_new_tokens:
@@ -4845,14 +5263,19 @@ class Qwen38CausalChat:
         if action_directive is not None:
             evidence["inference_action_directive"] = {
                 "applied": {
-                    "attention_output_crystal": (
-                        attention_output_crystal_applied
-                    ),
+                    "attention_output_crystal": (attention_output_crystal_applied),
                     "attention_output_crystal_directive_selected": (
                         attention_output_crystal_directive_selected
                     ),
                     "attention_output_crystal_explicitly_disabled": (
                         attention_output_crystal_explicitly_disabled
+                    ),
+                    "layer_transition_crystal": (layer_transition_crystal_applied),
+                    "layer_transition_crystal_directive_selected": (
+                        layer_transition_crystal_directive_selected
+                    ),
+                    "layer_transition_crystal_explicitly_disabled": (
+                        layer_transition_crystal_explicitly_disabled
                     ),
                     "mlp_head_coordinate": delta_head_applied,
                     "mlp_head_coordinate_directive_selected": (
@@ -4883,9 +5306,7 @@ class Qwen38CausalChat:
                     "draft_window_ceiling": (
                         None
                         if self._last_draft_evidence is None
-                        else self._last_draft_evidence.get(
-                            "action_bank_window_ceiling"
-                        )
+                        else self._last_draft_evidence.get("action_bank_window_ceiling")
                     ),
                 },
                 "directive": action_directive.to_document(),
@@ -4914,9 +5335,15 @@ class Qwen38CausalChat:
         if self._last_attention_output_crystal_evidence is not None:
             evidence["attention_output_crystal"] = {
                 **dict(evidence["attention_output_crystal"]),
-                "request": dict(
-                    self._last_attention_output_crystal_evidence
-                ),
+                "request": dict(self._last_attention_output_crystal_evidence),
+            }
+        if self._last_layer_transition_crystal_evidence is not None:
+            evidence["layer_transition_crystal"] = {
+                **dict(evidence["layer_transition_crystal"]),
+                "directive_selected": (layer_transition_crystal_directive_selected),
+                "explicitly_disabled": (layer_transition_crystal_explicitly_disabled),
+                "request": dict(self._last_layer_transition_crystal_evidence),
+                "request_applied": layer_transition_crystal_applied,
             }
         if self._last_mlp_page_coordinate_evidence is not None:
             evidence["mlp_page_coordinate"] = {
@@ -5003,6 +5430,7 @@ class Qwen38CausalChat:
             rendered_prompt=prompt,
             prompt_ids=prompt_ids,
             prefix_sinkhorn_applied=prefix_sinkhorn_applied,
+            layer_transition_crystal_applied=layer_transition_crystal_applied,
         )
         if result_cell_binding is not None:
             evidence["result_cell_binding_receipt"] = result_cell_binding
@@ -5063,9 +5491,7 @@ class Qwen38CausalChat:
                     self._validated_conversation_mtp_carry = carry
                     conversation_evidence["mtp_carry_bytes"] = carry.state_bytes
                     conversation_evidence["mtp_carry_status"] = (
-                        "reused+stored"
-                        if mtp_carry_reused_tokens
-                        else "stored"
+                        "reused+stored" if mtp_carry_reused_tokens else "stored"
                     )
                 else:
                     self._conversation_mtp_carry = None
@@ -5189,10 +5615,14 @@ class Qwen38CausalChat:
         if pending is None:
             return result
         runtime = self._runtime
-        page_router = None if runtime is None else getattr(
-            runtime,
-            "mlp_page_router",
-            None,
+        page_router = (
+            None
+            if runtime is None
+            else getattr(
+                runtime,
+                "mlp_page_router",
+                None,
+            )
         )
         if failure_outcome is not None:
             if self._page_reward_retry_failed:
@@ -5340,14 +5770,11 @@ class Qwen38CausalChat:
                         "runtime model lost Delta head coordinate selection"
                     )
                 setter(None)
-                prefix_banks_compatible = (
-                    self._native_head_crsa is None
-                    or bool(
-                        getattr(
-                            runtime.model,
-                            "native_head_crsa_enabled",
-                            False,
-                        )
+                prefix_banks_compatible = self._native_head_crsa is None or bool(
+                    getattr(
+                        runtime.model,
+                        "native_head_crsa_enabled",
+                        False,
                     )
                 )
                 if (
@@ -5455,9 +5882,7 @@ class Qwen38CausalChat:
                 )
                 finalized = self._finalize_page_runtime_reward_result(
                     finalized,
-                    failure_outcome=(
-                        "aborted" if abort is not None else "error"
-                    ),
+                    failure_outcome=("aborted" if abort is not None else "error"),
                 )
                 if abort is not None:
                     raise abort
@@ -5535,6 +5960,9 @@ class Qwen38CausalChat:
             self._markov_o1_retention = None
             self._contextual_continuation_bank = None
             self._attention_output_crystal_bank = None
+            self._layer_transition_crystal_bank = None
+            self._layer_transition_crystal_atlas = None
+            self._layer_transition_crystal_compute_graph = None
             self._mlp_page_coordinate_bank = None
             self._clear_conversation_binding()
             self._closed = True
@@ -5566,6 +5994,7 @@ __all__ = [
     "QWEN38_CHAT_HISTORY_METADATA",
     "QWEN38_CHAT_SESSION_METADATA",
     "QWEN38_INFERENCE_ACTION_METADATA",
+    "LAYER_TRANSITION_CRYSTAL_EVIDENCE_SCHEMA",
     "RESULT_CELL_GENERATION_POLICY_SCHEMA",
     "Qwen38CausalChat",
     "Qwen38Chat",

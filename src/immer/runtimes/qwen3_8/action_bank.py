@@ -30,6 +30,7 @@ ACTION_CATALOG = (
     "dynamic_mlp_pages",
     "external_drafter",
     "fertig_exact",
+    "layer_transition_crystal",
     "lm_head_coordinate",
     "mlp_head_coordinate",
     "mlp_page_coordinate",
@@ -63,8 +64,7 @@ def physical_prefix_sinkhorn_executed(value: object) -> bool:
 
     if (
         not isinstance(value, Mapping)
-        or value.get("schema")
-        != "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
+        or value.get("schema") != "immer.qwen3.8-prefix-sinkhorn-action-evidence/v1"
         or value.get("active") is not True
         or value.get("available") is not True
         or not _is_sha256(value.get("action_identity_sha256"))
@@ -111,6 +111,78 @@ def physical_lm_head_coordinate_executed(value: object) -> bool:
                 "packed_weight_bytes_avoided",
             )
         )
+    )
+
+
+def physical_layer_transition_crystal_executed(value: object) -> bool:
+    """Accept only physically executed layer transitions with pinned identity."""
+
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema") != "immer.qwen3.8-layer-transition-crystal-evidence/v1"
+        or not all(
+            _is_sha256(value.get(field))
+            for field in (
+                "identity_sha256",
+                "model_sha256",
+                "q4_sha256",
+                "graph_revision_sha256",
+                "atlas_revision_sha256",
+            )
+        )
+    ):
+        return False
+    request = value.get("request")
+    if not isinstance(request, Mapping) or not all(
+        request.get(field) == value.get(field)
+        for field in (
+            "identity_sha256",
+            "model_sha256",
+            "q4_sha256",
+            "graph_revision_sha256",
+            "atlas_revision_sha256",
+        )
+    ):
+        return False
+    counters = (
+        request.get("physical_transitions"),
+        request.get("skipped_q4_matrix_calls"),
+        request.get("packed_weight_bytes_avoided"),
+        request.get("exact_kv_state_updates"),
+    )
+    if any(
+        isinstance(counter, bool) or not isinstance(counter, int) or counter <= 0
+        for counter in counters
+    ):
+        return False
+    transitions, skipped_matrices, avoided_bytes, exact_updates = counters
+    attempts = request.get("attempts")
+    replacements = request.get("replacements")
+    fallbacks = request.get("fallbacks")
+    if (
+        isinstance(attempts, bool)
+        or not isinstance(attempts, int)
+        or attempts <= 0
+        or isinstance(replacements, bool)
+        or not isinstance(replacements, int)
+        or replacements <= 0
+        or isinstance(fallbacks, bool)
+        or not isinstance(fallbacks, int)
+        or fallbacks < 0
+    ):
+        return False
+    radius = value.get("max_error_radius")
+    return (
+        isinstance(radius, (int, float))
+        and not isinstance(radius, bool)
+        and float(radius) >= 0.0
+        and float(radius) not in {float("inf"), float("-inf")}
+        and float(radius) == float(radius)
+        and request.get("max_error_radius") == radius
+        and replacements == transitions == exact_updates
+        and attempts == replacements + fallbacks
+        and skipped_matrices == 5 * transitions
+        and avoided_bytes % transitions == 0
     )
 
 
@@ -175,11 +247,10 @@ def executed_actions_from_result(
     exact_head = execution.get("exact_head")
     delta_head_router = execution.get("delta_head_router")
     attention_output_crystal = execution.get("attention_output_crystal")
+    layer_transition_crystal = execution.get("layer_transition_crystal")
     mlp_page_coordinate = execution.get("mlp_page_coordinate")
     draft = execution.get("draft")
-    battery_hit = (
-        isinstance(anchor, Mapping) and anchor.get("status") == "hit"
-    ) or (
+    battery_hit = (isinstance(anchor, Mapping) and anchor.get("status") == "hit") or (
         isinstance(conversation, Mapping)
         and conversation.get("reuse_status") == "hit"
         and isinstance(conversation.get("reused_prefix_tokens"), int)
@@ -188,14 +259,14 @@ def executed_actions_from_result(
     )
     if battery_hit:
         actions = tuple(sorted({*actions, "continuation_battery"}))
-    if "qwen_target" in actions and physical_prefix_sinkhorn_executed(
-        prefix_sinkhorn
-    ):
+    if "qwen_target" in actions and physical_prefix_sinkhorn_executed(prefix_sinkhorn):
         actions = tuple(sorted({*actions, "prefix_sinkhorn"}))
-    if "qwen_target" in actions and physical_lm_head_coordinate_executed(
-        exact_head
-    ):
+    if "qwen_target" in actions and physical_lm_head_coordinate_executed(exact_head):
         actions = tuple(sorted({*actions, "lm_head_coordinate"}))
+    if "qwen_target" in actions and physical_layer_transition_crystal_executed(
+        layer_transition_crystal
+    ):
+        actions = tuple(sorted({*actions, "layer_transition_crystal"}))
     if isinstance(delta_head_router, Mapping):
         request = delta_head_router.get("request")
         if isinstance(request, Mapping) and all(
@@ -248,7 +319,11 @@ def executed_actions_from_result(
             if not isinstance(crystal, Mapping)
             else crystal.get("crystal_accepted_tokens")
         )
-        if isinstance(accepted, int) and not isinstance(accepted, bool) and accepted > 0:
+        if (
+            isinstance(accepted, int)
+            and not isinstance(accepted, bool)
+            and accepted > 0
+        ):
             actions = tuple(sorted({*actions, "compute_crystal"}))
     return actions
 
@@ -313,15 +388,14 @@ class InferenceActionReceipt:
             action in self.actions
             for action in (
                 "attention_output_crystal",
+                "layer_transition_crystal",
                 "lm_head_coordinate",
                 "mlp_head_coordinate",
                 "mlp_page_coordinate",
                 "prefix_sinkhorn",
             )
         ) and ("qwen_target" not in self.actions or self.target_forwards <= 0):
-            raise ValueError(
-                "coordinate actions require executed Qwen target work"
-            )
+            raise ValueError("coordinate actions require executed Qwen target work")
 
     @classmethod
     def from_economics(
@@ -482,25 +556,20 @@ class InferenceActionDirective:
                 or any(action not in ACTION_CATALOG for action in actions)
             ):
                 raise ValueError(f"{name} must be sorted known action classes")
-            if (
-                "attention_output_crystal" in actions
-                and "qwen_target" not in actions
-            ):
+            if "attention_output_crystal" in actions and "qwen_target" not in actions:
                 raise ValueError(
                     f"{name} attention_output_crystal requires qwen_target"
                 )
             if "mlp_head_coordinate" in actions and "qwen_target" not in actions:
-                raise ValueError(
-                    f"{name} mlp_head_coordinate requires qwen_target"
-                )
+                raise ValueError(f"{name} mlp_head_coordinate requires qwen_target")
             if "lm_head_coordinate" in actions and "qwen_target" not in actions:
+                raise ValueError(f"{name} lm_head_coordinate requires qwen_target")
+            if "layer_transition_crystal" in actions and "qwen_target" not in actions:
                 raise ValueError(
-                    f"{name} lm_head_coordinate requires qwen_target"
+                    f"{name} layer_transition_crystal requires qwen_target"
                 )
             if "mlp_page_coordinate" in actions and "qwen_target" not in actions:
-                raise ValueError(
-                    f"{name} mlp_page_coordinate requires qwen_target"
-                )
+                raise ValueError(f"{name} mlp_page_coordinate requires qwen_target")
             if "prefix_sinkhorn" in actions and "qwen_target" not in actions:
                 raise ValueError(f"{name} prefix_sinkhorn requires qwen_target")
         if self.draft_enabled is not None and not isinstance(
@@ -508,9 +577,8 @@ class InferenceActionDirective:
             bool,
         ):
             raise TypeError("draft_enabled must be boolean or null")
-        if (
-            tuple(sorted(set(self.disabled_actions))) != self.disabled_actions
-            or any(action not in ACTION_CATALOG for action in self.disabled_actions)
+        if tuple(sorted(set(self.disabled_actions))) != self.disabled_actions or any(
+            action not in ACTION_CATALOG for action in self.disabled_actions
         ):
             raise ValueError("disabled_actions must be sorted known action classes")
         if set(self.disabled_actions) & {
@@ -524,13 +592,11 @@ class InferenceActionDirective:
             or self.draft_window_ceiling not in {4, 8, 16}
         ):
             raise ValueError("draft_window_ceiling must be K4, K8, K16, or null")
-        if (
-            tuple(sorted(set(self.source_signature_sha256s)))
-            != self.source_signature_sha256s
-            or any(
-                require_sha256(value, field="source signature") != value
-                for value in self.source_signature_sha256s
-            )
+        if tuple(
+            sorted(set(self.source_signature_sha256s))
+        ) != self.source_signature_sha256s or any(
+            require_sha256(value, field="source signature") != value
+            for value in self.source_signature_sha256s
         ):
             raise ValueError("source signatures must be sorted unique SHA-256 values")
         if self.support <= 0 or isinstance(self.support, bool):
@@ -539,8 +605,7 @@ class InferenceActionDirective:
         if self.draft_window_ceiling is not None and (
             self.draft_enabled is not True
             or self.saved_qwen_forwards <= 0
-            or "compute_crystal"
-            not in {*self.primary_actions, *self.fallback_actions}
+            or "compute_crystal" not in {*self.primary_actions, *self.fallback_actions}
         ):
             raise ValueError(
                 "draft_window_ceiling requires a positive compute_crystal action"
@@ -665,7 +730,10 @@ class InferenceActionBank:
         receipts = []
         requests: dict[str, str] = {}
         for path in sorted(self.events.iterdir(), key=lambda item: item.name):
-            if not stat.S_ISREG(path.lstat().st_mode) or _EVENT.fullmatch(path.name) is None:
+            if (
+                not stat.S_ISREG(path.lstat().st_mode)
+                or _EVENT.fullmatch(path.name) is None
+            ):
                 raise InferenceActionBankError("action-bank event inventory is invalid")
             raw = path.read_bytes()
             if len(raw) > MAX_ACTION_RECEIPT_BYTES:
@@ -673,7 +741,9 @@ class InferenceActionBank:
             try:
                 document = json.loads(raw)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise InferenceActionBankError("action-bank event is invalid JSON") from exc
+                raise InferenceActionBankError(
+                    "action-bank event is invalid JSON"
+                ) from exc
             if canonical_json_bytes(document) != raw:
                 raise InferenceActionBankError("action-bank event is not canonical")
             receipt = InferenceActionReceipt.from_document(document)
@@ -773,9 +843,7 @@ class InferenceActionBank:
             executed_actions=executed_actions,
         )
         payload = canonical_json_bytes(receipt.to_document())
-        destination = self.events / (
-            f"{receipt.request_sha256}-{receipt.sha256}.json"
-        )
+        destination = self.events / (f"{receipt.request_sha256}-{receipt.sha256}.json")
         with self._lock:
             created = self._publish(destination, payload)
             receipts = self._receipts()
@@ -797,9 +865,7 @@ class InferenceActionBank:
         receipts: Iterable[InferenceEconomicsReceipt],
     ) -> dict[str, Any]:
         with self._lock:
-            existing = {
-                receipt.request_sha256 for receipt in self._receipts()
-            }
+            existing = {receipt.request_sha256 for receipt in self._receipts()}
         for receipt in receipts:
             if receipt.request_sha256 in existing:
                 continue
@@ -845,8 +911,7 @@ class InferenceActionBank:
         parametric = [
             receipt
             for receipt in receipts
-            if receipt.status == "ok"
-            and receipt.actions == ("parametric_program",)
+            if receipt.status == "ok" and receipt.actions == ("parametric_program",)
         ]
         parametric.sort(
             key=lambda receipt: (
@@ -862,6 +927,7 @@ class InferenceActionBank:
             and "qwen_target" in receipt.actions
             and (
                 "attention_output_crystal" in receipt.actions
+                or "layer_transition_crystal" in receipt.actions
                 or "lm_head_coordinate" in receipt.actions
                 or "mlp_head_coordinate" in receipt.actions
                 or "mlp_page_coordinate" in receipt.actions
@@ -908,6 +974,7 @@ class InferenceActionBank:
                     "compute_crystal",
                     "continuation_battery",
                     "dynamic_mlp_pages",
+                    "layer_transition_crystal",
                     "lm_head_coordinate",
                     "mlp_page_coordinate",
                     "prefix_sinkhorn",
@@ -923,13 +990,15 @@ class InferenceActionBank:
         # additive even when a higher-ranked draft receipt supplied the rest of
         # the vector.
         if any("attention_output_crystal" in receipt.actions for receipt in runtime):
-            runtime_action_set.update(
-                {"attention_output_crystal", "qwen_target"}
-            )
+            runtime_action_set.update({"attention_output_crystal", "qwen_target"})
         if any("mlp_page_coordinate" in receipt.actions for receipt in runtime):
             runtime_action_set.update({"mlp_page_coordinate", "qwen_target"})
         if any("lm_head_coordinate" in receipt.actions for receipt in runtime):
             runtime_action_set.update({"lm_head_coordinate", "qwen_target"})
+        if exact_runtime and any(
+            "layer_transition_crystal" in receipt.actions for receipt in exact_runtime
+        ):
+            runtime_action_set.update({"layer_transition_crystal", "qwen_target"})
         if exact_runtime and any(
             "mlp_head_coordinate" in receipt.actions for receipt in exact_runtime
         ):
@@ -952,12 +1021,7 @@ class InferenceActionBank:
         }
         sources_receipts = tuple(sources_by_request.values())
         sources = tuple(
-            sorted(
-                {
-                    receipt.action_signature_sha256
-                    for receipt in sources_receipts
-                }
-            )
+            sorted({receipt.action_signature_sha256 for receipt in sources_receipts})
         )
         return InferenceActionDirective(
             question_sha256=question,
@@ -965,18 +1029,14 @@ class InferenceActionBank:
             primary_actions=primary,
             fallback_actions=fallback,
             draft_enabled=(
-                True
-                if runtime and "target_verified_draft" in runtime_actions
-                else None
+                True if runtime and "target_verified_draft" in runtime_actions else None
             ),
             source_signature_sha256s=sources,
             support=len(sources_receipts),
             saved_qwen_forwards=sum(
                 receipt.saved_qwen_forwards for receipt in sources_receipts
             ),
-            draft_window_ceiling=(
-                16 if "compute_crystal" in runtime_actions else None
-            ),
+            draft_window_ceiling=(16 if "compute_crystal" in runtime_actions else None),
         )
 
 

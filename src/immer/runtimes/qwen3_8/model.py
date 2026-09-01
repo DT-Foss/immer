@@ -34,11 +34,16 @@ from .kernels import (
     DeltaNetProbe,
     DeltaNetState,
     full_attention_core,
+    full_attention_kv_state,
     gated_delta_net_core,
     gated_delta_net_postconv_core,
     recurrent_gated_delta_rule,
     rms_norm,
     swiglu,
+)
+from .layer_transition_crystal import (
+    TARGET_LAYER_INDEX,
+    LayerTransitionCrystalBank,
 )
 from .mlp_page_coordinate import (
     MlpPageCoordinateBank,
@@ -268,9 +273,7 @@ class _PendingStatefulBlock:
     runtime_identity: str
     mlp_page_transaction_owner: Any | None
     delta_head_transaction_owner: Any | None
-    attention_output_crystal_transaction_owner: (
-        AttentionOutputCrystalTransaction | None
-    )
+    attention_output_crystal_transaction_owner: AttentionOutputCrystalTransaction | None
     mlp_page_coordinate_transaction_owner: MlpPageCoordinateTransaction | None
 
 
@@ -314,6 +317,10 @@ class StreamedQwen38:
         delta_head_router: Any | None = None,
         attention_output_crystal_bank: AttentionOutputCrystalBank | None = None,
         mlp_page_coordinate_bank: MlpPageCoordinateBank | None = None,
+        layer_transition_crystal_bank: LayerTransitionCrystalBank | None = None,
+        layer_transition_crystal_max_error_radius: float = 0.0,
+        layer_transition_crystal_graph_revision_sha256: str | None = None,
+        layer_transition_crystal_atlas_revision_sha256: str | None = None,
         native_deltanet_recurrence: bool = False,
         native_deltanet_fusion: bool = False,
         packed_continuation_gemm: bool = False,
@@ -406,8 +413,7 @@ class StreamedQwen38:
                 "snapshot_identity",
             )
             if any(
-                not callable(getattr(mlp_page_router, name, None))
-                for name in required
+                not callable(getattr(mlp_page_router, name, None)) for name in required
             ):
                 raise TypeError("mlp_page_router lacks the runtime contract")
             route_width = getattr(mlp_page_router, "route_width", None)
@@ -557,6 +563,13 @@ class StreamedQwen38:
             MlpPageCoordinateTransaction | None
         ) = None
         self._mlp_page_coordinate_failures = 0
+        self.layer_transition_crystal_bank: LayerTransitionCrystalBank | None = None
+        self.layer_transition_crystal_enabled = False
+        self.layer_transition_crystal_max_error_radius = 0.0
+        self._layer_transition_crystal_hits = 0
+        self._layer_transition_crystal_exact_kv_state_updates = 0
+        self._layer_transition_crystal_skipped_q4_matrix_calls = 0
+        self._layer_transition_crystal_packed_weight_bytes_avoided = 0
         self._attention_state_digest_cache: dict[
             tuple[object, ...],
             tuple[
@@ -586,6 +599,13 @@ class StreamedQwen38:
             self.attach_attention_output_crystal_bank(attention_output_crystal_bank)
         if mlp_page_coordinate_bank is not None:
             self.attach_mlp_page_coordinate_bank(mlp_page_coordinate_bank)
+        if layer_transition_crystal_bank is not None:
+            self.attach_layer_transition_crystal_bank(
+                layer_transition_crystal_bank,
+                max_error_radius=layer_transition_crystal_max_error_radius,
+                graph_revision_sha256=(layer_transition_crystal_graph_revision_sha256),
+                atlas_revision_sha256=(layer_transition_crystal_atlas_revision_sha256),
+            )
 
     @property
     def next_position(self) -> int:
@@ -822,7 +842,9 @@ class StreamedQwen38:
         if bank is not None:
             expected = self._mlp_page_coordinate_identity_components()
             identity = bank.identity
-            if any(getattr(identity, field) != value for field, value in expected.items()):
+            if any(
+                getattr(identity, field) != value for field, value in expected.items()
+            ):
                 raise Qwen38RuntimeError(
                     "MLP page coordinate identity does not match the target"
                 )
@@ -852,6 +874,244 @@ class StreamedQwen38:
                 "MLP page coordinate activation cannot change during a stage"
             )
         self.mlp_page_coordinate_enabled = enabled
+
+    def layer_transition_crystal_model_sha256(self) -> str:
+        """Return the transport-neutral checkpoint pin used by layer crystals."""
+
+        source = self.pager.source
+        source.inventory()
+        metrics = source.metrics()
+        fingerprint = metrics.get("inventory_source_fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal target has no source fingerprint"
+            )
+        source_kind = f"{type(source).__module__}.{type(source).__qualname__}"
+        repo_id = metrics.get("repo_id", getattr(source, "repo_id", source_kind))
+        revision = metrics.get("revision", getattr(source, "revision", "fixture"))
+        if not isinstance(repo_id, str) or not repo_id:
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal target repo identity is invalid"
+            )
+        if not isinstance(revision, str) or not revision:
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal target revision is invalid"
+            )
+        return self._snapshot_digest(
+            {
+                "config": asdict(self.config),
+                "inventory_fingerprint": fingerprint,
+                "repo_id": repo_id,
+                "revision": revision,
+                "schema": "immer.qwen3.8-layer-transition-model-pin/v1",
+            }
+        )
+
+    def layer_transition_crystal_q4_sha256(self) -> str:
+        """Return the exact packed-weight identity used by layer crystals."""
+
+        q4_bank = getattr(self.pager, "q4_bank", None)
+        identity = None if q4_bank is None else getattr(q4_bank, "identity", None)
+        if not isinstance(identity, dict):
+            raise Qwen38RuntimeError("layer-transition Crystals require a Q4 identity")
+        return self._snapshot_digest(dict(identity))
+
+    def _layer_transition_q4_names(self) -> tuple[str, ...]:
+        layer = TARGET_LAYER_INDEX
+        base = f"model.language_model.layers.{layer}"
+        return (
+            f"{base}.self_attn.q_proj.weight",
+            f"{base}.self_attn.o_proj.weight",
+            f"{base}.mlp.gate_proj.weight",
+            f"{base}.mlp.up_proj.weight",
+            f"{base}.mlp.down_proj.weight",
+        )
+
+    def _layer_transition_avoided_q4_bytes(self) -> int:
+        q4_bank = getattr(self.pager, "q4_bank", None)
+        entries = None if q4_bank is None else getattr(q4_bank, "entries", None)
+        has = None if q4_bank is None else getattr(q4_bank, "has", None)
+        if not isinstance(entries, dict) or not callable(has):
+            raise Qwen38RuntimeError(
+                "layer-transition Crystals require a packed Q4 inventory"
+            )
+        total = 0
+        for name in self._layer_transition_q4_names():
+            if not bool(has(name)):
+                raise Qwen38RuntimeError(
+                    f"layer-transition Crystal Q4 bank lacks {name}"
+                )
+            try:
+                entry = entries[name]
+            except KeyError:
+                raise Qwen38RuntimeError(
+                    f"layer-transition Crystal inventory lacks {name}"
+                ) from None
+            payload_bytes = (
+                entry.get("payload_bytes")
+                if isinstance(entry, dict)
+                else getattr(entry, "payload_bytes", None)
+            )
+            if (
+                isinstance(payload_bytes, bool)
+                or not isinstance(payload_bytes, int)
+                or payload_bytes <= 0
+            ):
+                raise Qwen38RuntimeError(
+                    "layer-transition Crystal Q4 payload size is invalid"
+                )
+            total += payload_bytes
+        return total
+
+    def attach_layer_transition_crystal_bank(
+        self,
+        bank: LayerTransitionCrystalBank | None,
+        *,
+        max_error_radius: float = 0.0,
+        graph_revision_sha256: str | None = None,
+        atlas_revision_sha256: str | None = None,
+    ) -> None:
+        """Attach a private layer-63 quotient operator while the runtime is idle."""
+
+        if bank is not None and not isinstance(bank, LayerTransitionCrystalBank):
+            raise TypeError(
+                "layer_transition_crystal_bank must be a "
+                "LayerTransitionCrystalBank or None"
+            )
+        if (
+            isinstance(max_error_radius, bool)
+            or not isinstance(max_error_radius, (int, float))
+            or not math.isfinite(float(max_error_radius))
+            or float(max_error_radius) < 0.0
+        ):
+            raise ValueError(
+                "layer-transition Crystal max_error_radius must be finite and "
+                "non-negative"
+            )
+        if (
+            self._pending_block_stage is not None
+            or self._active_attention_output_crystal_transaction is not None
+            or self._active_mlp_page_coordinate_transaction is not None
+        ):
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal attachment cannot change during a stage"
+            )
+        if bank is not None:
+            for label, claimed, expected in (
+                (
+                    "graph",
+                    graph_revision_sha256,
+                    bank.identity.graph_revision_sha256,
+                ),
+                (
+                    "Atlas",
+                    atlas_revision_sha256,
+                    bank.identity.atlas_revision_sha256,
+                ),
+            ):
+                if (
+                    not isinstance(claimed, str)
+                    or len(claimed) != 64
+                    or set(claimed) - set("0123456789abcdef")
+                    or claimed != expected
+                ):
+                    raise Qwen38RuntimeError(
+                        f"layer-transition Crystal {label} authority differs "
+                        "from its bank"
+                    )
+            if self.pager.compute_dtype != torch.bfloat16:
+                raise ValueError(
+                    "layer-transition Crystals require exact BF16 target execution"
+                )
+            if (
+                self.config.n_layers - 1 != TARGET_LAYER_INDEX
+                or not self.config.is_full_attention(TARGET_LAYER_INDEX)
+            ):
+                raise Qwen38RuntimeError(
+                    "layer-transition Crystals require full-attention layer 63 "
+                    "as the final decoder layer"
+                )
+            identity = bank.identity
+            if identity.hidden_dim != self.config.dim:
+                raise Qwen38RuntimeError(
+                    "layer-transition Crystal hidden width differs from target"
+                )
+            if identity.model_sha256 != self.layer_transition_crystal_model_sha256():
+                raise Qwen38RuntimeError(
+                    "layer-transition Crystal model pin differs from target"
+                )
+            if identity.q4_sha256 != self.layer_transition_crystal_q4_sha256():
+                raise Qwen38RuntimeError(
+                    "layer-transition Crystal Q4 pin differs from target"
+                )
+            expected_bytes = self._layer_transition_avoided_q4_bytes()
+            if any(
+                crystal.logical_weight_bytes_replaced != expected_bytes
+                for crystal in bank.crystals
+            ):
+                raise Qwen38RuntimeError(
+                    "layer-transition Crystal physical byte claim differs from Q4"
+                )
+        self.layer_transition_crystal_bank = bank
+        self.layer_transition_crystal_enabled = bank is not None
+        self.layer_transition_crystal_max_error_radius = (
+            0.0 if bank is None else float(max_error_radius)
+        )
+
+    def set_layer_transition_crystal_enabled(self, enabled: bool) -> None:
+        """Select the attached layer-transition action for the next request."""
+
+        if not isinstance(enabled, bool):
+            raise TypeError("layer-transition Crystal activation must be boolean")
+        if enabled and self.layer_transition_crystal_bank is None:
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal activation requires an attached bank"
+            )
+        if (
+            self._pending_block_stage is not None
+            or self._active_attention_output_crystal_transaction is not None
+            or self._active_mlp_page_coordinate_transaction is not None
+        ):
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal activation cannot change during a stage"
+            )
+        self.layer_transition_crystal_enabled = enabled
+
+    def layer_transition_crystal_metrics(self) -> dict[str, object]:
+        """Return cumulative physical K1 replacement counters."""
+
+        bank = self.layer_transition_crystal_bank
+        bank_metrics = None if bank is None else bank.metrics().to_dict()
+        identity = None if bank is None else bank.identity
+        return {
+            "atlas_revision_sha256": (
+                None if identity is None else identity.atlas_revision_sha256
+            ),
+            "attempts": 0 if bank_metrics is None else int(bank_metrics["attempts"]),
+            "enabled": self.layer_transition_crystal_enabled,
+            "exact_kv_state_updates": (
+                self._layer_transition_crystal_exact_kv_state_updates
+            ),
+            "fallbacks": 0 if bank_metrics is None else int(bank_metrics["fallbacks"]),
+            "graph_revision_sha256": (
+                None if identity is None else identity.graph_revision_sha256
+            ),
+            "identity_sha256": (None if identity is None else identity.identity_sha256),
+            "max_error_radius": self.layer_transition_crystal_max_error_radius,
+            "model_sha256": None if identity is None else identity.model_sha256,
+            "packed_weight_bytes_avoided": (
+                self._layer_transition_crystal_packed_weight_bytes_avoided
+            ),
+            "physical_transitions": self._layer_transition_crystal_hits,
+            "q4_sha256": None if identity is None else identity.q4_sha256,
+            "replacements": (
+                0 if bank_metrics is None else int(bank_metrics["replacements"])
+            ),
+            "schema": "immer.qwen3.8-layer-transition-crystal-metrics/v1",
+            "skipped_q4_matrix_calls": (
+                self._layer_transition_crystal_skipped_q4_matrix_calls
+            ),
+        }
 
     def set_delta_head_router(self, router: Any | None) -> None:
         """Select one output-changing DeltaNet coordinate action while idle."""
@@ -1066,15 +1326,11 @@ class StreamedQwen38:
             )
         if evidence is not None and intervention is not None:
             expected_mode = (
-                "replace_base_softmax"
-                if intervention.physical_replacement
-                else "blend"
+                "replace_base_softmax" if intervention.physical_replacement else "blend"
             )
-            if (
-                evidence.execution_mode != expected_mode
-                or evidence.alpha_per_head
-                != (intervention.alpha,) * len(intervention.head_indices)
-            ):
+            if evidence.execution_mode != expected_mode or evidence.alpha_per_head != (
+                intervention.alpha,
+            ) * len(intervention.head_indices):
                 raise Qwen38RuntimeError(
                     "attention-output Crystal Prefix-Sinkhorn action changed"
                 )
@@ -1387,6 +1643,19 @@ class StreamedQwen38:
                 transport_neutral=transport_neutral
             ),
             "mlp_page_router": self._mlp_page_snapshot_identity(),
+            "layer_transition_crystal": (
+                None
+                if self.layer_transition_crystal_bank is None
+                else {
+                    "enabled": self.layer_transition_crystal_enabled,
+                    "identity": (
+                        self.layer_transition_crystal_bank.identity.to_record()
+                    ),
+                    "max_error_radius": (
+                        self.layer_transition_crystal_max_error_radius.hex()
+                    ),
+                }
+            ),
             "native_head_crsa": self._native_head_crsa_snapshot_identity(),
         }
 
@@ -1991,6 +2260,21 @@ class StreamedQwen38:
             raise Qwen38RuntimeError("layer boundary stage is not registered")
         observer(layer, stage, value.detach().clone())
 
+    def _requires_unfused_mlp_boundaries(self, layer: int) -> bool:
+        """Return whether this observer needs Gate/Up/activation/output tensors."""
+
+        if self.layer_boundary_observer is None:
+            return False
+        if (
+            self.layer_boundary_layers is not None
+            and layer not in self.layer_boundary_layers
+        ):
+            return False
+        return any(
+            stage in self.layer_boundary_stages
+            for stage in ("mlp.gate", "mlp.up", "mlp.activated", "mlp.output")
+        )
+
     def _norm(self, hidden: torch.Tensor, name: str) -> torch.Tensor:
         weight = self._control(name)
         try:
@@ -2029,10 +2313,7 @@ class StreamedQwen38:
             )
         crystal_key = None
         if bank is not None:
-            if (
-                tuple(hidden.shape) != (1, 1, self.config.dim)
-                or token_mask is not None
-            ):
+            if tuple(hidden.shape) != (1, 1, self.config.dim) or token_mask is not None:
                 raise Qwen38RuntimeError(
                     "direct attention-output Crystal execution requires K1 decode"
                 )
@@ -2419,13 +2700,11 @@ class StreamedQwen38:
             and self.pager.compute_dtype == torch.bfloat16
             and all(q4_bank.has(name) for name in fused_names)
             and self.mlp_sparse_executor is None
-            and self.layer_boundary_observer is None
+            and not self._requires_unfused_mlp_boundaries(layer)
         ):
             page_router = self.mlp_page_router
             if page_router is not None:
-                coordinate_transaction = (
-                    self._active_mlp_page_coordinate_transaction
-                )
+                coordinate_transaction = self._active_mlp_page_coordinate_transaction
                 coordinate_bank = (
                     self.mlp_page_coordinate_bank
                     if coordinate_transaction is not None
@@ -2533,15 +2812,11 @@ class StreamedQwen38:
                 page_ids = tuple(
                     () if prediction is None else getattr(prediction, "page_ids", ())
                 )
-                if prediction is not None and bool(
-                    getattr(prediction, "ready", False)
-                ):
+                if prediction is not None and bool(getattr(prediction, "ready", False)):
                     before_weight_bytes = (
                         0
                         if coordinate_bank is None
-                        else int(
-                            q4_bank.metrics().get("page_mlp_weight_bytes", 0)
-                        )
+                        else int(q4_bank.metrics().get("page_mlp_weight_bytes", 0))
                     )
                     route_shape = (*hidden.shape[:-1], len(page_ids))
                     output = self.pager.mlp_selected_pages(
@@ -2578,9 +2853,9 @@ class StreamedQwen38:
                             self._q4_mlp_full_payload_bytes(q4_bank, fused_names)
                             - selected_weight_bytes,
                         )
-                        full_page_ids = tuple(
-                            getattr(prediction, "full_page_ids", ())
-                        ) or page_ids
+                        full_page_ids = (
+                            tuple(getattr(prediction, "full_page_ids", ())) or page_ids
+                        )
                         staged_coordinate = coordinate_bank.stage(
                             coordinate_key,
                             full_page_ids,
@@ -3161,7 +3436,7 @@ class StreamedQwen38:
             and self.pager.compute_dtype == torch.bfloat16
             and all(q4_bank.has(name) for name in fused_names)
             and self.mlp_sparse_executor is None
-            and self.layer_boundary_observer is None
+            and not self._requires_unfused_mlp_boundaries(layer)
         ):
             shapes = [tuple(row.shape) for row in hidden]
             counts = [row.numel() // row.shape[-1] for row in hidden]
@@ -3176,11 +3451,15 @@ class StreamedQwen38:
                 prediction = page_router.route(layer, row_count=row_count)
                 page_ids = tuple(getattr(prediction, "page_ids", ()))
                 if bool(getattr(prediction, "ready", False)):
-                    routes = torch.tensor(
-                        [page_ids],
-                        dtype=torch.int64,
-                        device="cpu",
-                    ).expand(row_count, -1).contiguous()
+                    routes = (
+                        torch.tensor(
+                            [page_ids],
+                            dtype=torch.int64,
+                            device="cpu",
+                        )
+                        .expand(row_count, -1)
+                        .contiguous()
+                    )
                     fused = self.pager.mlp_selected_pages(
                         combined,
                         fused_names,
@@ -3392,6 +3671,110 @@ class StreamedQwen38:
             prefix_trace,
         )
 
+    def _layer_transition_crystal_forward(
+        self,
+        hidden: torch.Tensor,
+        *,
+        layer: int,
+        token_mask: torch.Tensor,
+        state: LayerState | None,
+        start_pos: int,
+        stateful: bool,
+    ) -> tuple[torch.Tensor, AttentionState] | None:
+        """Replace final-layer K1 math while appending authoritative live K/V."""
+
+        bank = self.layer_transition_crystal_bank
+        if (
+            bank is None
+            or not self.layer_transition_crystal_enabled
+            or not stateful
+            or layer != TARGET_LAYER_INDEX
+            or layer != self.config.n_layers - 1
+            or tuple(hidden.shape) != (1, 1, self.config.dim)
+            or hidden.dtype != torch.bfloat16
+            or self.layer_boundary_observer is not None
+            or self.native_prefix_sinkhorn_operator_observer is not None
+        ):
+            return None
+        if not self.config.is_full_attention(layer):
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal target is not full attention"
+            )
+        if state is not None and not isinstance(state, AttentionState):
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal received a non-K/V state"
+            )
+        if state is not None and state.crsa_log_usage is not None:
+            return None
+        if (
+            tuple(token_mask.shape) != (1, 1)
+            or token_mask.dtype != torch.bool
+            or not bool(token_mask.item())
+        ):
+            return None
+
+        replacement = bank.replace(
+            hidden,
+            max_error_radius=self.layer_transition_crystal_max_error_radius,
+        )
+        if replacement is None:
+            return None
+        output = replacement.output
+        if (
+            tuple(output.shape) != (1, 1, self.config.dim)
+            or output.dtype != self.pager.compute_dtype
+            or not self._on_pager_device(output)
+            or not bool(torch.isfinite(output).all().item())
+        ):
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal emitted an invalid hidden row"
+            )
+        avoided_bytes = self._layer_transition_avoided_q4_bytes()
+        if replacement.logical_weight_bytes_replaced != avoided_bytes:
+            raise Qwen38RuntimeError(
+                "layer-transition Crystal byte claim changed after attachment"
+            )
+
+        prefix = f"model.language_model.layers.{layer}"
+        base = f"{prefix}.self_attn"
+        mixed_input = self._norm(hidden, f"{prefix}.input_layernorm.weight")
+        projected_key, projected_value = self.pager.linear_group(
+            mixed_input,
+            (f"{base}.k_proj", f"{base}.v_proj"),
+        )
+        k_norm_weight = self._control(f"{base}.k_norm.weight")
+        positions = torch.full(
+            (1, 1),
+            start_pos,
+            dtype=torch.long,
+            device=hidden.device,
+        )
+        try:
+            next_state = full_attention_kv_state(
+                projected_key,
+                projected_value,
+                k_norm_weight=k_norm_weight,
+                num_key_value_heads=self.config.n_kv_heads,
+                head_dim=self.config.head_dim,
+                position_ids=positions,
+                state=state,
+                rope_theta=self.config.rope_theta,
+                rotary_dim=self.config.rotary_dim,
+                mrope_section=self.config.mrope_section,
+                mrope_interleaved=self.config.mrope_interleaved,
+                rms_norm_eps=self.config.rms_norm_eps,
+            )
+        finally:
+            del mixed_input, projected_key, projected_value, k_norm_weight
+
+        self._layer_transition_crystal_hits += 1
+        self._layer_transition_crystal_exact_kv_state_updates += 1
+        self._layer_transition_crystal_skipped_q4_matrix_calls += len(
+            self._layer_transition_q4_names()
+        )
+        self._layer_transition_crystal_packed_weight_bytes_avoided += avoided_bytes
+        return output, next_state
+
     def _forward_layer(
         self,
         hidden: torch.Tensor,
@@ -3410,6 +3793,18 @@ class StreamedQwen38:
         prefix = f"model.language_model.layers.{layer}"
         residual = hidden
         self._observe_layer_boundary(layer, "layer.input", residual)
+        crystal = self._layer_transition_crystal_forward(
+            hidden,
+            layer=layer,
+            token_mask=token_mask,
+            state=state,
+            start_pos=start_pos,
+            stateful=stateful,
+        )
+        if crystal is not None:
+            output, next_state = crystal
+            self._observe_layer_boundary(layer, "layer.output", output)
+            return output, next_state
         mixed_input = self._norm(hidden, f"{prefix}.input_layernorm.weight")
         self._observe_layer_boundary(layer, "attention.input", mixed_input)
         if self.config.is_full_attention(layer):
@@ -3569,9 +3964,7 @@ class StreamedQwen38:
                 "mlp_sparse_executor": self._mlp_sparse_snapshot_identity(),
                 "mlp_page_router": self._mlp_page_snapshot_identity(),
                 "mlp_page_router_instance": (
-                    None
-                    if self.mlp_page_router is None
-                    else id(self.mlp_page_router)
+                    None if self.mlp_page_router is None else id(self.mlp_page_router)
                 ),
                 "attention_output_crystal": (
                     None
@@ -3593,6 +3986,20 @@ class StreamedQwen38:
                             self.mlp_page_coordinate_bank.identity.identity_sha256
                         ),
                         "instance": id(self.mlp_page_coordinate_bank),
+                    }
+                ),
+                "layer_transition_crystal": (
+                    None
+                    if self.layer_transition_crystal_bank is None
+                    else {
+                        "enabled": self.layer_transition_crystal_enabled,
+                        "identity_sha256": (
+                            self.layer_transition_crystal_bank.identity.identity_sha256
+                        ),
+                        "instance": id(self.layer_transition_crystal_bank),
+                        "max_error_radius": (
+                            self.layer_transition_crystal_max_error_radius.hex()
+                        ),
                     }
                 ),
                 "native_head_crsa": native,
@@ -3911,17 +4318,13 @@ class StreamedQwen38:
 
     def _reset_mlp_page_session(self) -> None:
         pending = self._pending_block_stage
-        owner = (
-            None if pending is None else pending.mlp_page_transaction_owner
-        )
+        owner = None if pending is None else pending.mlp_page_transaction_owner
         current = self.mlp_page_router
         if owner is not None and owner is not current:
             owner.rollback_transaction()
         if current is not None:
             current.reset_session()
-        delta_owner = (
-            None if pending is None else pending.delta_head_transaction_owner
-        )
+        delta_owner = None if pending is None else pending.delta_head_transaction_owner
         delta_current = self.delta_head_router
         if delta_owner is not None and delta_owner is not delta_current:
             delta_owner.rollback_transaction()
@@ -3938,9 +4341,7 @@ class StreamedQwen38:
         self._rollback_attention_output_crystal_transaction(crystal_owner)
         self._active_attention_output_crystal_transaction = None
         coordinate_owner = (
-            None
-            if pending is None
-            else pending.mlp_page_coordinate_transaction_owner
+            None if pending is None else pending.mlp_page_coordinate_transaction_owner
         )
         active_coordinate = self._active_mlp_page_coordinate_transaction
         if active_coordinate is not None and active_coordinate is not coordinate_owner:
@@ -4553,9 +4954,7 @@ class StreamedQwen38:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         page_router = pending.mlp_page_transaction_owner
         delta_router = pending.delta_head_transaction_owner
-        crystal_transaction = (
-            pending.attention_output_crystal_transaction_owner
-        )
+        crystal_transaction = pending.attention_output_crystal_transaction_owner
         coordinate_transaction = pending.mlp_page_coordinate_transaction_owner
 
         # A matching handle is consumed exactly once.  No later validation or
@@ -4836,9 +5235,7 @@ class StreamedQwen38:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         page_router = pending.mlp_page_transaction_owner
         delta_router = pending.delta_head_transaction_owner
-        crystal_transaction = (
-            pending.attention_output_crystal_transaction_owner
-        )
+        crystal_transaction = pending.attention_output_crystal_transaction_owner
         coordinate_transaction = pending.mlp_page_coordinate_transaction_owner
 
         def rollback_coordinate_routes() -> None:
@@ -4996,9 +5393,7 @@ class StreamedQwen38:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         page_router = pending.mlp_page_transaction_owner
         delta_router = pending.delta_head_transaction_owner
-        crystal_transaction = (
-            pending.attention_output_crystal_transaction_owner
-        )
+        crystal_transaction = pending.attention_output_crystal_transaction_owner
         coordinate_transaction = pending.mlp_page_coordinate_transaction_owner
 
         def rollback_coordinate_routes() -> None:
@@ -5399,9 +5794,7 @@ class StreamedQwen38:
                 coordinate_transaction = (
                     self.mlp_page_coordinate_bank.begin_transaction()
                 )
-                self._active_mlp_page_coordinate_transaction = (
-                    coordinate_transaction
-                )
+                self._active_mlp_page_coordinate_transaction = coordinate_transaction
             try:
                 hidden, evidence = self.hidden_stateful(
                     ids,

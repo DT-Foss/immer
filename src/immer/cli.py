@@ -4,11 +4,13 @@ import argparse
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
+import stat
 import sys
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from .contracts import Request, Result
 from .resource_paths import s3_ship_manifest
@@ -81,6 +83,18 @@ def _sorted_layer_list(value: str) -> tuple[int, ...]:
     return layers
 
 
+def _finite_non_negative_float(value: str | int | float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "value must be a finite non-negative number"
+        ) from exc
+    if isinstance(value, bool) or not math.isfinite(result) or result < 0.0:
+        raise argparse.ArgumentTypeError("value must be a finite non-negative number")
+    return result
+
+
 def _s3_manifest(configured: str | Path | None = None) -> Path:
     """Resolve the one deployment manifest used by solve, serve and organs."""
 
@@ -102,16 +116,16 @@ def _artifact_root(
 
 
 _QWEN38_DEPLOYMENT_ROOT = Path("/") / "app" / "models" / "Qwen3.8-27B"
-_QWEN38_DEPLOYMENT_PRIVATE = Path("/") / "root" / "immer-runtime" / "artifacts" / "private"
+_QWEN38_DEPLOYMENT_PRIVATE = (
+    Path("/") / "root" / "immer-runtime" / "artifacts" / "private"
+)
 _QWEN38_DEPLOYMENT_STATE = Path("/") / "root" / "immer-state"
 _QWEN38_DEPLOYMENT_WARM_ROOT = _QWEN38_DEPLOYMENT_PRIVATE / "qwen3.8-ooe-chat-real"
 _QWEN38_DEPLOYMENT_MARKOV_DRAFT_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-markov-q4-v1.bin"
 )
 _QWEN38_DEPLOYMENT_MTP_STATE = _QWEN38_DEPLOYMENT_STATE / "qwen-mtp-q4-v1.json"
-_QWEN38_DEPLOYMENT_MARKOV_ATLAS = (
-    _QWEN38_DEPLOYMENT_STATE / "qwen-markov-atlas-v1.bin"
-)
+_QWEN38_DEPLOYMENT_MARKOV_ATLAS = _QWEN38_DEPLOYMENT_STATE / "qwen-markov-atlas-v1.bin"
 _QWEN38_DEPLOYMENT_O1_RETENTION = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-markov-o1-retention-v1.json"
 )
@@ -127,12 +141,8 @@ _QWEN38_DEPLOYMENT_DRAFT_WINDOW_STATE = (
 _QWEN38_DEPLOYMENT_INFERENCE_ECONOMICS = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-inference-economics-v1"
 )
-_QWEN38_DEPLOYMENT_SERVICE_SOCKET = (
-    _QWEN38_DEPLOYMENT_STATE / "qwen3.8-service.sock"
-)
-_QWEN38_DEPLOYMENT_ANCHOR_CACHE = (
-    _QWEN38_DEPLOYMENT_STATE / "qwen-chat-prefix-anchors"
-)
+_QWEN38_DEPLOYMENT_SERVICE_SOCKET = _QWEN38_DEPLOYMENT_STATE / "qwen3.8-service.sock"
+_QWEN38_DEPLOYMENT_ANCHOR_CACHE = _QWEN38_DEPLOYMENT_STATE / "qwen-chat-prefix-anchors"
 _QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-contextual-continuation-v1.json"
 )
@@ -163,6 +173,190 @@ def _path_sha256(path: Path) -> str:
         while chunk := handle.read(4 * 1024**2):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _require_existing_real_directory(path: Path, option: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"{option} must name an existing real directory") from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError(f"{option} must name an existing real directory")
+
+
+def _authenticate_layer_transition_crystal_atlas(
+    path: Path,
+    *,
+    atlas_revision_sha256: str,
+) -> None:
+    _require_existing_real_directory(path, "--layer-transition-crystal-atlas")
+    from .knowledge.livecausal import LiveGraph
+    from .runtimes.qwen3_8.semantic_atlas import GraphRevision
+
+    try:
+        atlas = LiveGraph(path)
+        revision_history = atlas.store.revision_history()
+    except Exception as exc:
+        raise ValueError(
+            "--layer-transition-crystal-atlas is unavailable or unauthenticated"
+        ) from exc
+    if not any(
+        GraphRevision(sequence, event_sha256).sha256 == atlas_revision_sha256
+        for sequence, event_sha256 in revision_history
+    ):
+        raise ValueError(
+            "layer-transition Crystal bank belongs to a foreign Atlas authority"
+        )
+
+
+def _authenticate_layer_transition_crystal_compute_graph(
+    path: Path,
+    *,
+    graph_revision_sha256: str,
+) -> Any:
+    _require_existing_real_directory(path, "--layer-transition-crystal-compute-root")
+    from .runtimes.ooe.compute_crystals import ComputeCrystalBank
+    from .runtimes.ooe.compute_graph import (
+        ComputeOperatorGraph,
+        ComputeOperatorGraphState,
+    )
+
+    try:
+        bank = ComputeCrystalBank(path)
+        graph = ComputeOperatorGraph(bank)
+        current = graph.state()
+        seen: set[str] = set()
+        while True:
+            current_sha256 = current.sha256
+            if current_sha256 in seen:
+                raise ValueError(
+                    "layer-transition Compute graph history contains a cycle"
+                )
+            seen.add(current_sha256)
+            if current_sha256 == graph_revision_sha256:
+                return current
+            previous_sha256 = current.previous_state_sha256
+            if previous_sha256 is None:
+                break
+            payload = bank.store.restore_state(
+                graph.history_state_name(previous_sha256)
+            )
+            previous = ComputeOperatorGraphState.from_bytes(payload)
+            if (
+                previous.sha256 != previous_sha256
+                or current.generation != previous.generation + 1
+                or current.previous_state_sha256 != previous.sha256
+            ):
+                raise ValueError(
+                    "layer-transition Compute graph history is unauthenticated"
+                )
+            current = previous
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(
+            "--layer-transition-crystal-compute-root is unavailable or unauthenticated"
+        ) from exc
+    raise ValueError(
+        "layer-transition Crystal bank belongs to a foreign Compute graph authority"
+    )
+
+
+def _qwen38_layer_transition_crystal_policy(
+    args: argparse.Namespace,
+    *,
+    request_applied: bool | None = None,
+) -> dict[str, object] | None:
+    """Return a path-free policy for one configured private layer-63 bank."""
+
+    configured = getattr(args, "layer_transition_crystal_state", None)
+    configured_atlas = getattr(args, "layer_transition_crystal_atlas", None)
+    configured_compute_root = getattr(
+        args,
+        "layer_transition_crystal_compute_root",
+        None,
+    )
+    radius = getattr(args, "layer_transition_crystal_max_error_radius", 0.0)
+    try:
+        radius = _finite_non_negative_float(radius)
+    except argparse.ArgumentTypeError as exc:
+        raise ValueError(
+            "layer-transition Crystal max-error radius must be finite and non-negative"
+        ) from exc
+    if configured is None:
+        if configured_atlas is not None:
+            raise ValueError(
+                "--layer-transition-crystal-atlas requires "
+                "--layer-transition-crystal-state"
+            )
+        if configured_compute_root is not None:
+            raise ValueError(
+                "--layer-transition-crystal-compute-root requires "
+                "--layer-transition-crystal-state"
+            )
+        if radius != 0.0:
+            raise ValueError(
+                "--layer-transition-crystal-max-error-radius requires "
+                "--layer-transition-crystal-state"
+            )
+        return None
+    if configured_atlas is None:
+        raise ValueError(
+            "--layer-transition-crystal-state requires --layer-transition-crystal-atlas"
+        )
+    if configured_compute_root is None:
+        raise ValueError(
+            "--layer-transition-crystal-state requires "
+            "--layer-transition-crystal-compute-root"
+        )
+    if request_applied is not None and not isinstance(request_applied, bool):
+        raise TypeError("request_applied must be boolean or null")
+    path = Path(configured).expanduser().absolute()
+    if not path.is_file():
+        raise ValueError(
+            "--layer-transition-crystal-state must name an existing sealed file"
+        )
+    from .runtimes.qwen3_8.layer_transition_crystal import (
+        LayerTransitionCrystalBank,
+        LayerTransitionCrystalIdentity,
+    )
+
+    bank = LayerTransitionCrystalBank.load(path)
+    identity = getattr(bank, "identity", None)
+    if not isinstance(identity, LayerTransitionCrystalIdentity):
+        raise ValueError("layer-transition Crystal bank identity is invalid")
+    atlas_path = Path(configured_atlas).expanduser().absolute()
+    _authenticate_layer_transition_crystal_atlas(
+        atlas_path,
+        atlas_revision_sha256=identity.atlas_revision_sha256,
+    )
+    compute_root = Path(configured_compute_root).expanduser().absolute()
+    compute_state = _authenticate_layer_transition_crystal_compute_graph(
+        compute_root,
+        graph_revision_sha256=identity.graph_revision_sha256,
+    )
+    edges = {edge.sha256: edge for edge in compute_state.edges}
+    for crystal in bank.crystals:
+        source = crystal.source_compute_crystal_sha256
+        edge_sha256 = crystal.source_compute_edge_sha256
+        if source is None and edge_sha256 is None:
+            continue
+        edge = None if edge_sha256 is None else edges.get(edge_sha256)
+        if edge is None or source is None or edge.crystal_sha256 != source:
+            raise ValueError(
+                "layer-transition Crystal source lineage differs from Compute graph"
+            )
+    return {
+        "atlas_revision_sha256": identity.atlas_revision_sha256,
+        "enabled": True,
+        "graph_revision_sha256": identity.graph_revision_sha256,
+        "identity_sha256": identity.identity_sha256,
+        "max_error_radius": radius.hex(),
+        "model_sha256": identity.model_sha256,
+        "q4_sha256": identity.q4_sha256,
+        "request_applied": True if request_applied is None else request_applied,
+        "schema": "immer.qwen3.8-layer-transition-crystal-policy/v1",
+    }
 
 
 def _resolve_qwen38_chat_paths(
@@ -271,10 +465,7 @@ def _resolve_qwen38_inference_economics(
     )
     if configured is not None:
         return configured
-    if (
-        bundle_path == _QWEN38_DEPLOYMENT_ROOT
-        and _QWEN38_DEPLOYMENT_STATE.is_dir()
-    ):
+    if bundle_path == _QWEN38_DEPLOYMENT_ROOT and _QWEN38_DEPLOYMENT_STATE.is_dir():
         return _QWEN38_DEPLOYMENT_INFERENCE_ECONOMICS
     if bool(getattr(args, "service", False)):
         service_socket = getattr(args, "service_socket", None)
@@ -294,10 +485,7 @@ def _resolve_qwen38_service_socket(
     )
     if configured is not None:
         return configured
-    if (
-        bundle_path == _QWEN38_DEPLOYMENT_ROOT
-        and _QWEN38_DEPLOYMENT_STATE.is_dir()
-    ):
+    if bundle_path == _QWEN38_DEPLOYMENT_ROOT and _QWEN38_DEPLOYMENT_STATE.is_dir():
         return _QWEN38_DEPLOYMENT_SERVICE_SOCKET
     return (Path.home() / ".immer" / "qwen3.8-service.sock").absolute()
 
@@ -381,9 +569,8 @@ def _qwen38_service_profile(
         return value
 
     profile = {
-        "attention_output_crystal": (
-            attention_output_crystal_state_path is not None
-        ),
+        "attention_output_crystal": (attention_output_crystal_state_path is not None),
+        "layer_transition_crystal": (_qwen38_layer_transition_crystal_policy(args)),
         "mlp_page_coordinate": mlp_page_coordinate_enabled,
         "arguments": {
             name: normalized(getattr(args, name, None)) for name in argument_names
@@ -530,9 +717,7 @@ def _qwen38_growing_warm_profile(
             "policy": MLP_PAGE_MARKOV_POLICY,
             "route_width": route_width,
             "schema": MLP_PAGE_MARKOV_SCHEMA,
-            "width_actions": list(
-                MlpPageMarkov.width_actions_for(route_width)
-            ),
+            "width_actions": list(MlpPageMarkov.width_actions_for(route_width)),
         }
     profile = {
         "abi_sha256": _QWEN38_GROWING_WARM_ABI_SHA256,
@@ -547,6 +732,7 @@ def _qwen38_growing_warm_profile(
                 "output": "exact-full-attention-token-transition/v1",
             }
         ),
+        "layer_transition_crystal": (_qwen38_layer_transition_crystal_policy(args)),
         "mlp_page_coordinate": (
             getattr(args, "mlp_page_coordinate_state", None) is not None
         ),
@@ -589,14 +775,10 @@ def _qwen38_growing_warm_profile(
             }
         ),
         "markov_provider_abi": (
-            _QWEN38_MARKOV_DRAFT_ABI
-            if draft_mode in {"hybrid", "markov"}
-            else None
+            _QWEN38_MARKOV_DRAFT_ABI if draft_mode in {"hybrid", "markov"} else None
         ),
         "markov_atlas_sha256": (
-            None
-            if markov_atlas_path is None
-            else _path_sha256(markov_atlas_path)
+            None if markov_atlas_path is None else _path_sha256(markov_atlas_path)
         ),
         "markov_o1_retention": markov_o1_retention_path is not None,
         "mtp_provider_abi": (
@@ -633,6 +815,10 @@ def _qwen38_output_semantics(
     q4_root: Path | None,
     mlp_page_state_path: Path | None,
 ):
+    # A private layer-transition bank is a bounded approximate same-runtime
+    # action.  It cannot share the cross-profile exact-output replay authority.
+    if _qwen38_layer_transition_crystal_policy(args) is not None:
+        return None
     if q4_root is None:
         return None
     q4_manifest = q4_root / "manifest.json"
@@ -690,7 +876,11 @@ def _qwen38_runtime_code_paths() -> tuple[Path, ...]:
     )
     qwen_runtime = tuple(
         sorted(
-            (package / "runtimes" / "qwen3_8").glob("*.py"),
+            (
+                path
+                for path in (package / "runtimes" / "qwen3_8").glob("*.py")
+                if path.name != "layer_transition_builder.py"
+            ),
             key=lambda path: path.name,
         )
     )
@@ -1060,9 +1250,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                         and isinstance(width_mean, (int, float))
                         and not isinstance(width_mean, bool)
                     ):
-                        page_parts.append(
-                            f"width {width_min}-{float(width_mean):.1f}"
-                        )
+                        page_parts.append(f"width {width_min}-{float(width_mean):.1f}")
                 if page_parts:
                     parts.append("MLP pages " + ", ".join(page_parts))
         q4 = evidence.get("q4")
@@ -1071,19 +1259,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             if isinstance(q4_request, dict):
                 prefetch_calls = q4_request.get("page_mlp_prefetch_calls")
                 prefetch_pages = q4_request.get("page_mlp_prefetch_pages")
-                requested_pages = q4_request.get(
-                    "page_mlp_prefetch_requested_pages"
-                )
-                selected_pages = q4_request.get(
-                    "page_mlp_prefetch_selected_pages"
-                )
+                requested_pages = q4_request.get("page_mlp_prefetch_requested_pages")
+                selected_pages = q4_request.get("page_mlp_prefetch_selected_pages")
                 prefetch_bytes = q4_request.get("page_mlp_prefetch_bytes")
-                consumed = q4_request.get(
-                    "page_mlp_prefetch_consumed_leases"
-                )
-                declines = q4_request.get(
-                    "page_mlp_prefetch_budget_declines"
-                )
+                consumed = q4_request.get("page_mlp_prefetch_consumed_leases")
+                declines = q4_request.get("page_mlp_prefetch_budget_declines")
                 budget_fraction_sum = q4_request.get(
                     "page_mlp_prefetch_budget_fraction_sum_ppm"
                 )
@@ -1103,9 +1283,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                         f"{prefetch_pages} pages fully advised, "
                         f"{prefetch_bytes / 1024**2:.1f} MiB advised"
                     )
-                    if (
-                        isinstance(budget_fraction_sum, int)
-                        and not isinstance(budget_fraction_sum, bool)
+                    if isinstance(budget_fraction_sum, int) and not isinstance(
+                        budget_fraction_sum, bool
                     ):
                         detail += (
                             f", {budget_fraction_sum / prefetch_calls / 10_000:.1f}% "
@@ -1179,9 +1358,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             mtp = None
             if isinstance(provider, dict):
                 provider_parts = []
-                provider_tournaments = provider.get(
-                    "provider_tournament_calls"
-                )
+                provider_tournaments = provider.get("provider_tournament_calls")
                 if (
                     isinstance(provider_tournaments, int)
                     and not isinstance(provider_tournaments, bool)
@@ -1262,11 +1439,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     markov_parts.append(f"{counterfactual} counterfactual labels")
                 deep = markov.get("recursive_trace_feedback_tokens")
                 depth = markov.get("recursive_trace_max_position")
-                if (
-                    isinstance(deep, int)
-                    and not isinstance(deep, bool)
-                    and deep > 0
-                ):
+                if isinstance(deep, int) and not isinstance(deep, bool) and deep > 0:
                     markov_parts.append(
                         f"{deep} deep labels"
                         + (
@@ -1285,9 +1458,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 ):
                     markov_parts.append(f"dialect {float(similarity):.2f}")
                 ricci_builds = markov.get("ricci_working_set_builds")
-                ricci_episodes = markov.get(
-                    "ricci_working_set_selected_episodes"
-                )
+                ricci_episodes = markov.get("ricci_working_set_selected_episodes")
                 ricci_tokens = markov.get("ricci_working_set_selected_tokens")
                 ricci_age = markov.get("ricci_working_set_oldest_age")
                 if (
@@ -1514,7 +1685,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 raise ValueError("max_requests must be a positive integer")
         elif interactive:
             if message is not None:
-                raise ValueError("chat message and --interactive are mutually exclusive")
+                raise ValueError(
+                    "chat message and --interactive are mutually exclusive"
+                )
             if output_mode != "text":
                 raise ValueError("interactive chat requires --output text")
             if max_requests is not None and (
@@ -1543,9 +1716,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             getattr(args, "markov_o1_retention", None),
             "IMMER_QWEN38_MARKOV_O1_RETENTION",
         )
-        disable_mlp_page_route = bool(
-            getattr(args, "no_mlp_page_route", False)
-        )
+        disable_mlp_page_route = bool(getattr(args, "no_mlp_page_route", False))
         if disable_mlp_page_route and getattr(args, "mlp_page_state", None):
             raise ValueError(
                 "--mlp-page-state and --no-mlp-page-route are mutually exclusive"
@@ -1577,11 +1748,15 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         disable_mlp_page_coordinate = bool(
             getattr(args, "no_mlp_page_coordinate", False)
         )
-        if disable_mlp_page_coordinate and getattr(
-            args,
-            "mlp_page_coordinate_state",
-            None,
-        ) is not None:
+        if (
+            disable_mlp_page_coordinate
+            and getattr(
+                args,
+                "mlp_page_coordinate_state",
+                None,
+            )
+            is not None
+        ):
             raise ValueError(
                 "--mlp-page-coordinate-state and "
                 "--no-mlp-page-coordinate are mutually exclusive"
@@ -1607,20 +1782,23 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         if mlp_page_coordinate_state_path is not None and (
             q4_root is None or mlp_page_state_path is None
         ):
-            raise ValueError(
-                "MLP page coordinates require local Q4 MLP page routing"
-            )
-        if (
-            mlp_page_coordinate_state_path is not None
-            and args.compute_dtype not in {"auto", "bfloat16"}
-        ):
+            raise ValueError("MLP page coordinates require local Q4 MLP page routing")
+        if mlp_page_coordinate_state_path is not None and args.compute_dtype not in {
+            "auto",
+            "bfloat16",
+        }:
             raise ValueError(
                 "MLP page coordinates require bfloat16 compute; pass "
                 "--no-mlp-page-coordinate to use another dtype"
             )
         args.mlp_page_coordinate_state = mlp_page_coordinate_state_path
-        if bool(getattr(args, "no_markov_draft", False)) and markov_atlas_path is not None:
-            raise ValueError("--markov-atlas and --no-markov-draft are mutually exclusive")
+        if (
+            bool(getattr(args, "no_markov_draft", False))
+            and markov_atlas_path is not None
+        ):
+            raise ValueError(
+                "--markov-atlas and --no-markov-draft are mutually exclusive"
+            )
         if (
             bool(getattr(args, "no_markov_draft", False))
             and markov_o1_retention_path is not None
@@ -1648,14 +1826,16 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             and bundle_path == _QWEN38_DEPLOYMENT_ROOT
         ):
             markov_o1_retention_path = _QWEN38_DEPLOYMENT_O1_RETENTION
-        disable_context_crystal = bool(
-            getattr(args, "no_context_crystal", False)
-        )
-        if disable_context_crystal and getattr(
-            args,
-            "context_crystal_state",
-            None,
-        ) is not None:
+        disable_context_crystal = bool(getattr(args, "no_context_crystal", False))
+        if (
+            disable_context_crystal
+            and getattr(
+                args,
+                "context_crystal_state",
+                None,
+            )
+            is not None
+        ):
             raise ValueError(
                 "--context-crystal-state and --no-context-crystal are "
                 "mutually exclusive"
@@ -1675,25 +1855,26 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             and bundle_path == _QWEN38_DEPLOYMENT_ROOT
             and q4_root is not None
         ):
-            context_crystal_state_path = (
-                _QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE
-            )
+            context_crystal_state_path = _QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE
         if context_crystal_state_path is not None and (
             draft_mode not in {"hybrid", "markov"} or q4_root is None
         ):
             raise ValueError(
-                "contextual continuation Crystals require Q4 Markov or "
-                "hybrid drafting"
+                "contextual continuation Crystals require Q4 Markov or hybrid drafting"
             )
         args.context_crystal_state = context_crystal_state_path
         disable_attention_output_crystal = bool(
             getattr(args, "no_attention_output_crystal", False)
         )
-        if disable_attention_output_crystal and getattr(
-            args,
-            "attention_output_crystal_state",
-            None,
-        ) is not None:
+        if (
+            disable_attention_output_crystal
+            and getattr(
+                args,
+                "attention_output_crystal_state",
+                None,
+            )
+            is not None
+        ):
             raise ValueError(
                 "--attention-output-crystal-state and "
                 "--no-attention-output-crystal are mutually exclusive"
@@ -1716,15 +1897,100 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 _QWEN38_DEPLOYMENT_ATTENTION_OUTPUT_CRYSTAL_STATE
             )
         if attention_output_crystal_state_path is not None and q4_root is None:
-            raise ValueError(
-                "attention-output Crystals require local Q4 execution"
+            raise ValueError("attention-output Crystals require local Q4 execution")
+        args.attention_output_crystal_state = attention_output_crystal_state_path
+        layer_transition_crystal_state_path = _chat_path(
+            getattr(args, "layer_transition_crystal_state", None),
+            "IMMER_QWEN38_LAYER_TRANSITION_CRYSTAL_STATE",
+        )
+        layer_transition_crystal_atlas_path = _chat_path(
+            getattr(args, "layer_transition_crystal_atlas", None),
+            "IMMER_QWEN38_LAYER_TRANSITION_ATLAS",
+        )
+        layer_transition_crystal_compute_root = _chat_path(
+            getattr(args, "layer_transition_crystal_compute_root", None),
+            "IMMER_QWEN38_LAYER_TRANSITION_COMPUTE_ROOT",
+        )
+        layer_transition_crystal_max_error_radius = _finite_non_negative_float(
+            getattr(
+                args,
+                "layer_transition_crystal_max_error_radius",
+                0.0,
             )
-        args.attention_output_crystal_state = (
-            attention_output_crystal_state_path
         )
-        disable_draft_window = bool(
-            getattr(args, "no_draft_window_controller", False)
+        if layer_transition_crystal_state_path is not None and q4_root is None:
+            raise ValueError("layer-transition Crystals require local Q4 execution")
+        if (
+            layer_transition_crystal_state_path is not None
+            and not layer_transition_crystal_state_path.is_file()
+        ):
+            raise ValueError(
+                "--layer-transition-crystal-state must name an existing sealed file"
+            )
+        if (
+            layer_transition_crystal_state_path is not None
+            and layer_transition_crystal_atlas_path is None
+        ):
+            raise ValueError(
+                "--layer-transition-crystal-state requires "
+                "--layer-transition-crystal-atlas"
+            )
+        if (
+            layer_transition_crystal_state_path is not None
+            and layer_transition_crystal_compute_root is None
+        ):
+            raise ValueError(
+                "--layer-transition-crystal-state requires "
+                "--layer-transition-crystal-compute-root"
+            )
+        if (
+            layer_transition_crystal_state_path is None
+            and layer_transition_crystal_atlas_path is not None
+        ):
+            raise ValueError(
+                "--layer-transition-crystal-atlas requires "
+                "--layer-transition-crystal-state"
+            )
+        if (
+            layer_transition_crystal_state_path is None
+            and layer_transition_crystal_compute_root is not None
+        ):
+            raise ValueError(
+                "--layer-transition-crystal-compute-root requires "
+                "--layer-transition-crystal-state"
+            )
+        if layer_transition_crystal_atlas_path is not None:
+            _require_existing_real_directory(
+                layer_transition_crystal_atlas_path,
+                "--layer-transition-crystal-atlas",
+            )
+        if layer_transition_crystal_compute_root is not None:
+            _require_existing_real_directory(
+                layer_transition_crystal_compute_root,
+                "--layer-transition-crystal-compute-root",
+            )
+        if (
+            layer_transition_crystal_state_path is not None
+            and args.compute_dtype not in {"auto", "bfloat16"}
+        ):
+            raise ValueError("layer-transition Crystals require bfloat16 compute")
+        if (
+            layer_transition_crystal_state_path is None
+            and layer_transition_crystal_max_error_radius != 0.0
+        ):
+            raise ValueError(
+                "--layer-transition-crystal-max-error-radius requires "
+                "--layer-transition-crystal-state"
+            )
+        args.layer_transition_crystal_state = layer_transition_crystal_state_path
+        args.layer_transition_crystal_atlas = layer_transition_crystal_atlas_path
+        args.layer_transition_crystal_compute_root = (
+            layer_transition_crystal_compute_root
         )
+        args.layer_transition_crystal_max_error_radius = (
+            layer_transition_crystal_max_error_radius
+        )
+        disable_draft_window = bool(getattr(args, "no_draft_window_controller", False))
         if disable_draft_window and getattr(args, "draft_window_state", None):
             raise ValueError(
                 "--draft-window-state and --no-draft-window-controller are mutually exclusive"
@@ -1760,9 +2026,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 anchor_cache_path = str(_QWEN38_DEPLOYMENT_ANCHOR_CACHE)
         args.qwen38_anchor_cache = anchor_cache_path
         runtime_code_revision = _qwen38_runtime_code_revision()
-        warm_runtime_code_revision = (
-            None if args.raw_qwen else runtime_code_revision
-        )
+        warm_runtime_code_revision = None if args.raw_qwen else runtime_code_revision
         warm_profile_sha256 = (
             None
             if args.raw_qwen
@@ -1779,9 +2043,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             )
         )
         warm_root = (
-            None
-            if args.raw_qwen
-            else _resolve_qwen38_warm_root(args, bundle_path)
+            None if args.raw_qwen else _resolve_qwen38_warm_root(args, bundle_path)
         )
         service_profile_sha256 = _qwen38_service_profile(
             args,
@@ -1796,12 +2058,8 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             markov_atlas_path=markov_atlas_path,
             markov_o1_retention_path=markov_o1_retention_path,
             mlp_page_state_path=mlp_page_state_path,
-            attention_output_crystal_state_path=(
-                attention_output_crystal_state_path
-            ),
-            mlp_page_coordinate_enabled=(
-                mlp_page_coordinate_state_path is not None
-            ),
+            attention_output_crystal_state_path=(attention_output_crystal_state_path),
+            mlp_page_coordinate_enabled=(mlp_page_coordinate_state_path is not None),
             draft_window_state_path=draft_window_state_path,
             runtime_code_revision=runtime_code_revision,
         )
@@ -1814,9 +2072,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                     session_id=None,
                     request_id=secrets.token_hex(16),
                 )
-                remote_profile = ping.result.evidence.get(
-                    "runtime_profile_sha256"
-                )
+                remote_profile = ping.result.evidence.get("runtime_profile_sha256")
             except (OSError, QwenServiceError):
                 service_client.close()
             else:
@@ -1890,7 +2146,10 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                             None
                             if q4_root is None
                             or not (q4_root / "manifest.json").is_file()
-                                else _path_sha256(q4_root / "manifest.json")
+                            else _path_sha256(q4_root / "manifest.json")
+                        ),
+                        "layer_transition_crystal": (
+                            _qwen38_layer_transition_crystal_policy(args)
                         ),
                         "prefix_sinkhorn": bool(args.prefix_sinkhorn),
                         "raw_qwen": bool(args.raw_qwen),
@@ -1951,9 +2210,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 except Exception:
                     directive = None
                 if directive is not None:
-                    metadata[QWEN38_INFERENCE_ACTION_METADATA] = (
-                        directive.to_document()
-                    )
+                    metadata[QWEN38_INFERENCE_ACTION_METADATA] = directive.to_document()
             if warm_profile_sha256 is None or prompt_tokenizer is None:
                 return metadata
             from .runtimes.qwen3_8.cartography_probe import (
@@ -1993,9 +2250,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 }
             )
             if semantic_key is not None:
-                metadata[QWEN_SEMANTIC_REPLAY_METADATA_KEY] = (
-                    semantic_key.to_document()
-                )
+                metadata[QWEN_SEMANTIC_REPLAY_METADATA_KEY] = semantic_key.to_document()
             return metadata
 
         def fit_interactive_history(
@@ -2013,8 +2268,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 )
                 token_count = len(prompt_tokenizer.encode(rendered))
                 if (
-                    token_count <= args.max_prompt_tokens
-                    and len(retained) <= 128
+                    token_count <= args.max_prompt_tokens and len(retained) <= 128
                 ) or not retained:
                     return retained, dropped, token_count
                 retained = retained[2:]
@@ -2184,9 +2438,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                         verify_prompt_token if warm_profile_sha256 is not None else None
                     ),
                     semantic_key_verifier=(
-                        verify_semantic_key
-                        if warm_profile_sha256 is not None
-                        else None
+                        verify_semantic_key if warm_profile_sha256 is not None else None
                     ),
                 )
         anchor_cache = (
@@ -2264,6 +2516,24 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 None
                 if attention_output_crystal_state_path is None
                 else str(attention_output_crystal_state_path)
+            ),
+            layer_transition_crystal_state_path=(
+                None
+                if layer_transition_crystal_state_path is None
+                else str(layer_transition_crystal_state_path)
+            ),
+            layer_transition_crystal_atlas_path=(
+                None
+                if layer_transition_crystal_atlas_path is None
+                else str(layer_transition_crystal_atlas_path)
+            ),
+            layer_transition_crystal_compute_root=(
+                None
+                if layer_transition_crystal_compute_root is None
+                else str(layer_transition_crystal_compute_root)
+            ),
+            layer_transition_crystal_max_error_radius=(
+                layer_transition_crystal_max_error_radius
             ),
             mtp_draft_state_path=mtp_draft_state,
             draft_window_state_path=(
@@ -3225,7 +3495,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--qwen38-root",
         help="local Qwen3.8 root containing bundle, tokenizer, causal graph and Q4/Q8",
     )
-    doctor.add_argument("--qwen38-causal-bundle", help="override the causal bundle root")
+    doctor.add_argument(
+        "--qwen38-causal-bundle", help="override the causal bundle root"
+    )
     doctor.add_argument("--qwen38-tokenizer", help="override tokenizer.json")
     doctor.add_argument("--qwen38-q4", help="override the packed Q4/Q8 bank")
     solve = sub.add_parser("solve", help="run the guarded S3 + FERTIG exact cascade")
@@ -3365,6 +3637,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable the deployed exact attention-output Crystal bank",
     )
     chat.add_argument(
+        "--layer-transition-crystal-state",
+        help=(
+            "existing sealed private layer-63 K1 transition Crystal bank; "
+            "no bank is mounted by default"
+        ),
+    )
+    chat.add_argument(
+        "--layer-transition-crystal-atlas",
+        help=(
+            "existing O1 Semantic Atlas authority whose authenticated history "
+            "contains the private layer-63 bank revision"
+        ),
+    )
+    chat.add_argument(
+        "--layer-transition-crystal-compute-root",
+        help=(
+            "existing Compute Crystal bank whose authenticated operator-graph "
+            "history contains the private layer-63 bank revision"
+        ),
+    )
+    chat.add_argument(
+        "--layer-transition-crystal-max-error-radius",
+        type=_finite_non_negative_float,
+        default=0.0,
+        metavar="RADIUS",
+        help=(
+            "maximum admitted artifact error radius for the private BF16 "
+            "layer-63 bank (default: 0)"
+        ),
+    )
+    chat.add_argument(
         "--mtp-draft-state",
         help="persistent embedded-MTP reliability state",
     )
@@ -3461,9 +3764,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat.add_argument(
         "--mlp-page-state",
-        help=(
-            "persistent Markov page routes that execute selected Q4 MLP pages"
-        ),
+        help=("persistent Markov page routes that execute selected Q4 MLP pages"),
     )
     chat.add_argument(
         "--mlp-page-width",
@@ -3478,9 +3779,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat.add_argument(
         "--mlp-page-coordinate-state",
-        help=(
-            "persistent exact K1 MLP page actions keyed by target BF16 inputs"
-        ),
+        help=("persistent exact K1 MLP page actions keyed by target BF16 inputs"),
     )
     chat.add_argument(
         "--no-mlp-page-coordinate",

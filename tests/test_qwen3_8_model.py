@@ -28,6 +28,11 @@ from immer.runtimes.qwen3_8.model import (
     StreamedQwen38,
 )
 from immer.runtimes.qwen3_8.kernels import AttentionState, DeltaNetState
+from immer.runtimes.qwen3_8.layer_transition_crystal import (
+    LayerTransitionCrystalBank,
+    LayerTransitionCrystalIdentity,
+    LayerTransitionProjectionIdentity,
+)
 from immer.runtimes.qwen3_8.mlp_page_coordinate import (
     MlpPageCoordinateBank,
     MlpPageCoordinateIdentity,
@@ -322,6 +327,19 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertTrue(report["vision_excluded"])
         self.assertTrue(report["mtp_excluded"])
 
+    def test_layer_endpoint_capture_keeps_fused_mlp_eligible(self) -> None:
+        self.model.layer_boundary_observer = lambda *_args: None
+        self.model.layer_boundary_layers = (3,)
+        self.model.layer_boundary_stages = ("layer.input", "layer.output")
+        self.assertFalse(self.model._requires_unfused_mlp_boundaries(3))
+        self.model.layer_boundary_stages = (
+            "layer.input",
+            "mlp.output",
+            "layer.output",
+        )
+        self.assertTrue(self.model._requires_unfused_mlp_boundaries(3))
+        self.assertFalse(self.model._requires_unfused_mlp_boundaries(2))
+
     def test_tied_qwen35_head_and_f32_controls_execute_without_lm_head(self) -> None:
         config = _tiny_tied_config()
         tensors = _tiny_weights(config)
@@ -372,8 +390,7 @@ class Qwen38ModelTests(unittest.TestCase):
     def test_grouped_token_row_projections_are_bit_exact(self) -> None:
         generator = torch.Generator().manual_seed(381)
         rows = tuple(
-            torch.randn((1, 1, self.config.dim), generator=generator)
-            for _ in range(3)
+            torch.randn((1, 1, self.config.dim), generator=generator) for _ in range(3)
         )
         groups = (
             tuple(
@@ -634,10 +651,7 @@ class Qwen38ModelTests(unittest.TestCase):
                 outputs = model._mlp_token_rows(rows, layer=1)
                 self.assertEqual(len(outputs), 2)
                 self.assertTrue(
-                    all(
-                        torch.equal(row, torch.full_like(row, 0.75))
-                        for row in outputs
-                    )
+                    all(torch.equal(row, torch.full_like(row, 0.75)) for row in outputs)
                 )
                 self.assertEqual(full.call_count, 1)
                 self.assertEqual(selected.call_count, 2)
@@ -1009,7 +1023,9 @@ class Qwen38ModelTests(unittest.TestCase):
         with self.assertRaisesRegex(Qwen38RuntimeError, "stale"):
             model.discard_continuation_block(stage)
 
-    def test_exact_mlp_without_sparse_executor_requests_no_weight_observer(self) -> None:
+    def test_exact_mlp_without_sparse_executor_requests_no_weight_observer(
+        self,
+    ) -> None:
         hidden = torch.ones(1, 1, self.config.dim)
         with mock.patch.object(
             self.pager,
@@ -1202,7 +1218,9 @@ class Qwen38ModelTests(unittest.TestCase):
             )
             self.assertTrue(torch.isfinite(values).all())
 
-    def test_delta_head_router_changes_only_continuation_output_projection(self) -> None:
+    def test_delta_head_router_changes_only_continuation_output_projection(
+        self,
+    ) -> None:
         class Router:
             def __init__(self, width: int) -> None:
                 self.width = width
@@ -1653,9 +1671,7 @@ class Qwen38ModelTests(unittest.TestCase):
             try:
                 baseline.prefill([[1, 4]])
                 baseline_stage = baseline.stage_continuation_block([[9, 8]])
-                baseline_hidden, _ = baseline.commit_continuation_block(
-                    baseline_stage
-                )
+                baseline_hidden, _ = baseline.commit_continuation_block(baseline_stage)
                 baseline_states = _clone_layer_states(baseline._layer_states)
             finally:
                 baseline.reset_state(release=True)
@@ -1664,9 +1680,7 @@ class Qwen38ModelTests(unittest.TestCase):
             model.reset_state()
             model.prefill([[1, 4]])
             partial_hit_stage = model.stage_continuation_block([[9, 8]])
-            partial_hit_hidden, _ = model.commit_continuation_block(
-                partial_hit_stage
-            )
+            partial_hit_hidden, _ = model.commit_continuation_block(partial_hit_stage)
             torch.testing.assert_close(
                 partial_hit_hidden,
                 baseline_hidden,
@@ -1791,9 +1805,7 @@ class Qwen38ModelTests(unittest.TestCase):
     ) -> None:
         tokens = tuple(range(5, 21))
         for stage_width in (2, 4, 8, 16):
-            commit_widths = tuple(
-                sorted({1, stage_width // 2, stage_width - 1})
-            )
+            commit_widths = tuple(sorted({1, stage_width // 2, stage_width - 1}))
             for commit_width in commit_widths:
                 with self.subTest(
                     stage_width=stage_width,
@@ -1850,7 +1862,9 @@ class Qwen38ModelTests(unittest.TestCase):
                             token_model._layer_states,
                         )
                         self.assertEqual(block_model.next_position, 2 + commit_width)
-                        self.assertEqual(evidence.input_token_ids, (tokens[:commit_width],))
+                        self.assertEqual(
+                            evidence.input_token_ids, (tokens[:commit_width],)
+                        )
                         self.assertEqual(evidence.end_pos, 2 + commit_width)
                         for key in (
                             "tensor_reads",
@@ -1905,9 +1919,7 @@ class Qwen38ModelTests(unittest.TestCase):
                 )
 
             direct_hidden, _ = direct.commit_continuation_prefix(direct_stage, 2)
-            extended_hidden, _ = extended.commit_continuation_prefix(
-                extended_stage, 2
-            )
+            extended_hidden, _ = extended.commit_continuation_prefix(extended_stage, 2)
 
             self.assertTrue(torch.equal(direct_hidden, extended_hidden))
             _assert_layer_states_equal(
@@ -1919,7 +1931,9 @@ class Qwen38ModelTests(unittest.TestCase):
             for pager in pagers:
                 pager.close()
 
-    def test_failed_prefix_reconstruction_consumes_stage_and_preserves_base(self) -> None:
+    def test_failed_prefix_reconstruction_consumes_stage_and_preserves_base(
+        self,
+    ) -> None:
         self.model.prefill([[1, 4]])
         base = _clone_layer_states(self.model._layer_states)
         stage = self.model.stage_continuation_block([[9, 7, 6, 5]])
@@ -2474,9 +2488,7 @@ class Qwen38ModelTests(unittest.TestCase):
                         kwargs = {}
                         if mode == "stable":
                             kwargs = {
-                                "graft": Qwen38StableCrsaGraft(
-                                    mode="crsa", alpha=0.1
-                                ),
+                                "graft": Qwen38StableCrsaGraft(mode="crsa", alpha=0.1),
                                 "graft_layer": 27,
                             }
                         else:
@@ -2511,7 +2523,9 @@ class Qwen38ModelTests(unittest.TestCase):
                         stage = block.stage_continuation_block([[9, 7, 6, 5]])
                         self.assertEqual(head_rows[0], [])
                         self.assertEqual(operator_rows[0], [])
-                        expected_rows = [tokenwise.decode([[token]])[0] for token in (9, 7)]
+                        expected_rows = [
+                            tokenwise.decode([[token]])[0] for token in (9, 7)
+                        ]
 
                         actual, _ = block.commit_continuation_prefix(stage, 2)
 
@@ -4034,6 +4048,219 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
                 native_head_crsa_observer=self.observed.append,
                 max_seq_len=16,
             )
+
+
+class LayerTransitionCrystalModelTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.config = _official_topology_tiny_config()
+        save_file(_tiny_weights(self.config), self.root / "model.safetensors")
+        self.source = Streamer.from_local(self.root, budget_mb=20, use_cache=False)
+        self.pager = Qwen38WeightPager(
+            self.source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=2 * 1024**2,
+        )
+        self.model = StreamedQwen38(
+            self.config,
+            self.pager,
+            max_batch_size=1,
+            max_seq_len=16,
+        )
+
+    def tearDown(self) -> None:
+        self.pager.q4_bank = None
+        self.pager.close()
+        self.source.close()
+        self.temporary.cleanup()
+
+    def _identity(self, q4_sha256: str) -> LayerTransitionCrystalIdentity:
+        return LayerTransitionCrystalIdentity(
+            model_sha256=self.model.layer_transition_crystal_model_sha256(),
+            q4_sha256=q4_sha256,
+            graph_revision_sha256="3" * 64,
+            atlas_revision_sha256="4" * 64,
+            projection=LayerTransitionProjectionIdentity(
+                hidden_dim=self.config.dim,
+                sketch_dim=3,
+                seed_sha256="5" * 64,
+            ),
+        )
+
+    def test_attach_binds_model_q4_and_physical_inventory(self) -> None:
+        entries = {
+            name: {"payload_bytes": 1000 + index}
+            for index, name in enumerate(self.model._layer_transition_q4_names())
+        }
+        q4_identity = {"manifest_sha256": "6" * 64, "schema": "fixture-q4/v1"}
+        self.pager.q4_bank = SimpleNamespace(
+            entries=entries,
+            has=lambda name: name in entries,
+            identity=q4_identity,
+        )
+        identity = self._identity(self.model.layer_transition_crystal_q4_sha256())
+        bank = LayerTransitionCrystalBank(
+            self.root / "layer-transition.json",
+            identity,
+        )
+
+        self.model.attach_layer_transition_crystal_bank(
+            bank,
+            max_error_radius=0.25,
+            graph_revision_sha256=identity.graph_revision_sha256,
+            atlas_revision_sha256=identity.atlas_revision_sha256,
+        )
+
+        self.assertIs(self.model.layer_transition_crystal_bank, bank)
+        self.assertTrue(self.model.layer_transition_crystal_enabled)
+        self.assertEqual(self.model.layer_transition_crystal_max_error_radius, 0.25)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "model pin"):
+            other = LayerTransitionCrystalBank(
+                self.root / "other-layer-transition.json",
+                LayerTransitionCrystalIdentity(
+                    model_sha256="7" * 64,
+                    q4_sha256=identity.q4_sha256,
+                    graph_revision_sha256=identity.graph_revision_sha256,
+                    atlas_revision_sha256=identity.atlas_revision_sha256,
+                    projection=identity.projection,
+                ),
+            )
+            self.model.attach_layer_transition_crystal_bank(
+                other,
+                graph_revision_sha256=other.identity.graph_revision_sha256,
+                atlas_revision_sha256=other.identity.atlas_revision_sha256,
+            )
+        with self.assertRaisesRegex(Qwen38RuntimeError, "graph authority"):
+            self.model.attach_layer_transition_crystal_bank(
+                bank,
+                graph_revision_sha256="8" * 64,
+                atlas_revision_sha256=identity.atlas_revision_sha256,
+            )
+        self.model.attach_layer_transition_crystal_bank(None)
+
+    def test_k1_hit_skips_q_o_and_mlp_but_appends_exact_live_kv(self) -> None:
+        layer = self.config.n_layers - 1
+        hidden = torch.randn((1, 1, self.config.dim)).to(torch.bfloat16)
+        mask = torch.ones((1, 1), dtype=torch.bool)
+        expected_hidden, expected_state = self.model._forward_layer(
+            hidden,
+            layer=layer,
+            token_mask=mask,
+            state=None,
+            start_pos=0,
+            stateful=True,
+        )
+        self.assertIsInstance(expected_state, AttentionState)
+
+        avoided_bytes = 123_456
+        replacement = SimpleNamespace(
+            output=expected_hidden.clone(),
+            logical_weight_bytes_replaced=avoided_bytes,
+        )
+        bank = SimpleNamespace(
+            identity=SimpleNamespace(
+                atlas_revision_sha256="a" * 64,
+                graph_revision_sha256="b" * 64,
+                identity_sha256="c" * 64,
+                model_sha256="d" * 64,
+                q4_sha256="e" * 64,
+            ),
+            metrics=lambda: SimpleNamespace(
+                to_dict=lambda: {"attempts": 1, "fallbacks": 0, "replacements": 1}
+            ),
+            replace=mock.Mock(return_value=replacement),
+        )
+        self.model.layer_transition_crystal_bank = bank
+        self.model.layer_transition_crystal_enabled = True
+        self.model.layer_transition_crystal_max_error_radius = 0.0
+
+        original_linear_group = self.pager.linear_group
+        projected_names: list[tuple[str, ...]] = []
+
+        def record_linear_group(value, names):
+            projected_names.append(tuple(names))
+            return original_linear_group(value, names)
+
+        with (
+            mock.patch.object(
+                self.model,
+                "_layer_transition_avoided_q4_bytes",
+                return_value=avoided_bytes,
+            ),
+            mock.patch.object(
+                self.pager,
+                "linear_group",
+                side_effect=record_linear_group,
+            ),
+            mock.patch.object(
+                self.model,
+                "_full_attention",
+                side_effect=AssertionError("full attention executed"),
+            ),
+            mock.patch.object(
+                self.model,
+                "_mlp",
+                side_effect=AssertionError("MLP executed"),
+            ),
+        ):
+            actual_hidden, actual_state = self.model._forward_layer(
+                hidden,
+                layer=layer,
+                token_mask=mask,
+                state=None,
+                start_pos=0,
+                stateful=True,
+            )
+
+        self.assertTrue(torch.equal(actual_hidden, expected_hidden))
+        self.assertIsInstance(actual_state, AttentionState)
+        assert isinstance(actual_state, AttentionState)
+        assert isinstance(expected_state, AttentionState)
+        self.assertTrue(torch.equal(actual_state.key, expected_state.key))
+        self.assertTrue(torch.equal(actual_state.value, expected_state.value))
+        self.assertEqual(
+            projected_names,
+            [
+                (
+                    f"model.language_model.layers.{layer}.self_attn.k_proj",
+                    f"model.language_model.layers.{layer}.self_attn.v_proj",
+                )
+            ],
+        )
+        bank.replace.assert_called_once_with(hidden, max_error_radius=0.0)
+        metrics = self.model.layer_transition_crystal_metrics()
+        self.assertEqual(metrics["physical_transitions"], 1)
+        self.assertEqual(metrics["exact_kv_state_updates"], 1)
+        self.assertEqual(metrics["skipped_q4_matrix_calls"], 5)
+        self.assertEqual(metrics["packed_weight_bytes_avoided"], avoided_bytes)
+
+    def test_miss_falls_through_without_partial_state_or_savings(self) -> None:
+        layer = self.config.n_layers - 1
+        hidden = torch.randn((1, 1, self.config.dim)).to(torch.bfloat16)
+        mask = torch.ones((1, 1), dtype=torch.bool)
+        bank = SimpleNamespace(replace=mock.Mock(return_value=None))
+        self.model.layer_transition_crystal_bank = bank
+        self.model.layer_transition_crystal_enabled = True
+
+        actual_hidden, actual_state = self.model._forward_layer(
+            hidden,
+            layer=layer,
+            token_mask=mask,
+            state=None,
+            start_pos=0,
+            stateful=True,
+        )
+
+        self.assertEqual(tuple(actual_hidden.shape), (1, 1, self.config.dim))
+        self.assertIsInstance(actual_state, AttentionState)
+        bank.replace.assert_called_once()
+        self.assertEqual(self.model._layer_transition_crystal_hits, 0)
+        self.assertEqual(
+            self.model._layer_transition_crystal_packed_weight_bytes_avoided,
+            0,
+        )
 
 
 if __name__ == "__main__":
