@@ -333,7 +333,7 @@ def _layer_contextual_continuation_runtime_sha256() -> str:
 
     return _digest(
         {
-            "markov_provider_abi": MARKOV_DRAFT_PROVIDER_ABI,
+            "markov_provider_abi": _DRAFT_WINDOW_MARKOV_ECONOMICS_ABI,
             "projection_abi": LAYER_CONTEXTUAL_PROJECTION_ABI,
             "schema": _LAYER_CONTEXTUAL_CONTINUATION_RUNTIME_SCHEMA,
             "stage": LAYER_CONTEXTUAL_STAGE,
@@ -6837,9 +6837,9 @@ class Qwen38CausalChat:
                                 "final-normalized-target-hidden-before-known/v1"
                             ),
                             "hybrid_provider": (
-                                QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA
+                                _DRAFT_WINDOW_HYBRID_ECONOMICS_ABI
                             ),
-                            "markov_provider": MARKOV_DRAFT_PROVIDER_ABI,
+                            "markov_provider": _DRAFT_WINDOW_MARKOV_ECONOMICS_ABI,
                             "mlp_page": mlp_page_identity,
                             "native_head_crsa": (
                                 None
