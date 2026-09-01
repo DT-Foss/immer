@@ -176,6 +176,7 @@ class Qwen38MarkovMtpDraftProvider:
         self.markov_provider = markov_provider
         self._mtp_factory = mtp_factory
         self._restored_prefix_length = restored_prefix_length
+        self._exact_restored_anchor = False
         self._mtp_provider: Qwen35MtpDraftProvider | object | None = None
         self._selected_provider: Literal["markov", "mtp"] | None = None
         self._request_history: tuple[int, ...] | None = None
@@ -259,8 +260,19 @@ class Qwen38MarkovMtpDraftProvider:
         if not isinstance(target_hidden, torch.Tensor):
             raise TypeError("target_hidden must be a torch.Tensor")
         restored = self._restored_prefix_length
+        if restored is not None and (
+            isinstance(restored, bool)
+            or not isinstance(restored, int)
+            or not 1 <= restored <= len(history)
+        ):
+            raise ValueError(
+                "restored hybrid prefix must identify a non-empty prompt prefix"
+            )
+        exact_restored_anchor = restored == len(history)
         expected_hidden_rows = (
-            len(history) if restored is None else len(history) - restored
+            len(history)
+            if restored is None
+            else len(history) - restored + int(exact_restored_anchor)
         )
         if (
             target_hidden.ndim != 3
@@ -268,11 +280,11 @@ class Qwen38MarkovMtpDraftProvider:
             or target_hidden.shape[1] != expected_hidden_rows
             or target_hidden.shape[2] <= 0
             or not target_hidden.is_floating_point()
+            or not bool(torch.isfinite(target_hidden).all().item())
         ):
             raise ValueError("prompt hidden rows must match request history")
-        if restored is not None and not 1 <= restored < len(history):
-            raise ValueError("restored hybrid prefix must leave a prompt suffix")
         self.markov_provider.begin_request(history)
+        self._exact_restored_anchor = exact_restored_anchor
         self._request_history = history
         self._hidden_history = target_hidden.detach().clone().contiguous()
         self._hidden_device = target_hidden.device
@@ -288,6 +300,45 @@ class Qwen38MarkovMtpDraftProvider:
             target_hidden[:, -1:].detach().clone().contiguous()
         )
         self._request_started = True
+
+    def _mtp_bootstrap_hidden(
+        self,
+        history: tuple[int, ...],
+        hidden_history: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select exact carry-seed or strict suffix rows for MTP bootstrap."""
+
+        restored = self._restored_prefix_length
+        expected_rows = (
+            len(history)
+            if restored is None
+            else len(history) - restored + int(self._exact_restored_anchor)
+        )
+        if hidden_history.shape[1] != expected_rows:
+            raise Qwen38MarkovMtpDraftError(
+                "hybrid target-hidden history is not aligned to its restore"
+            )
+        if (
+            self._exact_restored_anchor
+            and restored is not None
+            and len(history) > restored
+        ):
+            return hidden_history[:, 1:].detach().clone().contiguous()
+        return hidden_history.detach().clone().contiguous()
+
+    def _rollback_failed_exact_mtp_init(self, failure: Exception) -> None:
+        try:
+            self.markov_provider.discard_pending_proposal()
+        except Exception as rollback_failure:
+            raise Qwen38MarkovMtpDraftError(
+                "exact restored MTP initialization rollback failed"
+            ) from rollback_failure
+        self._switch_available = False
+        self._hidden_history = None
+        self._round_target_hidden = None
+        raise Qwen38MarkovMtpDraftError(
+            "exact restored MTP carry or seed is invalid"
+        ) from failure
 
     def _validate_history(self, history: tuple[int, ...]) -> None:
         if not isinstance(history, tuple) or not history:
@@ -599,7 +650,9 @@ class Qwen38MarkovMtpDraftProvider:
             != (
                 len(history)
                 if self._restored_prefix_length is None
-                else len(history) - self._restored_prefix_length
+                else len(history)
+                - self._restored_prefix_length
+                + int(self._exact_restored_anchor)
             )
         ):
             # Missing target state is a safe Markov-only fallback.  Keep its
@@ -612,16 +665,21 @@ class Qwen38MarkovMtpDraftProvider:
             mtp = self._load_mtp()
         except Qwen38MarkovMtpDraftError:
             raise
-        except Exception:
+        except Exception as exc:
+            if self._exact_restored_anchor:
+                self._rollback_failed_exact_mtp_init(exc)
             self._mtp_init_failures += 1
             self._switch_available = False
             self._hidden_history = None
             return self._commit_markov_selection(proposal)
         try:
             if hidden_history is not None:
-                mtp.begin_request_state(history, hidden_history.detach().clone())
+                mtp.begin_request_state(
+                    history,
+                    self._mtp_bootstrap_hidden(history, hidden_history),
+                )
                 self._hidden_history = None
-        except Exception:
+        except Exception as exc:
             failed = self._mtp_provider
             self._mtp_provider = None
             if failed is not None:
@@ -629,6 +687,8 @@ class Qwen38MarkovMtpDraftProvider:
                     failed.close()
                 except Exception:
                     pass
+            if self._exact_restored_anchor:
+                self._rollback_failed_exact_mtp_init(exc)
             self._mtp_init_failures += 1
             self._switch_available = False
             self._hidden_history = None
@@ -1162,7 +1222,10 @@ class Qwen38MarkovMtpDraftProvider:
             if hidden_history is None:
                 return None
             mtp = self._load_mtp()
-            mtp.begin_request_state(history, hidden_history.detach().clone())
+            mtp.begin_request_state(
+                history,
+                self._mtp_bootstrap_hidden(history, hidden_history),
+            )
             self._hidden_history = None
         export = getattr(mtp, "export_carry", None)
         if not callable(export):

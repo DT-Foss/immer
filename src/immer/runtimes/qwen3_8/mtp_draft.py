@@ -97,6 +97,49 @@ def _clone_attention_state(state: AttentionState | None) -> AttentionState | Non
     )
 
 
+def qwen35_mtp_carry_identity(
+    config: Qwen38Config,
+    pager: Qwen38WeightPager,
+) -> tuple[object, ...]:
+    """Return the runtime identity required by an in-memory MTP carry."""
+
+    if not isinstance(config, Qwen38Config):
+        raise TypeError("config must be Qwen38Config")
+    if not isinstance(pager, Qwen38WeightPager):
+        raise TypeError("pager must be Qwen38WeightPager")
+    bank = pager.q4_bank
+    if bank is None:
+        raise ValueError("local Q4 bank is required for an MTP carry identity")
+    source_metrics_callback = getattr(pager.source, "metrics", None)
+    source_metrics = (
+        dict(source_metrics_callback())
+        if callable(source_metrics_callback)
+        else {}
+    )
+    return (
+        QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
+        config.dim,
+        config.intermediate_size,
+        config.vocab_size,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        config.rotary_dim,
+        config.partial_rotary_factor,
+        config.rope_theta,
+        config.mrope_interleaved,
+        config.mrope_section,
+        config.rms_norm_eps,
+        config.hidden_act,
+        bank.identity["manifest_sha256"],
+        getattr(pager.source, "repo_id", None),
+        getattr(pager.source, "revision", None),
+        source_metrics.get("inventory_source_fingerprint"),
+        str(pager.device),
+        str(pager.compute_dtype),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Qwen35MtpCarry:
     """One content-bound in-memory MTP cache aligned to a target token prefix."""
@@ -237,6 +280,7 @@ class Qwen35MtpDraftProvider:
         self._last_target_hidden: torch.Tensor | None = None
         self._last_target_hidden_history_length = 0
         self._carry_imported = False
+        self._request_completed = False
         self._next_position = 0
         self._pending_base: tuple[int, ...] | None = None
         self._pending_proposal: tuple[int, ...] | None = None
@@ -359,34 +403,7 @@ class Qwen35MtpDraftProvider:
         return exact
 
     def _carry_identity(self) -> tuple[object, ...]:
-        source_metrics_callback = getattr(self.pager.source, "metrics", None)
-        source_metrics = (
-            dict(source_metrics_callback())
-            if callable(source_metrics_callback)
-            else {}
-        )
-        return (
-            QWEN35_MTP_DRAFT_PROVIDER_SCHEMA,
-            self.config.dim,
-            self.config.intermediate_size,
-            self.config.vocab_size,
-            self.config.n_heads,
-            self.config.n_kv_heads,
-            self.config.head_dim,
-            self.config.rotary_dim,
-            self.config.partial_rotary_factor,
-            self.config.rope_theta,
-            self.config.mrope_interleaved,
-            self.config.mrope_section,
-            self.config.rms_norm_eps,
-            self.config.hidden_act,
-            self.pager.q4_bank.identity["manifest_sha256"],
-            getattr(self.pager.source, "repo_id", None),
-            getattr(self.pager.source, "revision", None),
-            source_metrics.get("inventory_source_fingerprint"),
-            str(self.pager.device),
-            str(self.pager.compute_dtype),
-        )
+        return qwen35_mtp_carry_identity(self.config, self.pager)
 
     def _restore_carry(self, carry: Qwen35MtpCarry) -> None:
         if not isinstance(carry, Qwen35MtpCarry):
@@ -397,7 +414,11 @@ class Qwen35MtpDraftProvider:
         ):
             raise ValueError("MTP carry identity or cursor is invalid")
         history = self._history(carry.history, label="MTP carry history")
-        if carry.next_position != len(history) - 1:
+        if (
+            isinstance(carry.next_position, bool)
+            or not isinstance(carry.next_position, int)
+            or carry.next_position != len(history) - 1
+        ):
             raise ValueError("MTP carry identity or cursor is invalid")
         hidden = self._hidden(
             carry.last_target_hidden,
@@ -833,6 +854,19 @@ class Qwen35MtpDraftProvider:
         if self._carry_imported:
             base = self._committed_history
             previous = self._last_target_hidden
+            if base is not None and previous is not None and committed == base:
+                seed = self._hidden(
+                    target_hidden,
+                    rows=1,
+                    label="MTP exact restored request hidden",
+                )
+                if not torch.equal(seed, previous):
+                    raise Qwen35MtpDraftError(
+                        "MTP exact restore seed differs from its carry boundary"
+                    )
+                self._carry_imported = False
+                self._begin_calls += 1
+                return
             if (
                 base is None
                 or previous is None
@@ -1381,6 +1415,19 @@ class Qwen35MtpDraftProvider:
             last_target_hidden=hidden.detach().clone().contiguous(),
         )
 
+    def export_mtp_carry(
+        self,
+        history: tuple[int, ...],
+        /,
+    ) -> Qwen35MtpCarry:
+        """Export the completed request's exact target-boundary MTP carry."""
+
+        if not self._request_completed:
+            raise Qwen35MtpDraftError(
+                "MTP request must complete before MTP carry export"
+            )
+        return self.export_carry(history)
+
     def observe_final(self, history: tuple[int, ...], /) -> None:
         committed = self._committed_history
         final = self._history(history, label="final MTP history")
@@ -1394,6 +1441,7 @@ class Qwen35MtpDraftProvider:
             )
         self._advance_recursive_traces(final[len(committed) :])
         self._recursive_traces.clear()
+        self._request_completed = True
 
     def metrics(self) -> Qwen35MtpDraftMetrics:
         return Qwen35MtpDraftMetrics(
@@ -1467,6 +1515,7 @@ class Qwen35MtpDraftProvider:
         self._last_target_hidden = None
         self._last_target_hidden_history_length = 0
         self._carry_imported = False
+        self._request_completed = False
         self._pending_base = None
         self._pending_proposal = None
         self._pending_states = ()
@@ -1490,4 +1539,5 @@ __all__ = [
     "Qwen35MtpDraftError",
     "Qwen35MtpDraftMetrics",
     "Qwen35MtpDraftProvider",
+    "qwen35_mtp_carry_identity",
 ]

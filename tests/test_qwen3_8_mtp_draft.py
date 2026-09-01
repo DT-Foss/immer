@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import tempfile
@@ -641,6 +642,162 @@ class Qwen35MtpDraftTests(unittest.TestCase):
         self.assertFalse(full.metrics().carried_context)
         full.close()
         restored.close()
+
+    def test_mtp_carry_exact_restore_reuses_state_without_mtp_work(self) -> None:
+        config = _config()
+        tensors = _tensors(config)
+        history = (4, 7, 11, 19)
+        hidden = torch.randn(
+            (1, len(history), config.dim),
+            generator=torch.Generator().manual_seed(78),
+        ).to(torch.bfloat16)
+        cold = Qwen35MtpDraftProvider(
+            config,
+            _Pager(tensors),
+            proposal_width=3,
+        )
+        cold.begin_request_state(history, hidden)
+        carry = cold.export_carry(history)
+        pager = _Pager(tensors)
+        restored = Qwen35MtpDraftProvider(
+            config,
+            pager,
+            proposal_width=3,
+            initial_carry=carry,
+        )
+
+        with mock.patch.object(
+            restored,
+            "_step",
+            side_effect=AssertionError("exact carry restore must not run MTP"),
+        ):
+            restored.begin_request_state(history, hidden[:, -1:].clone())
+
+        assert cold._committed_state is not None
+        assert restored._committed_state is not None
+        self.assertTrue(
+            torch.equal(cold._committed_state.key, restored._committed_state.key)
+        )
+        self.assertTrue(
+            torch.equal(cold._committed_state.value, restored._committed_state.value)
+        )
+        self.assertIsNot(restored._committed_state, carry.state)
+        self.assertTrue(torch.equal(restored._last_target_hidden, hidden[:, -1:]))
+        self.assertFalse(restored._carry_imported)
+        metrics = restored.metrics()
+        self.assertEqual(metrics.begin_calls, 1)
+        self.assertEqual(metrics.advance_calls, 0)
+        self.assertEqual(metrics.draft_steps, 0)
+        self.assertEqual(metrics.source_body_bytes, 0)
+        self.assertEqual(metrics.logical_weight_bytes, 0)
+        self.assertEqual(pager.linears, 0)
+
+        cold_proposal = cold.propose_round_state(history, 23, hidden[:, -1:])
+        restored_proposal = restored.propose_round_state(
+            history,
+            23,
+            hidden[:, -1:],
+        )
+        self.assertEqual(restored_proposal.token_ids, cold_proposal.token_ids)
+        cold.close()
+        restored.close()
+
+    def test_mtp_exact_restore_rejects_bad_anchor_without_consuming_carry(
+        self,
+    ) -> None:
+        config = _config()
+        tensors = _tensors(config)
+        history = (4, 7, 11)
+        hidden = torch.randn((1, len(history), config.dim)).to(torch.bfloat16)
+        source = Qwen35MtpDraftProvider(
+            config,
+            _Pager(tensors),
+            proposal_width=3,
+        )
+        source.begin_request_state(history, hidden)
+        carry = source.export_carry(history)
+        source.close()
+        pager = _Pager(tensors)
+        restored = Qwen35MtpDraftProvider(
+            config,
+            pager,
+            proposal_width=3,
+            initial_carry=carry,
+        )
+        assert restored._committed_state is not None
+        key = restored._committed_state.key.clone()
+        value = restored._committed_state.value.clone()
+        last_hidden = restored._last_target_hidden.clone()
+
+        invalid_calls = (
+            (history[:-1], hidden[:, -1:]),
+            (history, hidden[:, -2:]),
+            (history, hidden[:, -1:].float()),
+            (history, hidden[:, -1:] + torch.ones_like(hidden[:, -1:])),
+        )
+        for bad_history, bad_hidden in invalid_calls:
+            with self.subTest(history=bad_history, shape=tuple(bad_hidden.shape)):
+                with self.assertRaises((ValueError, Qwen35MtpDraftError)):
+                    restored.begin_request_state(bad_history, bad_hidden)
+                self.assertTrue(restored._carry_imported)
+                self.assertEqual(restored._committed_history, history)
+                self.assertEqual(restored._next_position, len(history) - 1)
+                self.assertEqual(restored.metrics().begin_calls, 0)
+                self.assertEqual(restored.metrics().draft_steps, 0)
+                self.assertTrue(torch.equal(restored._committed_state.key, key))
+                self.assertTrue(torch.equal(restored._committed_state.value, value))
+                self.assertTrue(torch.equal(restored._last_target_hidden, last_hidden))
+
+        restored.begin_request_state(history, hidden[:, -1:])
+        self.assertFalse(restored._carry_imported)
+        self.assertEqual(restored.metrics().begin_calls, 1)
+        restored.close()
+
+        invalid_carries = (
+            replace(carry, identity=(*carry.identity[:-1], "wrong-device")),
+            replace(carry, next_position=True),
+            replace(carry, next_position=len(history)),
+        )
+        for bad_carry in invalid_carries:
+            with self.subTest(cursor=bad_carry.next_position):
+                with self.assertRaises(ValueError):
+                    Qwen35MtpDraftProvider(
+                        config,
+                        _Pager(tensors),
+                        proposal_width=3,
+                        initial_carry=bad_carry,
+                    )
+
+    def test_explicit_mtp_carry_export_requires_completed_exact_boundary(
+        self,
+    ) -> None:
+        config = _config()
+        history = (4, 7, 11)
+        hidden = torch.randn((1, len(history), config.dim)).to(torch.bfloat16)
+        provider = Qwen35MtpDraftProvider(
+            config,
+            _Pager(_tensors(config)),
+            proposal_width=3,
+        )
+        provider.begin_request_state(history, hidden)
+
+        with self.assertRaisesRegex(Qwen35MtpDraftError, "must complete"):
+            provider.export_mtp_carry(history)
+        provider.observe_final(history)
+        with self.assertRaisesRegex(Qwen35MtpDraftError, "not aligned"):
+            provider.export_mtp_carry(history[:-1])
+
+        carry = provider.export_mtp_carry(history)
+        legacy = provider.export_carry(history)
+        self.assertEqual(carry.history, legacy.history)
+        self.assertEqual(carry.next_position, legacy.next_position)
+        self.assertTrue(
+            torch.equal(carry.last_target_hidden, legacy.last_target_hidden)
+        )
+        assert carry.state is not None and legacy.state is not None
+        self.assertTrue(torch.equal(carry.state.key, legacy.state.key))
+        self.assertTrue(torch.equal(carry.state.value, legacy.state.value))
+        provider.close()
 
     def test_mtp_carry_trims_uncommitted_terminal_proposal_state(self) -> None:
         config = _config()

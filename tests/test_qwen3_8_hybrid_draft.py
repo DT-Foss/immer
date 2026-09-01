@@ -354,6 +354,106 @@ class Qwen38HybridDraftTests(unittest.TestCase):
         self.assertTrue(torch.equal(mtp.begin_calls[0][1], suffix_hidden))
         provider.close()
 
+    def test_exact_restored_hybrid_binds_one_seed_row_without_synthetic_state(
+        self,
+    ) -> None:
+        class SeedCarryMtp(_Mtp):
+            def export_carry(self, history):
+                self.export_calls.append(history)
+                return Qwen35MtpCarry(
+                    schema="fixture",
+                    identity=(),
+                    history=history,
+                    next_position=len(history) - 1,
+                    state=None,
+                    last_target_hidden=self.begin_calls[0][1].detach().clone(),
+                )
+
+        markov = _Markov(0.99)
+        mtp = SeedCarryMtp()
+        prompt = (11, 12, 13, 14)
+        seed_hidden = torch.randn((1, 1, 8), dtype=torch.bfloat16)
+        provider = Qwen38MarkovMtpDraftProvider(
+            markov,
+            lambda: mtp,
+            restored_prefix_length=len(prompt),
+        )
+
+        provider.begin_request_state(prompt, seed_hidden)
+        self.assertEqual(provider._hidden_history_rows, 1)
+        self.assertEqual(provider._boundary_history, prompt)
+        self.assertTrue(
+            torch.equal(provider._boundary_target_hidden, seed_hidden)
+        )
+        provider.observe_final(prompt)
+        carry = provider.export_mtp_carry(prompt)
+
+        self.assertEqual(mtp.begin_calls[0][0], prompt)
+        self.assertEqual(tuple(mtp.begin_calls[0][1].shape), (1, 1, 8))
+        self.assertTrue(torch.equal(mtp.begin_calls[0][1], seed_hidden))
+        self.assertTrue(torch.equal(carry.last_target_hidden, seed_hidden))
+        provider.close()
+
+    def test_exact_restored_hybrid_rejects_shape_before_partial_begin(self) -> None:
+        markov = _Markov(0.99)
+        provider = Qwen38MarkovMtpDraftProvider(
+            markov,
+            _Mtp,
+            restored_prefix_length=3,
+        )
+
+        with self.assertRaisesRegex(ValueError, "hidden rows"):
+            provider.begin_request_state(
+                (11, 12, 13),
+                torch.zeros((1, 0, 8), dtype=torch.bfloat16),
+            )
+
+        self.assertEqual(markov.begin_calls, [])
+        self.assertFalse(provider._request_started)
+        self.assertIsNone(provider._request_history)
+        self.assertIsNone(provider._boundary_history)
+        provider.close()
+
+    def test_exact_restored_hybrid_rolls_back_bad_mtp_seed(self) -> None:
+        expected_seed = torch.ones((1, 1, 8), dtype=torch.bfloat16)
+
+        class SeedBoundMtp(_Mtp):
+            def begin_request_state(self, history, hidden):
+                super().begin_request_state(history, hidden)
+                if not torch.equal(hidden, expected_seed):
+                    raise RuntimeError("seed mismatch")
+
+        markov = _Markov(0.01)
+        mtp = SeedBoundMtp()
+        prompt = (11, 12, 13)
+        provider = Qwen38MarkovMtpDraftProvider(
+            markov,
+            lambda: mtp,
+            restored_prefix_length=len(prompt),
+        )
+        provider.begin_request_state(
+            prompt,
+            torch.zeros((1, 1, 8), dtype=torch.bfloat16),
+        )
+
+        with self.assertRaisesRegex(
+            Qwen38MarkovMtpDraftError,
+            "carry or seed is invalid",
+        ):
+            provider.propose_round_state(
+                prompt,
+                14,
+                torch.zeros((1, 1, 8), dtype=torch.bfloat16),
+            )
+
+        self.assertTrue(mtp.closed)
+        self.assertFalse(markov.pending)
+        self.assertEqual(markov.discard_calls, 1)
+        self.assertIsNone(provider.mtp_provider)
+        self.assertIsNone(provider._hidden_history)
+        self.assertFalse(provider._switch_available)
+        provider.close()
+
     def test_terminal_uncommitted_tail_exports_last_target_boundary(self) -> None:
         markov = _Markov(0.01)
         mtp = _Mtp()
