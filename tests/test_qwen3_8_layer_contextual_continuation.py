@@ -23,6 +23,7 @@ from immer.runtimes.qwen3_8.layer_contextual_continuation import (
     LayerContextualContinuationIntegrityError,
     LayerContextualContinuationKey,
     LayerContextualContinuationTransaction,
+    project_layer_contextual_key,
 )
 
 
@@ -128,6 +129,29 @@ class LayerContextualContinuationBankTests(unittest.TestCase):
         )
         with self.assertRaises(LayerContextualContinuationIdentityError):
             changed.query_options(transaction)
+
+    def test_path_free_projection_matches_bank_without_creating_state(self) -> None:
+        self.assertFalse(self.path.exists())
+        expected_bank = LayerContextualContinuationBank(
+            self.path,
+            self.identity,
+            max_cells=8,
+        )
+        expected = expected_bank.project(_hidden(1.0), 1, 41)
+
+        actual = project_layer_contextual_key(
+            self.identity,
+            _hidden(1.0),
+            1,
+            41,
+        )
+
+        self.assertEqual(actual, expected)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(actual.q8.dtype, torch.int8)
+        self.assertTrue(actual.q8.is_contiguous())
+        with self.assertRaisesRegex(ValueError, "outside"):
+            project_layer_contextual_key(self.identity, _hidden(), 2, 41)
 
     def test_queries_are_isolated_by_layer_and_known_token(self) -> None:
         bank = LayerContextualContinuationBank(self.path, self.identity, max_cells=16)

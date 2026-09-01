@@ -54,6 +54,12 @@ from .layer_mlp_crystal import (
     LayerMlpResidualCrystalBank,
     LayerMlpResidualCrystalIdentity,
 )
+from .layer_contextual_continuation import (
+    LayerContextualContinuationIdentity,
+    LayerContextualContinuationKey,
+    LayerContextualContinuationTransaction,
+    project_layer_contextual_key,
+)
 from .layer_transition_crystal import (
     TARGET_LAYER_INDEX,
     LayerTransitionCrystalBank,
@@ -287,6 +293,36 @@ class StatefulBlockStage:
 
 
 @dataclass(frozen=True, slots=True)
+class LayerContextualContinuationSnapshot:
+    """Path-free immutable view of committed layer-boundary transactions."""
+
+    identity: LayerContextualContinuationIdentity | None
+    transactions: tuple[LayerContextualContinuationTransaction, ...]
+    current_boundary: int | None
+    current_transaction: LayerContextualContinuationTransaction | None
+
+    @property
+    def identity_sha256(self) -> str | None:
+        return None if self.identity is None else self.identity.identity_sha256
+
+    @property
+    def current(self) -> LayerContextualContinuationTransaction | None:
+        """Compatibility alias for consumers that name the current boundary."""
+
+        return self.current_transaction
+
+
+@dataclass(slots=True)
+class _LayerContextualCapture:
+    """Ephemeral Q8-only material for one uncommitted model transaction."""
+
+    identity: LayerContextualContinuationIdentity
+    boundaries: tuple[int, ...]
+    known_tokens: dict[int, int]
+    keys: dict[int, dict[int, LayerContextualContinuationKey]]
+
+
+@dataclass(frozen=True, slots=True)
 class _PendingStatefulBlock:
     """Private commit material; never returned to an untrusted verifier."""
 
@@ -302,6 +338,9 @@ class _PendingStatefulBlock:
     delta_head_transaction_owner: Any | None
     attention_output_crystal_transaction_owner: AttentionOutputCrystalTransaction | None
     mlp_page_coordinate_transaction_owner: MlpPageCoordinateTransaction | None
+    layer_contextual_transactions: tuple[
+        LayerContextualContinuationTransaction, ...
+    ]
 
 
 class StreamedQwen38:
@@ -312,6 +351,7 @@ class StreamedQwen38:
     # dropped without replay even when the window is wider than the DeltaNet
     # convolution kernel.
     MAX_CONTINUATION_BLOCK_WIDTH = 16
+    MAX_LAYER_CONTEXTUAL_COMMITTED_TRANSACTIONS = 4096
     EMBED_NAME = "model.language_model.embed_tokens.weight"
     FINAL_NORM_NAME = "model.language_model.norm.weight"
     HEAD_NAME = "lm_head.weight"
@@ -701,6 +741,15 @@ class StreamedQwen38:
         self._state_poisoned = False
         self._graft_history: torch.Tensor | None = None
         self._pending_block_stage: _PendingStatefulBlock | None = None
+        self._layer_contextual_continuation_identity: (
+            LayerContextualContinuationIdentity | None
+        ) = None
+        self._layer_contextual_committed: dict[
+            int, LayerContextualContinuationTransaction
+        ] = {}
+        self._active_layer_contextual_capture: _LayerContextualCapture | None = None
+        self._layer_contextual_projection_depth = 0
+        self._layer_contextual_prefill_target_boundary: int | None = None
         if attention_output_crystal_bank is not None:
             self.attach_attention_output_crystal_bank(attention_output_crystal_bank)
         if mlp_page_coordinate_bank is not None:
@@ -743,6 +792,381 @@ class StreamedQwen38:
     @property
     def state_poisoned(self) -> bool:
         return self._state_poisoned
+
+    @property
+    def layer_contextual_continuation_identity(
+        self,
+    ) -> LayerContextualContinuationIdentity | None:
+        """Return the attached projection identity, never a persistence bank."""
+
+        return self._layer_contextual_continuation_identity
+
+    def layer_contextual_continuation_model_sha256(self) -> str:
+        """Return the checkpoint pin accepted by the layer Q8 tracker."""
+
+        return self.layer_transition_crystal_model_sha256()
+
+    def layer_contextual_continuation_q4_sha256(self) -> str:
+        """Return the packed-Q4 pin accepted by the layer Q8 tracker."""
+
+        return self.layer_transition_crystal_q4_sha256()
+
+    def _guard_layer_contextual_reentrant_mutation(self, action: str) -> None:
+        if (
+            self._active_layer_contextual_capture is not None
+            or self._layer_contextual_projection_depth > 0
+        ):
+            raise Qwen38RuntimeError(
+                f"layer continuation {action} cannot re-enter an active capture"
+            )
+
+    def attach_layer_contextual_continuation(
+        self,
+        identity: LayerContextualContinuationIdentity | None,
+    ) -> None:
+        """Attach or detach a path-free Q8 projection identity while idle."""
+
+        if identity is not None and not isinstance(
+            identity, LayerContextualContinuationIdentity
+        ):
+            raise TypeError(
+                "identity must be a LayerContextualContinuationIdentity or None"
+            )
+        if (
+            self._layer_stage_depth > 0
+            or self._layer_mlp_crystal_continuation_staging_depth > 0
+            or self._pending_block_stage is not None
+            or self._active_attention_output_crystal_transaction is not None
+            or self._active_mlp_page_coordinate_transaction is not None
+            or self._active_layer_contextual_capture is not None
+            or self._layer_contextual_projection_depth > 0
+        ):
+            raise Qwen38RuntimeError(
+                "layer continuation identity cannot change during a stage"
+            )
+        if identity is not None:
+            if identity.hidden_dim != self.config.dim:
+                raise Qwen38RuntimeError(
+                    "layer continuation hidden width differs from target"
+                )
+            if any(layer >= self.config.n_layers for layer in identity.layers):
+                raise Qwen38RuntimeError(
+                    "layer continuation layer lies outside decoder depth"
+                )
+            if (
+                identity.model_sha256
+                != self.layer_contextual_continuation_model_sha256()
+            ):
+                raise Qwen38RuntimeError(
+                    "layer continuation model pin differs from target"
+                )
+            if identity.q4_sha256 != self.layer_contextual_continuation_q4_sha256():
+                raise Qwen38RuntimeError(
+                    "layer continuation Q4 pin differs from target"
+                )
+        if identity == self._layer_contextual_continuation_identity:
+            return
+        self._layer_contextual_continuation_identity = identity
+        self._layer_contextual_committed = {}
+
+    def attach_layer_contextual_continuation_identity(
+        self,
+        identity: LayerContextualContinuationIdentity | None,
+    ) -> None:
+        """Explicit-name alias for :meth:`attach_layer_contextual_continuation`."""
+
+        self.attach_layer_contextual_continuation(identity)
+
+    def layer_contextual_continuation_transaction_at(
+        self,
+        boundary_index: int,
+    ) -> LayerContextualContinuationTransaction | None:
+        """Return one committed absolute boundary without touching a file."""
+
+        if (
+            isinstance(boundary_index, bool)
+            or not isinstance(boundary_index, int)
+            or boundary_index < 0
+        ):
+            raise ValueError("boundary_index must be a non-negative integer")
+        return self._layer_contextual_committed.get(boundary_index)
+
+    def current_layer_contextual_continuation_transaction(
+        self,
+    ) -> LayerContextualContinuationTransaction | None:
+        """Return the transaction at the model's current token boundary."""
+
+        if self._next_position <= 0:
+            return None
+        return self._layer_contextual_committed.get(self._next_position - 1)
+
+    def layer_contextual_continuation_current(
+        self,
+    ) -> LayerContextualContinuationTransaction | None:
+        """Short-name alias for the current committed boundary."""
+
+        return self.current_layer_contextual_continuation_transaction()
+
+    def layer_contextual_continuation_transactions_since(
+        self,
+        boundary_index: int = -1,
+    ) -> tuple[LayerContextualContinuationTransaction, ...]:
+        """Return committed transactions strictly after an absolute boundary."""
+
+        if (
+            isinstance(boundary_index, bool)
+            or not isinstance(boundary_index, int)
+            or boundary_index < -1
+        ):
+            raise ValueError("boundary_index must be an integer of at least -1")
+        return tuple(
+            transaction
+            for position, transaction in sorted(
+                self._layer_contextual_committed.items()
+            )
+            if position > boundary_index
+        )
+
+    def layer_contextual_continuation_since(
+        self,
+        boundary_index: int = -1,
+    ) -> tuple[LayerContextualContinuationTransaction, ...]:
+        """Short-name alias for path-free committed transaction polling."""
+
+        return self.layer_contextual_continuation_transactions_since(boundary_index)
+
+    def layer_contextual_continuation_snapshot(
+        self,
+    ) -> LayerContextualContinuationSnapshot:
+        """Return an immutable path-free conversation tracker snapshot."""
+
+        current_boundary = self._next_position - 1 if self._next_position else None
+        return LayerContextualContinuationSnapshot(
+            identity=self._layer_contextual_continuation_identity,
+            transactions=self.layer_contextual_continuation_transactions_since(),
+            current_boundary=current_boundary,
+            current_transaction=(
+                self.current_layer_contextual_continuation_transaction()
+            ),
+        )
+
+    def _begin_layer_contextual_capture(
+        self,
+        ids: torch.Tensor,
+        *,
+        start_pos: int,
+        prefill_last_only: bool,
+    ) -> _LayerContextualCapture | None:
+        identity = self._layer_contextual_continuation_identity
+        if identity is None or ids.shape[0] != 1:
+            return None
+        if self._active_layer_contextual_capture is not None:
+            raise Qwen38RuntimeError("layer continuation capture is already active")
+        token_values = tuple(int(value) for value in ids[0].detach().cpu().tolist())
+        prefill_target = self._layer_contextual_prefill_target_boundary
+        if prefill_target is not None:
+            offset = prefill_target - start_pos
+            if not 0 <= offset < len(token_values):
+                return None
+            offsets = (offset,)
+        else:
+            offsets = (
+                (len(token_values) - 1,)
+                if prefill_last_only
+                else tuple(range(len(token_values)))
+            )
+        boundaries = tuple(start_pos + offset for offset in offsets)
+        capture = _LayerContextualCapture(
+            identity=identity,
+            boundaries=boundaries,
+            known_tokens={
+                start_pos + offset: token_values[offset] for offset in offsets
+            },
+            keys={boundary: {} for boundary in boundaries},
+        )
+        self._active_layer_contextual_capture = capture
+        return capture
+
+    def _capture_layer_contextual_output(
+        self,
+        output: torch.Tensor | Sequence[torch.Tensor],
+        *,
+        layer: int,
+        start_pos: int,
+    ) -> None:
+        capture = self._active_layer_contextual_capture
+        if capture is None or layer not in capture.identity.layers:
+            return
+        if isinstance(output, torch.Tensor):
+            if (
+                output.ndim != 3
+                or output.shape[0] != 1
+                or output.shape[2] != self.config.dim
+            ):
+                raise Qwen38RuntimeError(
+                    "layer continuation output tensor has an invalid shape"
+                )
+            rows = tuple(
+                output[:, offset : offset + 1]
+                for offset in range(output.shape[1])
+            )
+        else:
+            rows = tuple(output)
+            if any(
+                not isinstance(row, torch.Tensor)
+                or tuple(row.shape) != (1, 1, self.config.dim)
+                for row in rows
+            ):
+                raise Qwen38RuntimeError(
+                    "layer continuation output rows have an invalid shape"
+                )
+        projected: list[tuple[int, LayerContextualContinuationKey]] = []
+        try:
+            for boundary in capture.boundaries:
+                offset = boundary - start_pos
+                if not 0 <= offset < len(rows):
+                    continue
+                if layer in capture.keys[boundary]:
+                    raise Qwen38RuntimeError(
+                        "layer continuation boundary was projected twice"
+                    )
+                self._layer_contextual_projection_depth += 1
+                try:
+                    key = project_layer_contextual_key(
+                        capture.identity,
+                        rows[offset],
+                        layer,
+                        capture.known_tokens[boundary],
+                    )
+                finally:
+                    self._layer_contextual_projection_depth -= 1
+                if (
+                    not isinstance(key, LayerContextualContinuationKey)
+                    or key.layer != layer
+                    or key.known_token != capture.known_tokens[boundary]
+                    or key.sketch_dim != capture.identity.sketch_dim
+                ):
+                    raise Qwen38RuntimeError(
+                        "layer continuation projector returned an invalid key"
+                    )
+                projected.append((boundary, key))
+        except Exception:
+            raise
+        for boundary, key in projected:
+            capture.keys[boundary][layer] = key
+
+    def _finish_layer_contextual_capture(
+        self,
+        capture: _LayerContextualCapture | None,
+    ) -> tuple[LayerContextualContinuationTransaction, ...]:
+        if capture is None:
+            return ()
+        if capture is not self._active_layer_contextual_capture:
+            raise Qwen38RuntimeError("layer continuation capture is stale")
+        self._active_layer_contextual_capture = None
+        transactions: list[LayerContextualContinuationTransaction] = []
+        for boundary in capture.boundaries:
+            by_layer = capture.keys[boundary]
+            if set(by_layer) != set(capture.identity.layers):
+                raise Qwen38RuntimeError(
+                    "layer continuation capture omitted a configured layer"
+                )
+            transactions.append(
+                LayerContextualContinuationTransaction.create(
+                    identity_sha256=capture.identity.identity_sha256,
+                    boundary_index=boundary,
+                    known_token=capture.known_tokens[boundary],
+                    keys=tuple(by_layer[layer] for layer in capture.identity.layers),
+                )
+            )
+        return tuple(transactions)
+
+    def _abort_layer_contextual_capture(
+        self,
+        capture: _LayerContextualCapture | None,
+    ) -> None:
+        if capture is not None and capture is self._active_layer_contextual_capture:
+            self._active_layer_contextual_capture = None
+
+    def _prepare_layer_contextual_commit(
+        self,
+        transactions: Sequence[LayerContextualContinuationTransaction],
+        *,
+        accepted_end_position: int,
+    ) -> dict[int, LayerContextualContinuationTransaction]:
+        identity = self._layer_contextual_continuation_identity
+        if identity is None:
+            if transactions:
+                raise Qwen38RuntimeError(
+                    "layer continuation transactions have no attached identity"
+                )
+            return dict(self._layer_contextual_committed)
+        candidate = dict(self._layer_contextual_committed)
+        previous = -1
+        for transaction in transactions:
+            if not isinstance(transaction, LayerContextualContinuationTransaction):
+                raise TypeError(
+                    "layer continuation commit requires transaction objects"
+                )
+            boundary = transaction.boundary_index
+            if (
+                transaction.identity_sha256 != identity.identity_sha256
+                or transaction.layers != identity.layers
+                or any(
+                    key.sketch_dim != identity.sketch_dim
+                    for key in transaction.keys
+                )
+            ):
+                raise Qwen38RuntimeError(
+                    "layer continuation transaction identity is invalid"
+                )
+            if boundary <= previous or not 0 <= boundary < accepted_end_position:
+                raise Qwen38RuntimeError(
+                    "layer continuation transaction boundary is invalid"
+                )
+            existing = candidate.get(boundary)
+            if existing is not None and existing != transaction:
+                raise Qwen38RuntimeError(
+                    "layer continuation boundary is already committed"
+                )
+            candidate[boundary] = transaction
+            previous = boundary
+        overflow = (
+            len(candidate) - self.MAX_LAYER_CONTEXTUAL_COMMITTED_TRANSACTIONS
+        )
+        if overflow > 0:
+            for boundary in sorted(candidate)[:overflow]:
+                del candidate[boundary]
+        return candidate
+
+    def _prepare_staged_layer_contextual_commit(
+        self,
+        pending: _PendingStatefulBlock,
+        *,
+        width: int,
+    ) -> dict[int, LayerContextualContinuationTransaction]:
+        row = pending.evidence
+        stage_width = row.end_pos - row.start_pos
+        transactions = pending.layer_contextual_transactions
+        identity = self._layer_contextual_continuation_identity
+        if identity is None:
+            if transactions:
+                raise Qwen38RuntimeError(
+                    "detached layer continuation stage retained transactions"
+                )
+        elif (
+            len(transactions) != stage_width
+            or tuple(transaction.boundary_index for transaction in transactions)
+            != tuple(range(row.start_pos, row.end_pos))
+        ):
+            raise Qwen38RuntimeError(
+                "layer continuation stage has incomplete boundary transactions"
+            )
+        selected = transactions[:width]
+        return self._prepare_layer_contextual_commit(
+            selected,
+            accepted_end_position=row.start_pos + width,
+        )
 
     def component_timing_metrics(self) -> dict[str, object]:
         """Return process-local monotone counters for physical layer paths."""
@@ -2551,8 +2975,85 @@ class StreamedQwen38:
                     )
                 }
             ),
+            **(
+                {}
+                if self._layer_contextual_continuation_identity is None
+                else {
+                    "layer_contextual_continuation": (
+                        self._layer_contextual_continuation_identity.to_record()
+                    )
+                }
+            ),
             "native_head_crsa": self._native_head_crsa_snapshot_identity(),
         }
+
+    def _validate_layer_contextual_snapshot_history(
+        self,
+        transactions: Sequence[LayerContextualContinuationTransaction],
+        *,
+        next_position: int,
+    ) -> tuple[LayerContextualContinuationTransaction, ...]:
+        identity = self._layer_contextual_continuation_identity
+        rows = tuple(transactions)
+        if identity is None:
+            if rows:
+                raise Qwen38SnapshotError(
+                    "snapshot has layer continuation history without an identity"
+                )
+            return ()
+        if (
+            len(rows) > self.MAX_LAYER_CONTEXTUAL_COMMITTED_TRANSACTIONS
+            or len(rows) > next_position
+        ):
+            raise Qwen38SnapshotError(
+                "snapshot layer continuation history exceeds its count bound"
+            )
+        previous_boundary = -1
+        for transaction in rows:
+            if not isinstance(transaction, LayerContextualContinuationTransaction):
+                raise Qwen38SnapshotError(
+                    "snapshot layer continuation history has an invalid row"
+                )
+            boundary = transaction.boundary_index
+            if boundary <= previous_boundary or not 0 <= boundary < next_position:
+                raise Qwen38SnapshotError(
+                    "snapshot layer continuation boundaries are not sorted and unique"
+                )
+            if (
+                transaction.identity_sha256 != identity.identity_sha256
+                or transaction.layers != identity.layers
+                or any(key.sketch_dim != identity.sketch_dim for key in transaction.keys)
+            ):
+                raise Qwen38SnapshotError(
+                    "snapshot layer continuation identity differs from runtime"
+                )
+            previous_boundary = boundary
+        if next_position:
+            if not rows or rows[-1].boundary_index != next_position - 1:
+                raise Qwen38SnapshotError(
+                    "snapshot layer continuation current boundary is missing"
+                )
+        elif rows:
+            raise Qwen38SnapshotError(
+                "zero-cursor snapshot retains layer continuation history"
+            )
+        return rows
+
+    def _layer_contextual_snapshot_history(
+        self,
+    ) -> tuple[LayerContextualContinuationTransaction, ...]:
+        positioned = sorted(self._layer_contextual_committed.items())
+        if any(
+            position != transaction.boundary_index
+            for position, transaction in positioned
+        ):
+            raise Qwen38SnapshotError(
+                "model layer continuation position index is inconsistent"
+            )
+        return self._validate_layer_contextual_snapshot_history(
+            tuple(transaction for _position, transaction in positioned),
+            next_position=self._next_position,
+        )
 
     def _snapshot_model_state(
         self,
@@ -2727,6 +3228,7 @@ class StreamedQwen38:
             )
         if self._state_poisoned and (layers or tensors):
             raise Qwen38SnapshotError("poisoned model retains continuation tensors")
+        layer_contextual_history = self._layer_contextual_snapshot_history()
         return (
             {
                 "next_position": self._next_position,
@@ -2737,6 +3239,16 @@ class StreamedQwen38:
                 "max_position_embeddings": self.config.max_position_embeddings,
                 "graft_history": graft_history_name,
                 "attention_layers": layers,
+                **(
+                    {}
+                    if self._layer_contextual_continuation_identity is None
+                    else {
+                        "layer_contextual_continuation_transactions": [
+                            transaction.to_record()
+                            for transaction in layer_contextual_history
+                        ]
+                    }
+                ),
             },
             tensors,
         )
@@ -2755,6 +3267,7 @@ class StreamedQwen38:
     ) -> dict[str, Any]:
         """Atomically save every native Qwen continuation tensor."""
 
+        self._guard_layer_contextual_reentrant_mutation("snapshot")
         if not isinstance(transport_neutral, bool):
             raise TypeError("transport_neutral must be a boolean")
         limits = self._snapshot_limits(max_bytes, max_tensors)
@@ -2795,6 +3308,7 @@ class StreamedQwen38:
     ) -> dict[str, Any]:
         """Transactionally restore a bounded native Qwen continuation."""
 
+        self._guard_layer_contextual_reentrant_mutation("restore")
         if not isinstance(transport_neutral, bool):
             raise TypeError("transport_neutral must be a boolean")
         limits = self._snapshot_limits(max_bytes, max_tensors)
@@ -2818,6 +3332,8 @@ class StreamedQwen38:
             "state_batch_size",
             "state_poisoned",
         }
+        if self._layer_contextual_continuation_identity is not None:
+            expected_state_keys.add("layer_contextual_continuation_transactions")
         if set(state) != expected_state_keys:
             raise Qwen38SnapshotError("snapshot model-state schema is invalid")
         next_position = self._snapshot_state_int(
@@ -2852,6 +3368,56 @@ class StreamedQwen38:
                     "zero-cursor snapshot retains batch ownership"
                 )
             batch = None
+
+        restored_layer_contextual: dict[
+            int, LayerContextualContinuationTransaction
+        ] = {}
+        layer_contextual_identity = self._layer_contextual_continuation_identity
+        if layer_contextual_identity is not None:
+            raw_transactions = state.get("layer_contextual_continuation_transactions")
+            if (
+                not isinstance(raw_transactions, list)
+                or len(raw_transactions)
+                > self.MAX_LAYER_CONTEXTUAL_COMMITTED_TRANSACTIONS
+                or len(raw_transactions) > next_position
+            ):
+                raise Qwen38SnapshotError(
+                    "snapshot layer continuation history is invalid or oversized"
+                )
+            parsed_transactions: list[
+                LayerContextualContinuationTransaction
+            ] = []
+            for raw_transaction in raw_transactions:
+                raw_keys = (
+                    raw_transaction.get("keys")
+                    if isinstance(raw_transaction, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(raw_keys, list)
+                    or len(raw_keys) != len(layer_contextual_identity.layers)
+                ):
+                    raise Qwen38SnapshotError(
+                        "snapshot layer continuation transaction key count is invalid"
+                    )
+                try:
+                    transaction = LayerContextualContinuationTransaction.from_record(
+                        raw_transaction,
+                        sketch_dim=layer_contextual_identity.sketch_dim,
+                    )
+                except Exception as exc:
+                    raise Qwen38SnapshotError(
+                        "snapshot layer continuation transaction is invalid"
+                    ) from exc
+                parsed_transactions.append(transaction)
+            validated_transactions = (
+                self._validate_layer_contextual_snapshot_history(
+                    parsed_transactions,
+                    next_position=next_position,
+                )
+            )
+            for transaction in validated_transactions:
+                restored_layer_contextual[transaction.boundary_index] = transaction
 
         raw_layers = state.get("attention_layers")
         if not isinstance(raw_layers, list) or len(raw_layers) > self.config.n_layers:
@@ -3066,6 +3632,8 @@ class StreamedQwen38:
         self._state_batch_size = batch
         self._state_poisoned = poisoned
         self._graft_history = history_device
+        self._layer_contextual_committed = restored_layer_contextual
+        self._active_layer_contextual_capture = None
         self._reset_mlp_page_session()
         self._pending_block_stage = None
         return {
@@ -5461,6 +6029,15 @@ class StreamedQwen38:
                         )
                     }
                 ),
+                **(
+                    {}
+                    if self._layer_contextual_continuation_identity is None
+                    else {
+                        "layer_contextual_continuation": (
+                            self._layer_contextual_continuation_identity.identity_sha256
+                        )
+                    }
+                ),
                 "native_head_crsa": native,
             }
         )
@@ -5774,6 +6351,9 @@ class StreamedQwen38:
         self._state_poisoned = True
         self._reset_mlp_page_session()
         self._pending_block_stage = None
+        self._active_layer_contextual_capture = None
+        self._layer_contextual_committed = {}
+        self._layer_contextual_prefill_target_boundary = None
 
     def _reset_mlp_page_session(self) -> None:
         pending = self._pending_block_stage
@@ -5812,6 +6392,7 @@ class StreamedQwen38:
     def reset_state(self, *, release: bool = False) -> None:
         """Drop every committed KV/DeltaNet cache and clear the poison latch."""
 
+        self._guard_layer_contextual_reentrant_mutation("reset")
         self._layer_states = [None for _ in range(self.config.n_layers)]
         self._next_position = 0
         self._state_batch_size = None
@@ -5819,6 +6400,9 @@ class StreamedQwen38:
         self._graft_history = None
         self._reset_mlp_page_session()
         self._pending_block_stage = None
+        self._active_layer_contextual_capture = None
+        self._layer_contextual_committed = {}
+        self._layer_contextual_prefill_target_boundary = None
         if release:
             # ``release=True`` is the public request teardown boundary.  Layer
             # boundaries use the pager's bounded interval/RSS policy; request
@@ -5921,6 +6505,11 @@ class StreamedQwen38:
                 if next_state is None:  # pragma: no cover - stateful contract.
                     raise Qwen38RuntimeError("stateful layer returned no continuation")
                 staged[layer] = next_state
+                self._capture_layer_contextual_output(
+                    x,
+                    layer=layer,
+                    start_pos=start_pos,
+                )
                 if self.graft is not None and layer == self.graft_layer:
                     x, staged_history = self._apply_graft_stateful(
                         x,
@@ -6050,6 +6639,11 @@ class StreamedQwen38:
                         "continuation prefix trace lost a token row"
                     )
                 staged_layer_traces[layer] = prefix_trace
+                self._capture_layer_contextual_output(
+                    rows,
+                    layer=layer,
+                    start_pos=start_pos,
+                )
                 if self.graft is not None and layer == self.graft_layer:
                     grafted: list[torch.Tensor] = []
                     for offset, row in enumerate(rows):
@@ -6193,6 +6787,7 @@ class StreamedQwen38:
     ) -> StatefulBlockStage:
         """Stage an exact-only continuation under immutable configuration."""
 
+        self._guard_layer_contextual_reentrant_mutation("stage")
         with self._exact_continuation_staging():
             return self._stage_continuation_block_impl(
                 token_ids,
@@ -6262,6 +6857,7 @@ class StreamedQwen38:
             else None
         )
         coordinate_transaction: MlpPageCoordinateTransaction | None = None
+        layer_contextual_capture: _LayerContextualCapture | None = None
         previous_stage = self._pending_block_stage
         if previous_stage is not None:
             if previous_stage.mlp_page_transaction_owner is not None:
@@ -6307,6 +6903,11 @@ class StreamedQwen38:
             raise
         try:
             embedded = self.embed_batch(ids)
+            layer_contextual_capture = self._begin_layer_contextual_capture(
+                ids,
+                start_pos=start_pos,
+                prefill_last_only=False,
+            )
             self._active_attention_output_crystal_transaction = crystal_transaction
             self._active_mlp_page_coordinate_transaction = coordinate_transaction
             if ids.shape[1] == 2:
@@ -6337,7 +6938,11 @@ class StreamedQwen38:
                     self.FINAL_NORM_NAME,
                 )
             hidden = torch.cat(final_rows, dim=1)
+            layer_contextual_transactions = self._finish_layer_contextual_capture(
+                layer_contextual_capture
+            )
         except Exception:
+            self._abort_layer_contextual_capture(layer_contextual_capture)
             self._pending_block_stage = None
             if page_router is not None:
                 page_router.rollback_transaction()
@@ -6400,6 +7005,7 @@ class StreamedQwen38:
                 delta_head_transaction_owner=delta_router,
                 attention_output_crystal_transaction_owner=crystal_transaction,
                 mlp_page_coordinate_transaction_owner=coordinate_transaction,
+                layer_contextual_transactions=layer_contextual_transactions,
             )
             return stage
         except Exception:
@@ -6421,6 +7027,7 @@ class StreamedQwen38:
     ) -> StatefulBlockStage:
         """Extend a staged block with one exact-only continuation row."""
 
+        self._guard_layer_contextual_reentrant_mutation("extension")
         with self._exact_continuation_staging():
             return self._extend_continuation_block_impl(
                 stage,
@@ -6451,6 +7058,7 @@ class StreamedQwen38:
         delta_router = pending.delta_head_transaction_owner
         crystal_transaction = pending.attention_output_crystal_transaction_owner
         coordinate_transaction = pending.mlp_page_coordinate_transaction_owner
+        layer_contextual_capture: _LayerContextualCapture | None = None
 
         # A matching handle is consumed exactly once.  No later validation or
         # compute failure may leave the old private transaction committable.
@@ -6512,6 +7120,11 @@ class StreamedQwen38:
             start_linears = self._metric(self.pager, "linear_calls")
             started = time.perf_counter()
             embedded = self.embed_batch(ids)
+            layer_contextual_capture = self._begin_layer_contextual_capture(
+                ids,
+                start_pos=row.end_pos,
+                prefill_last_only=False,
+            )
             self._active_attention_output_crystal_transaction = crystal_transaction
             self._active_mlp_page_coordinate_transaction = coordinate_transaction
             staged = self._stage_continuation_token_rows(
@@ -6534,6 +7147,9 @@ class StreamedQwen38:
                 (staged.hidden,),
                 self.FINAL_NORM_NAME,
             )[0]
+            appended_layer_contextual = self._finish_layer_contextual_capture(
+                layer_contextual_capture
+            )
             hidden = torch.cat((pending.hidden, final_row), dim=1)
             input_ids = (
                 row.input_token_ids[0]
@@ -6584,9 +7200,14 @@ class StreamedQwen38:
                 delta_head_transaction_owner=delta_router,
                 attention_output_crystal_transaction_owner=crystal_transaction,
                 mlp_page_coordinate_transaction_owner=coordinate_transaction,
+                layer_contextual_transactions=(
+                    pending.layer_contextual_transactions
+                    + appended_layer_contextual
+                ),
             )
             return next_stage
         except Exception:
+            self._abort_layer_contextual_capture(layer_contextual_capture)
             self._pending_block_stage = None
             if page_router is not None:
                 page_router.rollback_transaction()
@@ -6603,6 +7224,7 @@ class StreamedQwen38:
     def discard_continuation_block(self, stage: StatefulBlockStage) -> None:
         """Invalidate exactly the currently pending block without a commit."""
 
+        self._guard_layer_contextual_reentrant_mutation("discard")
         if not isinstance(stage, StatefulBlockStage):
             raise TypeError("stage must be a StatefulBlockStage")
         pending = self._pending_block_stage
@@ -6723,6 +7345,7 @@ class StreamedQwen38:
     ) -> tuple[torch.Tensor, StatefulEvidence]:
         """Commit a verified staged prefix without reading model weights again."""
 
+        self._guard_layer_contextual_reentrant_mutation("prefix commit")
         if not isinstance(stage, StatefulBlockStage):
             raise TypeError("stage must be a StatefulBlockStage")
         pending = self._pending_block_stage
@@ -6789,6 +7412,16 @@ class StreamedQwen38:
         except Exception:
             rollback_coordinate_routes()
             raise
+        try:
+            layer_contextual_committed = (
+                self._prepare_staged_layer_contextual_commit(
+                    pending,
+                    width=width,
+                )
+            )
+        except Exception:
+            rollback_coordinate_routes()
+            raise
 
         self._pending_block_stage = None
         started = time.perf_counter()
@@ -6846,6 +7479,7 @@ class StreamedQwen38:
         self._next_position = end_pos
         self._state_batch_size = 1
         self._graft_history = graft_history
+        self._layer_contextual_committed = layer_contextual_committed
         evidence = StatefulEvidence(
             start_pos=row.start_pos,
             end_pos=end_pos,
@@ -6881,6 +7515,7 @@ class StreamedQwen38:
     ) -> tuple[torch.Tensor, StatefulEvidence]:
         """Atomically publish one staged block and its delayed evidence."""
 
+        self._guard_layer_contextual_reentrant_mutation("block commit")
         if not isinstance(stage, StatefulBlockStage):
             raise TypeError("stage must be a StatefulBlockStage")
         pending = self._pending_block_stage
@@ -6949,6 +7584,16 @@ class StreamedQwen38:
         except Exception:
             rollback_coordinate_routes()
             raise
+        try:
+            layer_contextual_committed = (
+                self._prepare_staged_layer_contextual_commit(
+                    pending,
+                    width=row.end_pos - row.start_pos,
+                )
+            )
+        except Exception:
+            rollback_coordinate_routes()
+            raise
 
         committed_states = list(pending.layer_states)
         self._pending_block_stage = None
@@ -6984,6 +7629,7 @@ class StreamedQwen38:
         self._next_position = row.end_pos
         self._state_batch_size = len(row.input_token_ids)
         self._graft_history = pending.graft_history
+        self._layer_contextual_committed = layer_contextual_committed
         evidence = StatefulEvidence(
             start_pos=row.start_pos,
             end_pos=row.end_pos,
@@ -7023,7 +7669,15 @@ class StreamedQwen38:
         with :meth:`reset_state`.
         """
 
+        self._guard_layer_contextual_reentrant_mutation("forward")
         ids = self._token_tensor(token_ids)
+        if (
+            self._layer_contextual_continuation_identity is not None
+            and ids.shape[0] != 1
+        ):
+            raise ValueError(
+                "layer continuation tracking requires stateful batch size 1"
+            )
         if self._state_poisoned:
             raise Qwen38RuntimeError("decoder state is poisoned; call reset_state()")
         if progress is not None and not callable(progress):
@@ -7088,8 +7742,15 @@ class StreamedQwen38:
             del pending
         staged: StatefulLayerRangeResult | None = None
         staged_native_evidence: tuple[NativeHeadCrsaEvidence, ...] = ()
+        layer_contextual_capture: _LayerContextualCapture | None = None
+        layer_contextual_committed = dict(self._layer_contextual_committed)
         self._layer_stage_depth += 1
         try:
+            layer_contextual_capture = self._begin_layer_contextual_capture(
+                ids,
+                start_pos=start_pos,
+                prefill_last_only=start_pos == 0,
+            )
             if start_pos == 0:
                 staged = self.hidden_stateful_range(
                     hidden,
@@ -7142,6 +7803,11 @@ class StreamedQwen38:
                         )
                     self._layer_states[layer] = next_state
                     del next_state
+                    self._capture_layer_contextual_output(
+                        hidden,
+                        layer=layer,
+                        start_pos=start_pos,
+                    )
                     if self.graft is not None and layer == self.graft_layer:
                         hidden, self._graft_history = self._apply_graft_stateful(
                             hidden,
@@ -7174,7 +7840,15 @@ class StreamedQwen38:
                         )
                 staged_native_evidence = tuple(native_evidence)
             hidden = self.finalize_hidden(hidden)
+            layer_contextual_transactions = self._finish_layer_contextual_capture(
+                layer_contextual_capture
+            )
+            layer_contextual_committed = self._prepare_layer_contextual_commit(
+                layer_contextual_transactions,
+                accepted_end_position=end_pos,
+            )
         except Exception:
+            self._abort_layer_contextual_capture(layer_contextual_capture)
             self._poison_state()
             self.pager.release()
             raise
@@ -7189,6 +7863,7 @@ class StreamedQwen38:
             staged_native_evidence = staged.native_head_crsa_evidence
         self._next_position = end_pos
         self._state_batch_size = ids.shape[0]
+        self._layer_contextual_committed = layer_contextual_committed
         evidence = StatefulEvidence(
             start_pos=start_pos,
             end_pos=end_pos,
@@ -7232,6 +7907,8 @@ class StreamedQwen38:
 
         if not isinstance(tokenwise, bool):
             raise TypeError("tokenwise must be a boolean")
+        if self._layer_contextual_prefill_target_boundary is not None:
+            raise Qwen38RuntimeError("layer continuation prefill is already active")
         ids = self._token_tensor(token_ids)
         previous_prefill = self._layer_mlp_crystal_prefill_active
         self._layer_mlp_crystal_prefill_active = True
@@ -7239,6 +7916,10 @@ class StreamedQwen38:
             if reset:
                 self.reset_state()
             start_pos = self._next_position
+            if self._layer_contextual_continuation_identity is not None:
+                self._layer_contextual_prefill_target_boundary = (
+                    start_pos + ids.shape[1] - 1
+                )
             if not tokenwise:
                 hidden, evidence = self.hidden_stateful(
                     ids, start_pos=start_pos, progress=progress
@@ -7256,6 +7937,7 @@ class StreamedQwen38:
                 evidence_rows.append(evidence)
             return torch.cat(outputs, dim=1), tuple(evidence_rows)
         finally:
+            self._layer_contextual_prefill_target_boundary = None
             self._layer_mlp_crystal_prefill_active = previous_prefill
 
     def decode(

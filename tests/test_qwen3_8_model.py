@@ -38,6 +38,10 @@ from immer.runtimes.qwen3_8.layer_mlp_crystal import (
     LayerMlpResidualCrystalBank,
     LayerMlpResidualCrystalIdentity,
 )
+from immer.runtimes.qwen3_8.layer_contextual_continuation import (
+    LayerContextualContinuationIdentity,
+    LayerContextualContinuationTransaction,
+)
 from immer.runtimes.qwen3_8.layer_transition_crystal import (
     LayerTransitionCrystalBank,
     LayerTransitionCrystalIdentity,
@@ -328,6 +332,177 @@ class Qwen38ModelTests(unittest.TestCase):
         self.pager.close()
         self.source.close()
         self.temporary.cleanup()
+
+    def _attach_layer_contextual_continuation(
+        self,
+        *,
+        layers: tuple[int, ...] = (0, 3),
+    ) -> LayerContextualContinuationIdentity:
+        identity = LayerContextualContinuationIdentity(
+            runtime_sha256="a" * 64,
+            model_sha256="b" * 64,
+            q4_sha256="c" * 64,
+            tokenizer_sha256="d" * 64,
+            hidden_dim=self.config.dim,
+            layers=layers,
+            projection_seed=17,
+        )
+        with (
+            mock.patch.object(
+                self.model,
+                "layer_contextual_continuation_model_sha256",
+                return_value=identity.model_sha256,
+            ),
+            mock.patch.object(
+                self.model,
+                "layer_contextual_continuation_q4_sha256",
+                return_value=identity.q4_sha256,
+            ),
+        ):
+            self.model.attach_layer_contextual_continuation(identity)
+        return identity
+
+    def test_layer_contextual_tracker_commits_prefill_last_and_decode_rows(
+        self,
+    ) -> None:
+        identity = self._attach_layer_contextual_continuation()
+
+        self.model.hidden_stateful([[1, 4, 9]])
+        prefill = self.model.layer_contextual_continuation_snapshot()
+
+        self.assertIs(prefill.identity, identity)
+        self.assertEqual(prefill.current_boundary, 2)
+        self.assertEqual(len(prefill.transactions), 1)
+        self.assertEqual(prefill.current_transaction, prefill.transactions[0])
+        self.assertEqual(prefill.current_transaction.boundary_index, 2)
+        self.assertEqual(prefill.current_transaction.known_token, 9)
+        self.assertEqual(prefill.current_transaction.layers, (0, 3))
+        self.assertTrue(
+            all(
+                key.q8.dtype == torch.int8
+                and key.q8.device.type == "cpu"
+                and key.q8.is_contiguous()
+                for key in prefill.current_transaction.keys
+            )
+        )
+
+        self.model.decode([[7]])
+        current = self.model.current_layer_contextual_continuation_transaction()
+        self.assertIsNotNone(current)
+        assert current is not None
+        self.assertEqual((current.boundary_index, current.known_token), (3, 7))
+        self.assertEqual(
+            self.model.layer_contextual_continuation_transactions_since(2),
+            (current,),
+        )
+
+        self.model.reset_state(release=True)
+        cleared = self.model.layer_contextual_continuation_snapshot()
+        self.assertIs(cleared.identity, identity)
+        self.assertIsNone(cleared.current_boundary)
+        self.assertIsNone(cleared.current_transaction)
+        self.assertEqual(cleared.transactions, ())
+
+    def test_layer_contextual_stage_prefix_commit_extend_and_discard(
+        self,
+    ) -> None:
+        self._attach_layer_contextual_continuation(layers=(1, 3))
+        self.model.hidden_stateful([[1, 4]])
+        base = self.model.layer_contextual_continuation_snapshot()
+
+        stage = self.model.stage_continuation_block([[5, 6]])
+        extended = self.model.extend_continuation_block(stage, [[7]])
+        self.assertEqual(
+            self.model.layer_contextual_continuation_snapshot(),
+            base,
+        )
+
+        self.model.commit_continuation_prefix(extended, 2)
+        committed = self.model.layer_contextual_continuation_transactions_since(1)
+        self.assertEqual(
+            tuple((row.boundary_index, row.known_token) for row in committed),
+            ((2, 5), (3, 6)),
+        )
+        self.assertIsNone(
+            self.model.layer_contextual_continuation_transaction_at(4)
+        )
+
+        discard = self.model.stage_continuation_block([[8, 9]])
+        before_discard = self.model.layer_contextual_continuation_snapshot()
+        self.model.discard_continuation_block(discard)
+        self.assertEqual(
+            self.model.layer_contextual_continuation_snapshot(),
+            before_discard,
+        )
+
+    def test_layer_contextual_prefill_captures_only_final_boundary_in_both_modes(
+        self,
+    ) -> None:
+        self._attach_layer_contextual_continuation(layers=(0, 3))
+
+        self.model.prefill([[1, 4, 9]], tokenwise=False)
+        batched = self.model.layer_contextual_continuation_snapshot().transactions
+        self.model.prefill([[1, 4, 9]], tokenwise=True)
+        tokenwise = self.model.layer_contextual_continuation_snapshot().transactions
+
+        self.assertEqual(len(batched), 1)
+        self.assertEqual(len(tokenwise), 1)
+        self.assertEqual(
+            (batched[0].boundary_index, batched[0].known_token),
+            (2, 9),
+        )
+        self.assertEqual(
+            (tokenwise[0].boundary_index, tokenwise[0].known_token),
+            (2, 9),
+        )
+        self.assertEqual(tokenwise[0].keys, batched[0].keys)
+
+    def test_layer_contextual_snapshot_roundtrips_complete_bounded_history(
+        self,
+    ) -> None:
+        identity = self._attach_layer_contextual_continuation(layers=(1, 3))
+        self.model.prefill([[1, 4]])
+        self.model.decode([[5]])
+        self.model.decode([[6]])
+        before = self.model.layer_contextual_continuation_snapshot()
+        snapshot_path = self.root / "layer-contextual-state.json"
+
+        self.model.save_state(snapshot_path)
+        self.model.reset_state()
+        self.assertEqual(
+            self.model.layer_contextual_continuation_since(),
+            (),
+        )
+        self.model.load_state(snapshot_path)
+        after = self.model.layer_contextual_continuation_snapshot()
+
+        self.assertEqual(after, before)
+        self.assertEqual(
+            tuple(row.boundary_index for row in after.transactions),
+            (1, 2, 3),
+        )
+        self.assertEqual(after.current_transaction, after.transactions[-1])
+
+        duplicate = (before.transactions[0], before.transactions[0])
+        with self.assertRaises(qwen_model_module.Qwen38SnapshotError):
+            self.model._validate_layer_contextual_snapshot_history(
+                duplicate,
+                next_position=4,
+            )
+        out_of_range = LayerContextualContinuationTransaction.create(
+            identity_sha256=identity.identity_sha256,
+            boundary_index=4,
+            known_token=6,
+            keys=tuple(
+                type(key)(key.layer, 6, key.q8)
+                for key in before.transactions[-1].keys
+            ),
+        )
+        with self.assertRaises(qwen_model_module.Qwen38SnapshotError):
+            self.model._validate_layer_contextual_snapshot_history(
+                (*before.transactions, out_of_range),
+                next_position=4,
+            )
 
     def test_preflight_covers_only_the_complete_text_stack(self) -> None:
         report = self.model.checkpoint_preflight()

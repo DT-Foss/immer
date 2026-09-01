@@ -1630,6 +1630,35 @@ def _project_hidden(
     return q8
 
 
+def project_layer_contextual_key(
+    identity: LayerContextualContinuationIdentity,
+    hidden: torch.Tensor,
+    layer: int,
+    known_token: int,
+) -> LayerContextualContinuationKey:
+    """Project one ``layer.output`` row without opening or owning a bank.
+
+    This is the path-free projection boundary used by the streamed model.  It
+    deliberately returns the same signed-Q8 key as
+    :meth:`LayerContextualContinuationBank.project` while retaining neither
+    the supplied hidden row nor a persistence handle.
+    """
+
+    if not isinstance(identity, LayerContextualContinuationIdentity):
+        raise TypeError(
+            "identity must be a LayerContextualContinuationIdentity"
+        )
+    selected_layer = _layer(layer)
+    if selected_layer not in identity.layers:
+        raise ValueError("layer is outside the continuation identity")
+    known = _token(known_token)
+    return LayerContextualContinuationKey(
+        selected_layer,
+        known,
+        _project_hidden(hidden, identity=identity, layer=selected_layer),
+    )
+
+
 def _cosine(
     left: LayerContextualContinuationKey,
     right: LayerContextualContinuationKey,
@@ -1881,14 +1910,11 @@ class LayerContextualContinuationBank:
         layer: int,
         known_token: int,
     ) -> LayerContextualContinuationKey:
-        selected_layer = _layer(layer)
-        if selected_layer not in self.identity.layers:
-            raise ValueError("layer is outside the bank identity")
-        known = _token(known_token)
-        return LayerContextualContinuationKey(
-            selected_layer,
-            known,
-            _project_hidden(hidden, identity=self.identity, layer=selected_layer),
+        return project_layer_contextual_key(
+            self.identity,
+            hidden,
+            layer,
+            known_token,
         )
 
     def capture_boundaries(
