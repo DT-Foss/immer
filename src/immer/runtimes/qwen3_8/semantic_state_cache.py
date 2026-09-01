@@ -27,12 +27,20 @@ from safetensors.torch import load as load_safetensors
 from safetensors.torch import save as save_safetensors
 import torch
 
+from .mtp_carry_snapshot import (
+    MtpCarrySidecarDescriptor,
+    Qwen35MtpCarrySidecarError,
+    read_qwen35_mtp_carry_sidecar,
+    write_qwen35_mtp_carry_sidecar,
+)
+from .mtp_draft import Qwen35MtpCarry
 from .snapshot import QWEN38_SNAPSHOT_SCHEMA, Qwen38SnapshotIdentityMismatch
 
 
 TOKEN_PREFIX_SCHEMA = "immer.qwen3.8-token-prefix/v1"
 SEMANTIC_ANCHOR_INDEX_SCHEMA = "immer.qwen3.8-semantic-anchor-index/v1"
-SEMANTIC_ANCHOR_RECEIPT_SCHEMA = "immer.qwen3.8-semantic-anchor/v1"
+_SEMANTIC_ANCHOR_RECEIPT_LEGACY_SCHEMA = "immer.qwen3.8-semantic-anchor/v1"
+SEMANTIC_ANCHOR_RECEIPT_SCHEMA = "immer.qwen3.8-semantic-anchor/v2"
 SEMANTIC_ANCHOR_GC_SCHEMA = "immer.qwen3.8-semantic-anchor-gc/v1"
 SEMANTIC_ANCHOR_SEED_SCHEMA = "immer.qwen3.8-semantic-anchor-seed/v1"
 
@@ -49,7 +57,9 @@ _DIGEST_RE = re.compile(r"[0-9a-f]{64}")
 _MANIFEST_RE = re.compile(r"([0-9a-f]{64})\.json")
 _PAYLOAD_RE = re.compile(r"([0-9a-f]{64})\.([0-9a-f]{64})\.npz")
 _SEED_RE = re.compile(r"([0-9a-f]{64})\.([0-9a-f]{64})\.seed\.safetensors")
+_MTP_CARRY_RE = re.compile(r"([0-9a-f]{64})\.qwen35-mtp-carry")
 _MAX_INDEX_BYTES = 16 * 1024**2
+_MAX_MTP_CARRY_SIDECAR_BYTES = 2 * 1024**3 + 1024**2
 _MAX_TOKEN_COUNT = 1_048_576
 _READ_CHUNK_BYTES = 1024 * 1024
 
@@ -415,6 +425,7 @@ class AnchorReceipt:
     last_access_sequence: int
     hit_count: int
     transport_neutral: bool
+    mtp_carry: MtpCarrySidecarDescriptor | None
     receipt_sha256: str
 
     def __post_init__(self) -> None:
@@ -485,6 +496,10 @@ class AnchorReceipt:
         _nonnegative_int(self.hit_count, "anchor hit count")
         if not isinstance(self.transport_neutral, bool):
             raise SemanticStateCacheError("transport_neutral must be boolean")
+        if self.mtp_carry is not None and not isinstance(
+            self.mtp_carry, MtpCarrySidecarDescriptor
+        ):
+            raise SemanticStateCacheError("MTP carry descriptor is invalid")
         _digest(self.receipt_sha256, "anchor receipt SHA-256")
         if self.receipt_sha256 != _sha256_document(self._body_document()):
             raise SemanticStateCacheError("anchor receipt SHA-256 mismatch")
@@ -495,17 +510,22 @@ class AnchorReceipt:
             self.snapshot_manifest_bytes
             + self.snapshot_payload_bytes
             + self.seed_hidden_bytes
+            + (0 if self.mtp_carry is None else self.mtp_carry.bytes)
         )
 
     def _body_document(self) -> dict[str, Any]:
-        return {
+        body: dict[str, Any] = {
             "boundary_kind": self.boundary_kind,
             "created_sequence": self.created_sequence,
             "hit_count": self.hit_count,
             "last_access_sequence": self.last_access_sequence,
             "prefix_length": self.prefix_length,
             "prefix_sha256": self.prefix_sha256,
-            "schema": SEMANTIC_ANCHOR_RECEIPT_SCHEMA,
+            "schema": (
+                _SEMANTIC_ANCHOR_RECEIPT_LEGACY_SCHEMA
+                if self.mtp_carry is None
+                else SEMANTIC_ANCHOR_RECEIPT_SCHEMA
+            ),
             "seed_hidden_bytes": self.seed_hidden_bytes,
             "seed_hidden_dtype": self.seed_hidden_dtype,
             "seed_hidden_name": self.seed_hidden_name,
@@ -527,18 +547,41 @@ class AnchorReceipt:
             "state_bytes": self.state_bytes,
             "transport_neutral": self.transport_neutral,
         }
+        if self.mtp_carry is not None:
+            body["mtp_carry"] = self.mtp_carry.to_record()
+        return body
 
     def to_document(self) -> dict[str, Any]:
         return {**self._body_document(), "receipt_sha256": self.receipt_sha256}
 
     @classmethod
     def create(cls, **values: Any) -> "AnchorReceipt":
+        values.setdefault("mtp_carry", None)
         if isinstance(values.get("seed_hidden_shape"), list):
             values["seed_hidden_shape"] = tuple(values["seed_hidden_shape"])
+        mtp_carry = values.get("mtp_carry")
+        if isinstance(mtp_carry, Mapping):
+            try:
+                mtp_carry = MtpCarrySidecarDescriptor.from_record(mtp_carry)
+            except (TypeError, ValueError) as exc:
+                raise SemanticStateCacheError("MTP carry descriptor is invalid") from exc
+            values["mtp_carry"] = mtp_carry
+        if mtp_carry is not None and not isinstance(
+            mtp_carry, MtpCarrySidecarDescriptor
+        ):
+            raise SemanticStateCacheError("MTP carry descriptor is invalid")
+        body_values = dict(values)
+        body_values.pop("mtp_carry")
         body = {
-            "schema": SEMANTIC_ANCHOR_RECEIPT_SCHEMA,
-            **values,
+            "schema": (
+                _SEMANTIC_ANCHOR_RECEIPT_LEGACY_SCHEMA
+                if mtp_carry is None
+                else SEMANTIC_ANCHOR_RECEIPT_SCHEMA
+            ),
+            **body_values,
         }
+        if mtp_carry is not None:
+            body["mtp_carry"] = mtp_carry.to_record()
         return cls(**values, receipt_sha256=_sha256_document(body))
 
     @classmethod
@@ -573,10 +616,25 @@ class AnchorReceipt:
             "state_bytes",
             "transport_neutral",
         }
-        if set(raw) != expected or raw.get("schema") != SEMANTIC_ANCHOR_RECEIPT_SCHEMA:
+        schema = raw.get("schema")
+        if schema == _SEMANTIC_ANCHOR_RECEIPT_LEGACY_SCHEMA:
+            if set(raw) != expected:
+                raise SemanticStateCacheError("anchor receipt schema is invalid")
+            mtp_carry = None
+        elif schema == SEMANTIC_ANCHOR_RECEIPT_SCHEMA:
+            if set(raw) != expected | {"mtp_carry"}:
+                raise SemanticStateCacheError("anchor receipt schema is invalid")
+            try:
+                mtp_carry = MtpCarrySidecarDescriptor.from_record(raw["mtp_carry"])
+            except (TypeError, ValueError) as exc:
+                raise SemanticStateCacheError(
+                    "anchor MTP carry descriptor is invalid"
+                ) from exc
+        else:
             raise SemanticStateCacheError("anchor receipt schema is invalid")
         values = dict(raw)
         del values["schema"]
+        values["mtp_carry"] = mtp_carry
         if isinstance(values.get("seed_hidden_shape"), list):
             values["seed_hidden_shape"] = tuple(values["seed_hidden_shape"])
         return cls(**values)
@@ -648,12 +706,14 @@ class OrphanGcReceipt:
 
 @dataclass(frozen=True, slots=True)
 class RestoredAnchor:
-    """One native state restore plus an authenticated exact-prefix seed."""
+    """One native restore plus authenticated seed and MTP carry sidecars."""
 
     anchor: AnchorReceipt
     query_length: int
     exact_prefix: bool
     seed_hidden: torch.Tensor | None
+    mtp_carry: Qwen35MtpCarry | None = None
+    mtp_carry_bytes: int = 0
 
     def __post_init__(self) -> None:
         _nonnegative_int(self.query_length, "anchor query length")
@@ -668,6 +728,27 @@ class RestoredAnchor:
                 )
             if tuple(self.seed_hidden.shape) != self.anchor.seed_hidden_shape:
                 raise SemanticStateCacheError("restored seed hidden shape mismatch")
+        _nonnegative_int(self.mtp_carry_bytes, "restored MTP carry bytes")
+        descriptor = self.anchor.mtp_carry
+        if self.mtp_carry is None:
+            if descriptor is not None or self.mtp_carry_bytes != 0:
+                raise SemanticStateCacheError(
+                    "restored anchor omitted its announced MTP carry"
+                )
+        else:
+            if not isinstance(self.mtp_carry, Qwen35MtpCarry):
+                raise SemanticStateCacheError("restored MTP carry type is invalid")
+            if descriptor is None or self.mtp_carry_bytes != descriptor.bytes:
+                raise SemanticStateCacheError(
+                    "restored MTP carry byte count is inconsistent"
+                )
+            if (
+                len(self.mtp_carry.history) != self.anchor.prefix_length
+                or self.mtp_carry.next_position != self.anchor.prefix_length - 1
+            ):
+                raise SemanticStateCacheError(
+                    "restored MTP carry cursor differs from anchor"
+                )
 
     @property
     def suffix_start(self) -> int:
@@ -910,6 +991,10 @@ class SemanticStateAnchorCache:
             ),
         )
 
+    def _mtp_carry_path(self, anchor: AnchorReceipt) -> Path | None:
+        descriptor = anchor.mtp_carry
+        return None if descriptor is None else self.snapshots / descriptor.basename
+
     def _verify_anchor_artifacts(
         self, anchor: AnchorReceipt, *, verify_seed: bool
     ) -> None:
@@ -939,6 +1024,19 @@ class SemanticStateAnchorCache:
             )
             if _sha256_bytes(seed_raw) != anchor.seed_hidden_sha256:
                 raise SemanticStateCacheError("anchor seed hidden SHA-256 mismatch")
+        descriptor = anchor.mtp_carry
+        if descriptor is not None:
+            sidecar = self.snapshots / descriptor.basename
+            sidecar_sha = _stable_regular_sha256(
+                sidecar,
+                label="anchor MTP carry sidecar",
+                max_bytes=descriptor.bytes,
+                expected_bytes=descriptor.bytes,
+            )
+            if sidecar_sha != descriptor.file_sha256:
+                raise SemanticStateCacheError(
+                    "anchor MTP carry sidecar SHA-256 mismatch"
+                )
 
     @staticmethod
     def _seed_tensor_sha256(value: torch.Tensor) -> str:
@@ -1081,6 +1179,108 @@ class SemanticStateAnchorCache:
             )
         return hidden.to(device=target_device, dtype=target_dtype).detach().clone()
 
+    @staticmethod
+    def _mtp_carries_equal(
+        left: Qwen35MtpCarry, right: Qwen35MtpCarry
+    ) -> bool:
+        if (
+            left.schema != right.schema
+            or left.identity != right.identity
+            or left.history != right.history
+            or left.next_position != right.next_position
+            or not torch.equal(left.last_target_hidden, right.last_target_hidden)
+        ):
+            return False
+        if left.state is None or right.state is None:
+            return left.state is right.state
+        return all(
+            (left_value is None and right_value is None)
+            or (
+                isinstance(left_value, torch.Tensor)
+                and isinstance(right_value, torch.Tensor)
+                and torch.equal(left_value, right_value)
+            )
+            for left_value, right_value in (
+                (left.state.key, right.state.key),
+                (left.state.value, right.state.value),
+                (left.state.crsa_log_usage, right.state.crsa_log_usage),
+            )
+        )
+
+    def _write_mtp_carry(
+        self,
+        prefix_sha256: str,
+        tokens: tuple[int, ...],
+        mtp_carry: Qwen35MtpCarry | None,
+        tokenizer_sha256: str | None,
+    ) -> MtpCarrySidecarDescriptor | None:
+        if mtp_carry is None:
+            return None
+        if not isinstance(mtp_carry, Qwen35MtpCarry):
+            raise TypeError("mtp_carry must be a Qwen35MtpCarry or None")
+        if mtp_carry.history != tokens:
+            raise ValueError("MTP carry history must equal the anchor token prefix")
+        tokenizer_digest = _digest(tokenizer_sha256, "tokenizer SHA-256")
+        assert tokenizer_digest is not None
+        try:
+            descriptor = write_qwen35_mtp_carry_sidecar(
+                self.snapshots,
+                mtp_carry,
+                tokenizer_sha256=tokenizer_digest,
+                prefix_sha256=prefix_sha256,
+            )
+            verified = read_qwen35_mtp_carry_sidecar(
+                self.snapshots,
+                descriptor,
+                history=tokens,
+                tokenizer_sha256=tokenizer_digest,
+                expected_identity=mtp_carry.identity,
+            )
+        except (OSError, TypeError, Qwen35MtpCarrySidecarError) as exc:
+            raise SemanticStateCacheError(
+                "cannot publish and verify MTP carry sidecar"
+            ) from exc
+        if not self._mtp_carries_equal(verified, mtp_carry):
+            raise SemanticStateCacheError(
+                "verified MTP carry sidecar differs from supplied carry"
+            )
+        return descriptor
+
+    def _load_mtp_carry(
+        self,
+        anchor: AnchorReceipt,
+        tokens: tuple[int, ...],
+        *,
+        tokenizer_sha256: str | None,
+        expected_mtp_identity: object | None,
+    ) -> Qwen35MtpCarry | None:
+        descriptor = anchor.mtp_carry
+        if descriptor is None:
+            return None
+        tokenizer_digest = _digest(tokenizer_sha256, "tokenizer SHA-256")
+        if tokenizer_digest is None or expected_mtp_identity is None:
+            raise SemanticStateCacheError(
+                "MTP carry restore requires tokenizer and runtime identity"
+            )
+        try:
+            carry = read_qwen35_mtp_carry_sidecar(
+                self.snapshots,
+                descriptor,
+                history=tokens[: anchor.prefix_length],
+                tokenizer_sha256=tokenizer_digest,
+                expected_identity=expected_mtp_identity,
+            )
+        except (OSError, TypeError, Qwen35MtpCarrySidecarError) as exc:
+            raise SemanticStateCacheError(
+                "cannot authenticate anchor MTP carry sidecar"
+            ) from exc
+        if (
+            carry.history != tokens[: anchor.prefix_length]
+            or carry.next_position != anchor.prefix_length - 1
+        ):
+            raise SemanticStateCacheError("anchor MTP carry cursor mismatch")
+        return carry
+
     def _anchor_from_snapshot(
         self,
         *,
@@ -1090,6 +1290,7 @@ class SemanticStateAnchorCache:
         semantic_digest: str | None,
         save_receipt: Mapping[str, Any],
         seed: _SeedDescriptor,
+        mtp_carry: MtpCarrySidecarDescriptor | None,
         sequence: int,
     ) -> AnchorReceipt:
         manifest_path = self.snapshots / f"{prefix_sha256}.json"
@@ -1203,6 +1404,7 @@ class SemanticStateAnchorCache:
             last_access_sequence=sequence,
             hit_count=0,
             transport_neutral=self.transport_neutral,
+            mtp_carry=mtp_carry,
         )
 
     def store(
@@ -1213,6 +1415,8 @@ class SemanticStateAnchorCache:
         boundary_kind: BoundaryKind,
         semantic_label_sha256: str | None = None,
         seed_hidden: torch.Tensor | None = None,
+        mtp_carry: Qwen35MtpCarry | None = None,
+        tokenizer_sha256: str | None = None,
     ) -> AnchorReceipt:
         """Commit one native snapshot, then atomically make its prefix visible."""
 
@@ -1226,6 +1430,14 @@ class SemanticStateAnchorCache:
             "semantic label SHA-256",
             optional=True,
         )
+        if mtp_carry is not None:
+            if not isinstance(mtp_carry, Qwen35MtpCarry):
+                raise TypeError("mtp_carry must be a Qwen35MtpCarry or None")
+            if mtp_carry.history != tokens:
+                raise ValueError(
+                    "MTP carry history must equal the anchor token prefix"
+                )
+            _digest(tokenizer_sha256, "tokenizer SHA-256")
         prefix_digest = token_prefix_sha256(tokens)
         manifest_path = self.snapshots / f"{prefix_digest}.json"
         with self._locked():
@@ -1255,6 +1467,12 @@ class SemanticStateAnchorCache:
             if not isinstance(save_receipt, Mapping):
                 raise SemanticStateCacheError("native save_state returned no receipt")
             seed = self._write_seed_hidden(prefix_digest, seed_hidden)
+            carry_descriptor = self._write_mtp_carry(
+                prefix_digest,
+                tokens,
+                mtp_carry,
+                tokenizer_sha256,
+            )
             sequence = state.logical_clock + 1
             anchor = self._anchor_from_snapshot(
                 prefix_length=len(tokens),
@@ -1263,6 +1481,7 @@ class SemanticStateAnchorCache:
                 semantic_digest=semantic_digest,
                 save_receipt=save_receipt,
                 seed=seed,
+                mtp_carry=carry_descriptor,
                 sequence=sequence,
             )
             if self.max_bytes is not None and anchor.cache_bytes > self.max_bytes:
@@ -1318,7 +1537,12 @@ class SemanticStateAnchorCache:
             return self._commit_hit(state, anchor)
 
     def restore_deepest(
-        self, model: _StateModel, token_ids: Sequence[int]
+        self,
+        model: _StateModel,
+        token_ids: Sequence[int],
+        *,
+        tokenizer_sha256: str | None = None,
+        expected_mtp_identity: object | None = None,
     ) -> RestoredAnchor | None:
         """Restore the deepest exact prefix through native ``load_state`` only."""
 
@@ -1334,6 +1558,12 @@ class SemanticStateAnchorCache:
             # replace the caller's continuation state.  Suffix queries never
             # consume this auxiliary head seed and therefore never read it.
             seed_hidden = self._load_seed_hidden(anchor, model) if exact else None
+            mtp_carry = self._load_mtp_carry(
+                anchor,
+                tokens,
+                tokenizer_sha256=tokenizer_sha256,
+                expected_mtp_identity=expected_mtp_identity,
+            )
             loaded_completed = False
             try:
                 loaded = model.load_state(
@@ -1379,6 +1609,10 @@ class SemanticStateAnchorCache:
                     query_length=len(tokens),
                     exact_prefix=exact,
                     seed_hidden=seed_hidden,
+                    mtp_carry=mtp_carry,
+                    mtp_carry_bytes=(
+                        0 if anchor.mtp_carry is None else anchor.mtp_carry.bytes
+                    ),
                 )
             except Qwen38SnapshotIdentityMismatch:
                 current = state.by_prefix().get(anchor.prefix_sha256)
@@ -1429,10 +1663,37 @@ class SemanticStateAnchorCache:
         )
         return updated
 
+    @staticmethod
+    def _physical_cache_bytes(anchors: Sequence[AnchorReceipt]) -> int:
+        """Count anchor-owned files, deduplicating shared content sidecars."""
+
+        total = 0
+        sidecar_bytes: dict[tuple[str, str], int] = {}
+        for anchor in anchors:
+            total += (
+                anchor.snapshot_manifest_bytes
+                + anchor.snapshot_payload_bytes
+                + anchor.seed_hidden_bytes
+            )
+            descriptor = anchor.mtp_carry
+            if descriptor is None:
+                continue
+            key = (descriptor.file_sha256, descriptor.basename)
+            previous = sidecar_bytes.get(key)
+            if previous is None:
+                sidecar_bytes[key] = descriptor.bytes
+                total += descriptor.bytes
+            elif previous != descriptor.bytes:
+                raise SemanticStateCacheError(
+                    "shared MTP carry sidecar byte counts conflict"
+                )
+        return total
+
     def _evict_after_commit(self, state: _IndexState, *, protected_prefix: str) -> None:
         if self.max_bytes is None:
             return
-        total = sum(anchor.cache_bytes for anchor in state.anchors)
+        retained = state.anchors
+        total = self._physical_cache_bytes(retained)
         if total <= self.max_bytes:
             return
         ordered = sorted(
@@ -1450,17 +1711,19 @@ class SemanticStateAnchorCache:
             if anchor.prefix_sha256 == protected_prefix:
                 continue
             evicted.append(anchor)
-            total -= anchor.cache_bytes
+            evicted_prefixes = {row.prefix_sha256 for row in evicted}
+            retained = tuple(
+                row
+                for row in state.anchors
+                if row.prefix_sha256 not in evicted_prefixes
+            )
+            # A shared content-addressed carry remains charged until its final
+            # live receipt is removed, while anchor-exclusive files free now.
+            total = self._physical_cache_bytes(retained)
         if total > self.max_bytes:
             raise SemanticStateCacheBudgetError(
                 "anchor budget cannot be met without evicting the committed anchor"
             )
-        evicted_prefixes = {anchor.prefix_sha256 for anchor in evicted}
-        retained = tuple(
-            anchor
-            for anchor in state.anchors
-            if anchor.prefix_sha256 not in evicted_prefixes
-        )
         # Remove references first; a crash after this commit leaves only safe
         # orphans for explicit collection.
         self._write_index(
@@ -1492,6 +1755,7 @@ class SemanticStateAnchorCache:
 
     def _delete_anchor_artifacts(self, anchor: AnchorReceipt) -> int:
         manifest, payload, seed = self._snapshot_paths(anchor)
+        carry_path = self._mtp_carry_path(anchor)
         reclaimed = 0
         # Manifest first prevents the native snapshot reader from discovering a
         # payload while an unreferenced cache entry is being removed.
@@ -1517,6 +1781,21 @@ class SemanticStateAnchorCache:
                 expected_bytes=anchor.seed_hidden_bytes,
                 label="anchor seed hidden",
             )
+        if carry_path is not None and carry_path.exists():
+            descriptor = anchor.mtp_carry
+            assert descriptor is not None
+            referenced_carries = {
+                row.mtp_carry.basename
+                for row in self._read_index().anchors
+                if row.mtp_carry is not None
+            }
+            if descriptor.basename not in referenced_carries:
+                reclaimed += self._delete_verified_file(
+                    carry_path,
+                    expected_sha256=descriptor.file_sha256,
+                    expected_bytes=descriptor.bytes,
+                    label="anchor MTP carry sidecar",
+                )
         _fsync_directory(self.snapshots)
         return reclaimed
 
@@ -1529,7 +1808,7 @@ class SemanticStateAnchorCache:
     @property
     def total_bytes(self) -> int:
         with self._locked():
-            return sum(anchor.cache_bytes for anchor in self._read_index().anchors)
+            return self._physical_cache_bytes(self._read_index().anchors)
 
     def gc_orphans(self) -> OrphanGcReceipt:
         """Explicitly remove verified cache-owned files absent from the index."""
@@ -1543,6 +1822,11 @@ class SemanticStateAnchorCache:
                     anchor.snapshot_manifest_name,
                     anchor.snapshot_payload_name,
                     anchor.seed_hidden_name,
+                    (
+                        None
+                        if anchor.mtp_carry is None
+                        else anchor.mtp_carry.basename
+                    ),
                 )
                 if name is not None
             }
@@ -1563,6 +1847,7 @@ class SemanticStateAnchorCache:
                 manifest_match = _MANIFEST_RE.fullmatch(name)
                 payload_match = _PAYLOAD_RE.fullmatch(name)
                 seed_match = _SEED_RE.fullmatch(name)
+                carry_match = _MTP_CARRY_RE.fullmatch(name)
                 if manifest_match is not None:
                     raw = _stable_regular_bytes(
                         path,
@@ -1634,6 +1919,22 @@ class SemanticStateAnchorCache:
                     if set(tensors) != {"seed_hidden"}:
                         continue
                     size = len(raw)
+                    path.unlink()
+                    reclaimed += size
+                    deleted_payloads.append(name)
+                elif carry_match is not None:
+                    expected_sha = carry_match.group(1)
+                    actual_sha = _stable_regular_sha256(
+                        path,
+                        label="orphan MTP carry sidecar",
+                        max_bytes=max(
+                            self.snapshot_max_bytes + 8 * 1024**2,
+                            _MAX_MTP_CARRY_SIDECAR_BYTES,
+                        ),
+                    )
+                    if actual_sha != expected_sha:
+                        continue
+                    size = linked.st_size
                     path.unlink()
                     reclaimed += size
                     deleted_payloads.append(name)
