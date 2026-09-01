@@ -332,6 +332,103 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertTrue(report["vision_excluded"])
         self.assertTrue(report["mtp_excluded"])
 
+    def test_component_timing_counters_cover_physical_forward_paths(self) -> None:
+        hidden = torch.randn((1, 1, self.config.dim))
+        mask = torch.ones((1, 1), dtype=torch.bool)
+        clock = iter(
+            (
+                100,
+                110,
+                200,
+                250,
+                300,
+                307,
+                400,
+                480,
+                500,
+                511,
+                600,
+                670,
+                700,
+                709,
+                800,
+                890,
+            )
+        )
+
+        with mock.patch.object(
+            qwen_model_module.time,
+            "perf_counter_ns",
+            side_effect=lambda: next(clock),
+        ):
+            self.model._forward_layer(
+                hidden,
+                layer=0,
+                token_mask=mask,
+                state=None,
+                start_pos=0,
+                stateful=True,
+            )
+            self.model._forward_layer(
+                hidden,
+                layer=3,
+                token_mask=mask,
+                state=None,
+                start_pos=0,
+                stateful=True,
+            )
+
+        metrics = self.model.component_timing_metrics()
+        self.assertEqual(
+            metrics["schema"],
+            "immer.qwen3.8-component-timing-counters/v1",
+        )
+        self.assertEqual(metrics["clock"], "time.perf_counter_ns")
+        self.assertEqual(metrics["unit"], "nanoseconds")
+        self.assertEqual(metrics["accounting_failures"], 0)
+        self.assertEqual(
+            metrics["components"],
+            {
+                "full_attention_core": {"calls": 1, "nanoseconds": 70},
+                "deltanet_core": {"calls": 1, "nanoseconds": 50},
+                "mlp_core": {"calls": 2, "nanoseconds": 170},
+                "layer_transition_crystal": {
+                    "calls": 2,
+                    "nanoseconds": 21,
+                },
+                "layer_mlp_crystal": {"calls": 2, "nanoseconds": 16},
+            },
+        )
+
+    def test_component_clock_failure_cannot_change_forward_execution(self) -> None:
+        hidden = torch.randn((1, 1, self.config.dim))
+        mask = torch.ones((1, 1), dtype=torch.bool)
+
+        with mock.patch.object(
+            qwen_model_module.time,
+            "perf_counter_ns",
+            side_effect=RuntimeError("clock unavailable"),
+        ):
+            output, state = self.model._forward_layer(
+                hidden,
+                layer=0,
+                token_mask=mask,
+                state=None,
+                start_pos=0,
+                stateful=True,
+            )
+
+        self.assertEqual(tuple(output.shape), tuple(hidden.shape))
+        self.assertIsInstance(state, DeltaNetState)
+        metrics = self.model.component_timing_metrics()
+        self.assertEqual(metrics["accounting_failures"], 4)
+        self.assertTrue(
+            all(
+                row == {"calls": 0, "nanoseconds": 0}
+                for row in metrics["components"].values()
+            )
+        )
+
     def test_layer_endpoint_capture_keeps_fused_mlp_eligible(self) -> None:
         self.model.layer_boundary_observer = lambda *_args: None
         self.model.layer_boundary_layers = (3,)

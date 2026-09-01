@@ -21,6 +21,7 @@ from immer.cli import (
     _qwen38_growing_warm_profile,
     _qwen38_layer_mlp_o1_policy,
     _qwen38_output_semantics,
+    _resolve_qwen38_prefix_sinkhorn,
     _qwen38_service_profile,
     _qwen38_runtime_code_paths,
     main,
@@ -331,6 +332,54 @@ class _StreamingModel(_Model):
                     }
                 )
         return super().generate_greedy(prompt, **kwargs)
+
+
+class _ComponentTimingModel(_Model):
+    _COMPONENTS = (
+        "full_attention_core",
+        "deltanet_core",
+        "mlp_core",
+        "layer_transition_crystal",
+        "layer_mlp_crystal",
+    )
+
+    def __init__(self, *, invalid_after_generation: bool = False) -> None:
+        super().__init__()
+        self.invalid_after_generation = invalid_after_generation
+        self.generated_once = False
+        self.component_counters = {
+            component: {"calls": 10, "nanoseconds": 1_000}
+            for component in self._COMPONENTS
+        }
+
+    def component_timing_metrics(self):
+        if self.invalid_after_generation and self.generated_once:
+            return {"schema": "broken"}
+        return {
+            "accounting_failures": 0,
+            "clock": "time.perf_counter_ns",
+            "components": {
+                component: dict(row)
+                for component, row in self.component_counters.items()
+            },
+            "schema": "immer.qwen3.8-component-timing-counters/v1",
+            "unit": "nanoseconds",
+        }
+
+    def generate_greedy(self, prompt, **kwargs):
+        generated, evidence = super().generate_greedy(prompt, **kwargs)
+        increments = {
+            "full_attention_core": (4, 400),
+            "deltanet_core": (12, 1_200),
+            "mlp_core": (16, 3_200),
+            "layer_transition_crystal": (16, 80),
+            "layer_mlp_crystal": (16, 96),
+        }
+        for component, (calls, nanoseconds) in increments.items():
+            self.component_counters[component]["calls"] += calls
+            self.component_counters[component]["nanoseconds"] += nanoseconds
+        self.generated_once = True
+        return generated, evidence
 
 
 class _LayerMlpO1Model(_Model):
@@ -3331,6 +3380,73 @@ class Qwen38CausalChatTests(unittest.TestCase):
             },
         )
 
+    def test_runtime_metrics_expose_request_local_component_nanoseconds(
+        self,
+    ) -> None:
+        model = _ComponentTimingModel()
+        result = _chat(_Runtime(model=model)).handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.OK)
+        timings = result.evidence["runtime_metrics"]["component_timings"]
+        self.assertEqual(
+            timings["schema"],
+            "immer.qwen3.8-component-timing-request/v1",
+        )
+        self.assertEqual(
+            timings["source_schema"],
+            "immer.qwen3.8-component-timing-counters/v1",
+        )
+        self.assertEqual(timings["clock"], "time.perf_counter_ns")
+        self.assertEqual(timings["unit"], "nanoseconds")
+        self.assertEqual(timings["status"], "ok")
+        self.assertIsNone(timings["accounting_error"])
+        self.assertEqual(timings["accounting_failures"], 0)
+        self.assertEqual(timings["measured_nanoseconds"], 4_976)
+        self.assertEqual(
+            timings["components"],
+            {
+                "full_attention_core": {
+                    "boundary": "StreamedQwen38._full_attention",
+                    "calls": 4,
+                    "nanoseconds": 400,
+                },
+                "deltanet_core": {
+                    "boundary": "StreamedQwen38._linear_attention",
+                    "calls": 12,
+                    "nanoseconds": 1_200,
+                },
+                "mlp_core": {
+                    "boundary": "StreamedQwen38._mlp",
+                    "calls": 16,
+                    "nanoseconds": 3_200,
+                },
+                "layer_transition_crystal": {
+                    "boundary": (
+                        "StreamedQwen38._layer_transition_crystal_forward"
+                    ),
+                    "calls": 16,
+                    "nanoseconds": 80,
+                },
+                "layer_mlp_crystal": {
+                    "boundary": "StreamedQwen38._layer_mlp_crystal_forward",
+                    "calls": 16,
+                    "nanoseconds": 96,
+                },
+            },
+        )
+
+    def test_component_timing_accounting_failure_is_request_fail_safe(self) -> None:
+        model = _ComponentTimingModel(invalid_after_generation=True)
+        result = _chat(_Runtime(model=model)).handle(Request("chat", "hello"))
+
+        self.assertIs(result.status, ExecutionStatus.OK)
+        self.assertEqual(result.output, "local answer")
+        timings = result.evidence["runtime_metrics"]["component_timings"]
+        self.assertEqual(timings["status"], "accounting-error")
+        self.assertEqual(timings["accounting_error"], "invalid-model-counter")
+        self.assertEqual(timings["components"], {})
+        self.assertIsNone(timings["measured_nanoseconds"])
+
     def test_chat_history_renders_exact_multi_turn_qwen_context(self) -> None:
         runtime = _Runtime()
         chat = _chat(runtime, system_prompt="stay concise")
@@ -5515,6 +5631,58 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(enabled_a, enabled_b)
         self.assertNotEqual(enabled_a, disabled)
 
+    def test_canonical_prefix_sinkhorn_default_is_shared_by_service_and_client(
+        self,
+    ) -> None:
+        canonical = Path("/models/canonical-qwen")
+        q4 = canonical / "causal" / "q4"
+        server_args = SimpleNamespace(prefix_sinkhorn=None)
+        client_args = SimpleNamespace(prefix_sinkhorn=None)
+        disabled_args = SimpleNamespace(prefix_sinkhorn=False)
+        outside_args = SimpleNamespace(prefix_sinkhorn=None)
+        explicit_args = SimpleNamespace(prefix_sinkhorn=True)
+        common = {
+            "bundle_path": canonical,
+            "tokenizer_path": canonical / "tokenizer.json",
+            "q4_root": q4,
+            "fast_mlp_root": None,
+            "warm_root": None,
+            "draft_mode": None,
+            "markov_draft_state": None,
+            "mtp_draft_state": None,
+            "markov_atlas_path": None,
+            "markov_o1_retention_path": None,
+            "mlp_page_state_path": None,
+            "draft_window_state_path": None,
+            "runtime_code_revision": "a" * 64,
+        }
+        with patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", canonical):
+            self.assertTrue(_resolve_qwen38_prefix_sinkhorn(server_args, canonical, q4))
+            self.assertTrue(_resolve_qwen38_prefix_sinkhorn(client_args, canonical, q4))
+            self.assertFalse(
+                _resolve_qwen38_prefix_sinkhorn(disabled_args, canonical, q4)
+            )
+            self.assertFalse(
+                _resolve_qwen38_prefix_sinkhorn(
+                    outside_args,
+                    Path("/models/other-qwen"),
+                    q4,
+                )
+            )
+            self.assertTrue(
+                _resolve_qwen38_prefix_sinkhorn(
+                    explicit_args,
+                    Path("/models/other-qwen"),
+                    q4,
+                )
+            )
+            server_profile = _qwen38_service_profile(args=server_args, **common)
+            client_profile = _qwen38_service_profile(args=client_args, **common)
+            disabled_profile = _qwen38_service_profile(args=disabled_args, **common)
+
+        self.assertEqual(server_profile, client_profile)
+        self.assertNotEqual(server_profile, disabled_profile)
+
     def test_q4_residency_changes_service_profile_not_replay_semantics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -7501,6 +7669,103 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(intervention.head_indices, (2, 8, 14, 20))
         self.assertEqual(intervention.alpha, 1.0)
         self.assertTrue(intervention.replace_base_softmax)
+
+    def test_cli_defaults_canonical_local_q4_to_prefix_sinkhorn(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        intervention = constructor.call_args.kwargs["native_head_crsa"]
+        self.assertIsInstance(intervention, Qwen38NativeHeadCrsa)
+        self.assertEqual(intervention.alpha, 1.0)
+        self.assertTrue(intervention.replace_base_softmax)
+
+    def test_cli_no_prefix_sinkhorn_overrides_canonical_default(self) -> None:
+        qwen = _chat(_Runtime())
+        with tempfile.TemporaryDirectory() as temporary:
+            deployed = Path(temporary) / "deployed"
+            (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch("immer.cli._QWEN38_DEPLOYMENT_ROOT", deployed),
+                patch(
+                    "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+                    return_value=qwen,
+                ) as constructor,
+                redirect_stdout(io.StringIO()),
+            ):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--no-prefix-sinkhorn",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(constructor.call_args.kwargs["native_head_crsa"])
+
+    def test_cli_noncanonical_local_q4_keeps_prefix_sinkhorn_opt_in(self) -> None:
+        qwen = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--qwen38-q4",
+                        "/models/qwen-q4",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(constructor.call_args.kwargs["native_head_crsa"])
+
+    def test_cli_prefix_sinkhorn_overrides_are_mutually_exclusive(self) -> None:
+        with (
+            redirect_stderr(io.StringIO()),
+            redirect_stdout(io.StringIO()),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            main(
+                [
+                    "chat",
+                    "hello",
+                    "--prefix-sinkhorn",
+                    "--no-prefix-sinkhorn",
+                ]
+            )
+        self.assertEqual(raised.exception.code, 2)
 
     def test_cli_wires_exact_head_index_root(self) -> None:
         qwen = _chat(_Runtime())

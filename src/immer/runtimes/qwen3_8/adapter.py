@@ -63,7 +63,11 @@ from .fast_mlp import (
     open_qwen38_fast_mlp,
 )
 from .exact_head import ExactHeadIndex, ExactHeadNotApplicable
-from .model import StreamedQwen38
+from .model import (
+    QWEN38_COMPONENT_TIMING_COMPONENTS,
+    QWEN38_COMPONENT_TIMING_COUNTER_SCHEMA,
+    StreamedQwen38,
+)
 from .local_draft import Qwen35K4DraftProvider
 from .markov_draft import (
     MARKOV_DRAFT_PROVIDER_ABI,
@@ -159,6 +163,18 @@ LAYER_MLP_CRYSTAL_EVIDENCE_SCHEMA = (
 LAYER_MLP_O1_COLLECTION_EVIDENCE_SCHEMA = (
     "immer.qwen3.8-layer63-mlp-o1-collection-evidence/v1"
 )
+QWEN38_COMPONENT_TIMING_REQUEST_SCHEMA = (
+    "immer.qwen3.8-component-timing-request/v1"
+)
+_QWEN38_COMPONENT_TIMING_BOUNDARIES = {
+    "full_attention_core": "StreamedQwen38._full_attention",
+    "deltanet_core": "StreamedQwen38._linear_attention",
+    "mlp_core": "StreamedQwen38._mlp",
+    "layer_transition_crystal": (
+        "StreamedQwen38._layer_transition_crystal_forward"
+    ),
+    "layer_mlp_crystal": "StreamedQwen38._layer_mlp_crystal_forward",
+}
 DEFAULT_LAYER_MLP_O1_PROJECTION_SEED = (
     "2b188a99b4b36f51bd910866e6d9a007fd02ec7256d6596fc87eb76f0444eccf"
 )
@@ -861,6 +877,149 @@ def _process_usage_delta(
         )
         for field in fields
     }
+
+
+def _runtime_component_timing_snapshot(
+    runtime: object,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Read validated model timing counters without affecting inference."""
+
+    model = getattr(runtime, "model", None)
+    metrics = getattr(model, "component_timing_metrics", None)
+    if not callable(metrics):
+        return None, "model-counter-unavailable"
+    try:
+        value = metrics()
+        if not isinstance(value, Mapping):
+            raise ValueError("component timing metrics are not a mapping")
+        if value.get("schema") != QWEN38_COMPONENT_TIMING_COUNTER_SCHEMA:
+            raise ValueError("component timing counter schema changed")
+        if value.get("clock") != "time.perf_counter_ns":
+            raise ValueError("component timing clock changed")
+        if value.get("unit") != "nanoseconds":
+            raise ValueError("component timing unit changed")
+        accounting_failures = value.get("accounting_failures")
+        if (
+            isinstance(accounting_failures, bool)
+            or not isinstance(accounting_failures, int)
+            or accounting_failures < 0
+        ):
+            raise ValueError("component timing failure counter is invalid")
+        raw_components = value.get("components")
+        if not isinstance(raw_components, Mapping):
+            raise ValueError("component timing counters are not a mapping")
+        components: dict[str, dict[str, int]] = {}
+        for component in QWEN38_COMPONENT_TIMING_COMPONENTS:
+            row = raw_components.get(component)
+            if not isinstance(row, Mapping):
+                raise ValueError(f"component timing row {component!r} is invalid")
+            calls = row.get("calls")
+            nanoseconds = row.get("nanoseconds")
+            if (
+                isinstance(calls, bool)
+                or not isinstance(calls, int)
+                or calls < 0
+                or isinstance(nanoseconds, bool)
+                or not isinstance(nanoseconds, int)
+                or nanoseconds < 0
+            ):
+                raise ValueError(
+                    f"component timing counters for {component!r} are invalid"
+                )
+            components[component] = {
+                "calls": calls,
+                "nanoseconds": nanoseconds,
+            }
+        return {
+            "accounting_failures": accounting_failures,
+            "components": components,
+        }, None
+    except Exception:
+        return None, "invalid-model-counter"
+
+
+def _runtime_component_timing_delta(
+    before: tuple[dict[str, object] | None, str | None],
+    after: tuple[dict[str, object] | None, str | None],
+) -> dict[str, object]:
+    """Build a request-local timing receipt from monotone model counters."""
+
+    receipt: dict[str, object] = {
+        "clock": "time.perf_counter_ns",
+        "components": {},
+        "measured_nanoseconds": None,
+        "schema": QWEN38_COMPONENT_TIMING_REQUEST_SCHEMA,
+        "source_schema": QWEN38_COMPONENT_TIMING_COUNTER_SCHEMA,
+        "status": "accounting-error",
+        "unit": "nanoseconds",
+    }
+    before_value, before_error = before
+    after_value, after_error = after
+    if before_value is None or after_value is None:
+        errors = tuple(
+            error for error in (before_error, after_error) if error is not None
+        )
+        receipt["accounting_error"] = (
+            "model-counter-unavailable"
+            if errors and all(error == "model-counter-unavailable" for error in errors)
+            else "invalid-model-counter"
+        )
+        receipt["status"] = (
+            "unavailable"
+            if receipt["accounting_error"] == "model-counter-unavailable"
+            else "accounting-error"
+        )
+        return receipt
+    try:
+        before_failures = before_value["accounting_failures"]
+        after_failures = after_value["accounting_failures"]
+        if (
+            isinstance(before_failures, bool)
+            or not isinstance(before_failures, int)
+            or isinstance(after_failures, bool)
+            or not isinstance(after_failures, int)
+            or after_failures < before_failures
+        ):
+            raise ValueError("component timing failure counter moved backwards")
+        before_components = before_value["components"]
+        after_components = after_value["components"]
+        if not isinstance(before_components, Mapping) or not isinstance(
+            after_components, Mapping
+        ):
+            raise ValueError("component timing counters disappeared")
+        request_components: dict[str, dict[str, object]] = {}
+        measured_nanoseconds = 0
+        for component in QWEN38_COMPONENT_TIMING_COMPONENTS:
+            before_row = before_components[component]
+            after_row = after_components[component]
+            if not isinstance(before_row, Mapping) or not isinstance(
+                after_row, Mapping
+            ):
+                raise ValueError("component timing row disappeared")
+            calls = after_row["calls"] - before_row["calls"]
+            nanoseconds = after_row["nanoseconds"] - before_row["nanoseconds"]
+            if calls < 0 or nanoseconds < 0:
+                raise ValueError("component timing counter moved backwards")
+            request_components[component] = {
+                "boundary": _QWEN38_COMPONENT_TIMING_BOUNDARIES[component],
+                "calls": calls,
+                "nanoseconds": nanoseconds,
+            }
+            measured_nanoseconds += nanoseconds
+        accounting_failures = after_failures - before_failures
+    except Exception:
+        receipt["accounting_error"] = "non-monotone-model-counter"
+        return receipt
+    receipt.update(
+        {
+            "accounting_error": None,
+            "accounting_failures": accounting_failures,
+            "components": request_components,
+            "measured_nanoseconds": measured_nanoseconds,
+            "status": "ok" if accounting_failures == 0 else "partial",
+        }
+    )
+    return receipt
 
 
 def _anchor_model_state(model: object) -> tuple[int, bool, int, int | None]:
@@ -5887,6 +6046,7 @@ class Qwen38CausalChat:
                 retention_before_sequence = sequence
         physical_read_before = _linux_process_read_bytes()
         process_usage_before = _process_usage_snapshot()
+        component_timing_before = _runtime_component_timing_snapshot(runtime)
         prefix_sinkhorn_before = self._prefix_sinkhorn_metrics(runtime)
         attention_output_crystal_before = self._attention_output_crystal_metrics()
         layer_transition_crystal_before = self._layer_transition_crystal_metrics(
@@ -5939,6 +6099,7 @@ class Qwen38CausalChat:
             if restore_lm_head_index is not None:
                 restore_lm_head_index(lm_head_index)
         request_seconds = time.perf_counter() - request_started
+        component_timing_after = _runtime_component_timing_snapshot(runtime)
         if delta_head_applied:
             assert callable(set_delta_head_router)
             runtime.model.reset_state(release=True)
@@ -6105,6 +6266,10 @@ class Qwen38CausalChat:
             "generation": receipt,
             "output_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
             "runtime_metrics": {
+                "component_timings": _runtime_component_timing_delta(
+                    component_timing_before,
+                    component_timing_after,
+                ),
                 "generation_wall_seconds": request_seconds,
                 "process_current_rss_bytes": _process_rss_bytes(),
                 "physical_read_bytes": (

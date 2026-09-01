@@ -90,6 +90,16 @@ LAYER_BOUNDARY_STAGES = (
     "mlp.output",
     "layer.output",
 )
+QWEN38_COMPONENT_TIMING_COUNTER_SCHEMA = (
+    "immer.qwen3.8-component-timing-counters/v1"
+)
+QWEN38_COMPONENT_TIMING_COMPONENTS = (
+    "full_attention_core",
+    "deltanet_core",
+    "mlp_core",
+    "layer_transition_crystal",
+    "layer_mlp_crystal",
+)
 LayerBoundaryObserver = Callable[[int, str, torch.Tensor], None]
 LayerMlpO1Observer = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor],
@@ -601,6 +611,13 @@ class StreamedQwen38:
         self._layer_mlp_crystal_rows = 0
         self._layer_mlp_crystal_skipped_q4_matrix_calls = 0
         self._layer_mlp_crystal_packed_weight_bytes_avoided = 0
+        self._component_timing_nanoseconds = {
+            component: 0 for component in QWEN38_COMPONENT_TIMING_COMPONENTS
+        }
+        self._component_timing_calls = {
+            component: 0 for component in QWEN38_COMPONENT_TIMING_COMPONENTS
+        }
+        self._component_timing_accounting_failures = 0
         self._attention_state_digest_cache: dict[
             tuple[object, ...],
             tuple[
@@ -656,6 +673,48 @@ class StreamedQwen38:
     @property
     def state_poisoned(self) -> bool:
         return self._state_poisoned
+
+    def component_timing_metrics(self) -> dict[str, object]:
+        """Return process-local monotone counters for physical layer paths."""
+
+        return {
+            "accounting_failures": self._component_timing_accounting_failures,
+            "clock": "time.perf_counter_ns",
+            "components": {
+                component: {
+                    "calls": self._component_timing_calls[component],
+                    "nanoseconds": self._component_timing_nanoseconds[component],
+                }
+                for component in QWEN38_COMPONENT_TIMING_COMPONENTS
+            },
+            "schema": QWEN38_COMPONENT_TIMING_COUNTER_SCHEMA,
+            "unit": "nanoseconds",
+        }
+
+    def _component_timing_start(self) -> int | None:
+        """Read the monotonic clock without making accounting correctness-critical."""
+
+        try:
+            return time.perf_counter_ns()
+        except Exception:
+            self._component_timing_accounting_failures += 1
+            return None
+
+    def _component_timing_finish(
+        self,
+        component: str,
+        started: int | None,
+    ) -> None:
+        """Accumulate one physical boundary while preserving model execution."""
+
+        if started is None:
+            return
+        try:
+            elapsed = max(0, time.perf_counter_ns() - started)
+            self._component_timing_nanoseconds[component] += elapsed
+            self._component_timing_calls[component] += 1
+        except Exception:
+            self._component_timing_accounting_failures += 1
 
     @property
     def attention_output_crystal_failures(self) -> int:
@@ -4349,14 +4408,21 @@ class StreamedQwen38:
         prefix = f"model.language_model.layers.{layer}"
         residual = hidden
         self._observe_layer_boundary(layer, "layer.input", residual)
-        crystal = self._layer_transition_crystal_forward(
-            hidden,
-            layer=layer,
-            token_mask=token_mask,
-            state=state,
-            start_pos=start_pos,
-            stateful=stateful,
-        )
+        timing_started = self._component_timing_start()
+        try:
+            crystal = self._layer_transition_crystal_forward(
+                hidden,
+                layer=layer,
+                token_mask=token_mask,
+                state=state,
+                start_pos=start_pos,
+                stateful=stateful,
+            )
+        finally:
+            self._component_timing_finish(
+                "layer_transition_crystal",
+                timing_started,
+            )
         if crystal is not None:
             output, next_state = crystal
             self._observe_layer_boundary(layer, "layer.output", output)
@@ -4366,24 +4432,40 @@ class StreamedQwen38:
         if self.config.is_full_attention(layer):
             if state is not None and not isinstance(state, AttentionState):
                 raise Qwen38RuntimeError("full-attention layer received DeltaNet state")
-            mixed, next_state = self._full_attention(
-                mixed_input,
-                layer=layer,
-                token_mask=None if stateful else token_mask,
-                state=state,
-                start_pos=start_pos,
-                native_head_crsa_observer=native_head_crsa_observer,
-                native_head_crsa_tokenwise_usage=native_head_crsa_tokenwise_usage,
-            )
+            timing_started = self._component_timing_start()
+            try:
+                mixed, next_state = self._full_attention(
+                    mixed_input,
+                    layer=layer,
+                    token_mask=None if stateful else token_mask,
+                    state=state,
+                    start_pos=start_pos,
+                    native_head_crsa_observer=native_head_crsa_observer,
+                    native_head_crsa_tokenwise_usage=(
+                        native_head_crsa_tokenwise_usage
+                    ),
+                )
+            finally:
+                self._component_timing_finish(
+                    "full_attention_core",
+                    timing_started,
+                )
         else:
             if state is not None and not isinstance(state, DeltaNetState):
                 raise Qwen38RuntimeError("linear-attention layer received KV state")
-            mixed, next_state = self._linear_attention(
-                mixed_input,
-                layer=layer,
-                token_mask=token_mask,
-                state=state,
-            )
+            timing_started = self._component_timing_start()
+            try:
+                mixed, next_state = self._linear_attention(
+                    mixed_input,
+                    layer=layer,
+                    token_mask=token_mask,
+                    state=state,
+                )
+            finally:
+                self._component_timing_finish(
+                    "deltanet_core",
+                    timing_started,
+                )
         self._observe_layer_boundary(layer, "attention.output", mixed)
         hidden = residual + mixed
         self._observe_layer_boundary(layer, "attention.residual", hidden)
@@ -4395,23 +4477,37 @@ class StreamedQwen38:
         residual = hidden
         mlp_input = self._norm(hidden, f"{prefix}.post_attention_layernorm.weight")
         self._observe_layer_boundary(layer, "mlp.input", mlp_input)
-        layer_mlp_crystal = self._layer_mlp_crystal_forward(
-            residual,
-            mlp_input,
-            layer=layer,
-            token_mask=token_mask,
-            stateful=stateful,
-        )
+        timing_started = self._component_timing_start()
+        try:
+            layer_mlp_crystal = self._layer_mlp_crystal_forward(
+                residual,
+                mlp_input,
+                layer=layer,
+                token_mask=token_mask,
+                stateful=stateful,
+            )
+        finally:
+            self._component_timing_finish(
+                "layer_mlp_crystal",
+                timing_started,
+            )
         if layer_mlp_crystal is not None:
             hidden = layer_mlp_crystal
         else:
-            if self._active_mlp_page_coordinate_transaction is None:
-                mlp_output = self._mlp(mlp_input, layer=layer)
-            else:
-                mlp_output = self._mlp(
-                    mlp_input,
-                    layer=layer,
-                    absolute_position=start_pos,
+            timing_started = self._component_timing_start()
+            try:
+                if self._active_mlp_page_coordinate_transaction is None:
+                    mlp_output = self._mlp(mlp_input, layer=layer)
+                else:
+                    mlp_output = self._mlp(
+                        mlp_input,
+                        layer=layer,
+                        absolute_position=start_pos,
+                    )
+            finally:
+                self._component_timing_finish(
+                    "mlp_core",
+                    timing_started,
                 )
             hidden = residual + mlp_output
             if stateful:

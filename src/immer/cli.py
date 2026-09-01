@@ -635,6 +635,22 @@ def _resolve_qwen38_chat_paths(
     return bundle, tokenizer, q4, fast_mlp
 
 
+def _resolve_qwen38_prefix_sinkhorn(
+    args: argparse.Namespace,
+    bundle_path: Path,
+    q4_root: Path | None,
+) -> bool:
+    """Resolve the deployment default while preserving both explicit overrides."""
+
+    selected = getattr(args, "prefix_sinkhorn", None)
+    if selected is None:
+        selected = bundle_path == _QWEN38_DEPLOYMENT_ROOT and q4_root is not None
+    elif not isinstance(selected, bool):
+        raise TypeError("prefix_sinkhorn must be boolean or None")
+    args.prefix_sinkhorn = selected
+    return selected
+
+
 def _resolve_qwen38_warm_root(
     args: argparse.Namespace,
     bundle_path: Path,
@@ -1936,6 +1952,7 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
         args.q4_resident_budget_mb = q4_resident_budget_mb
         if args.q4_resident_budget_mb and q4_root is None:
             raise ValueError("--q4-resident-budget-mb requires local Q4 execution")
+        _resolve_qwen38_prefix_sinkhorn(args, bundle_path, q4_root)
         service_socket = _resolve_qwen38_service_socket(args, bundle_path)
         args.service_socket = service_socket
         draft_mode, markov_draft_state, mtp_draft_state = _resolve_qwen38_markov_draft(
@@ -4327,14 +4344,23 @@ def build_parser() -> argparse.ArgumentParser:
             "defaults to every DeltaNet layer"
         ),
     )
-    chat.add_argument(
+    prefix_sinkhorn = chat.add_mutually_exclusive_group()
+    prefix_sinkhorn.add_argument(
         "--prefix-sinkhorn",
+        dest="prefix_sinkhorn",
         action="store_true",
         help=(
             "replace base softmax with native Prefix-Sinkhorn on the routed "
-            "layer-27 heads"
+            "layer-27 heads; this is the canonical local-Q4 deployment default"
         ),
     )
+    prefix_sinkhorn.add_argument(
+        "--no-prefix-sinkhorn",
+        dest="prefix_sinkhorn",
+        action="store_false",
+        help="use checkpoint base softmax instead of deployed Prefix-Sinkhorn",
+    )
+    chat.set_defaults(prefix_sinkhorn=None)
     chat.add_argument(
         "--raw-qwen",
         action="store_true",
