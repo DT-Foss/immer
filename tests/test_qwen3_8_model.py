@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,10 @@ from immer.runtimes.qwen3_8.kernels import AttentionState, DeltaNetState
 from immer.runtimes.qwen3_8.layer_mlp_crystal import (
     Layer63MlpResidualCrystalBank,
     Layer63MlpResidualCrystalIdentity,
+    LayerMlpResidualCoverage,
+    LayerMlpResidualCrystal,
+    LayerMlpResidualCrystalBank,
+    LayerMlpResidualCrystalIdentity,
 )
 from immer.runtimes.qwen3_8.layer_transition_crystal import (
     LayerTransitionCrystalBank,
@@ -4191,6 +4196,84 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
             ),
         )
 
+    def _layer_mlp_q4_inventory(self, *layers: int) -> dict[int, int]:
+        entries: dict[str, dict[str, int]] = {}
+        totals: dict[int, int] = {}
+        for layer in layers:
+            names = self.model._layer_mlp_crystal_q4_names(layer)
+            sizes = (1_000 + layer, 2_000 + layer, 3_000 + layer)
+            entries.update(
+                {
+                    name: {"payload_bytes": size}
+                    for name, size in zip(names, sizes, strict=True)
+                }
+            )
+            totals[layer] = sum(sizes)
+        self.pager.q4_bank = SimpleNamespace(
+            entries=entries,
+            has=lambda name: name in entries,
+            identity={"manifest_sha256": "6" * 64, "schema": "fixture-q4/v2"},
+        )
+        return totals
+
+    def _generic_layer_mlp_bank(
+        self,
+        layer: int,
+        *,
+        packed_weight_bytes_avoided: int,
+        model_sha256: str | None = None,
+        q4_sha256: str | None = None,
+        feature_center: float = 0.0,
+        feature_radius: float = 1_000_000.0,
+        state_suffix: str = "",
+    ) -> LayerMlpResidualCrystalBank:
+        identity = LayerMlpResidualCrystalIdentity(
+            model_sha256=(
+                self.model.layer_mlp_crystal_model_sha256()
+                if model_sha256 is None
+                else model_sha256
+            ),
+            q4_sha256=(
+                self.model.layer_mlp_crystal_q4_sha256()
+                if q4_sha256 is None
+                else q4_sha256
+            ),
+            graph_revision_sha256=f"{(layer % 10):x}" * 64,
+            atlas_revision_sha256=f"{((layer + 1) % 10):x}" * 64,
+            projection=LayerTransitionProjectionIdentity(
+                hidden_dim=self.config.dim,
+                sketch_dim=3,
+                seed_sha256=f"{((layer + 2) % 10):x}" * 64,
+            ),
+            layer_index=layer,
+        )
+        center = torch.full((3,), feature_center, dtype=torch.float64)
+        crystal = LayerMlpResidualCrystal(
+            identity=identity,
+            operator=torch.zeros((3, self.config.dim), dtype=torch.float64),
+            feature_mean=center,
+            residual_mean=torch.full(
+                (self.config.dim,),
+                (layer + 1) / 128.0,
+                dtype=torch.float64,
+            ),
+            coverage=LayerMlpResidualCoverage(
+                center=center,
+                feature_radius=feature_radius,
+                error_radius=0.0,
+                sample_count=4,
+                max_observed_error=0.0,
+            ),
+            packed_weight_bytes_avoided=packed_weight_bytes_avoided,
+            ridge=1e-4,
+        )
+        bank = LayerMlpResidualCrystalBank(
+            self.root / f"layer-{layer}-mlp-crystal{state_suffix}.json",
+            identity,
+        )
+        bank.publish(crystal)
+        return bank
+
     def test_attach_binds_model_q4_and_physical_inventory(self) -> None:
         entries = {
             name: {"payload_bytes": 1000 + index}
@@ -4513,7 +4596,7 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
             layer=layer,
             token_mask=mask,
             state=None,
-            start_pos=0,
+            start_pos=1,
             stateful=True,
         )
         self.assertIsInstance(expected_state, AttentionState)
@@ -4567,7 +4650,7 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
                 layer=layer,
                 token_mask=mask,
                 state=None,
-                start_pos=0,
+                start_pos=1,
                 stateful=True,
             )
 
@@ -4606,6 +4689,31 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
             metrics["packed_weight_bytes_avoided"],
             self.model.LAYER63_MLP_Q4_WEIGHT_BYTES,
         )
+        self.assertEqual(
+            metrics,
+            {
+                "atlas_revision_sha256": "a" * 64,
+                "attempts": 1,
+                "enabled": True,
+                "exact_kv_state_updates": 0,
+                "fallbacks": 0,
+                "graph_revision_sha256": "b" * 64,
+                "identity_sha256": "c" * 64,
+                "max_error_radius": 0.125,
+                "model_sha256": "d" * 64,
+                "packed_weight_bytes_avoided": (
+                    self.model.LAYER63_MLP_Q4_WEIGHT_BYTES
+                ),
+                "physical_transitions": 1,
+                "q4_sha256": "e" * 64,
+                "replacements": 1,
+                "schema": (
+                    "immer.qwen3.8-layer-mlp-residual-crystal-metrics/v1"
+                ),
+                "skipped_q4_matrix_calls": 3,
+                "transition_rows": 1,
+            },
+        )
 
     def test_layer_mlp_miss_runs_original_mlp_once(self) -> None:
         layer = self.config.n_layers - 1
@@ -4625,7 +4733,7 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
                 layer=layer,
                 token_mask=mask,
                 state=None,
-                start_pos=0,
+                start_pos=1,
                 stateful=True,
             )
 
@@ -4712,6 +4820,7 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
                 layer=self.config.n_layers - 1,
                 token_mask=torch.ones((1, 1), dtype=torch.bool),
                 stateful=True,
+                start_pos=1,
             )
         self.assertEqual(self.model._layer_mlp_crystal_hits, 0)
         self.assertEqual(
@@ -4782,6 +4891,262 @@ class LayerTransitionCrystalModelTests(unittest.TestCase):
         self.assertFalse(self.model.layer_mlp_crystal_enabled)
         with self.assertRaisesRegex(Qwen38RuntimeError, "requires an attached bank"):
             self.model.set_layer_mlp_crystal_enabled(True)
+
+    def test_layer_mlp_v2_registry_hits_linear_and_full_attention_layers(
+        self,
+    ) -> None:
+        totals = self._layer_mlp_q4_inventory(18, 63)
+        banks = {
+            layer: self._generic_layer_mlp_bank(
+                layer,
+                packed_weight_bytes_avoided=totals[layer],
+            )
+            for layer in (18, 63)
+        }
+        self.model.set_layer_mlp_crystal_registry(
+            banks,
+            max_error_radii={18: 0.0, 63: 0.0},
+        )
+        self.assertEqual(self.model.layer_mlp_crystal_enabled_layers, frozenset())
+        self.model.set_layer_mlp_crystal_registry_enabled([18, 63])
+
+        hidden = torch.randn((1, 1, self.config.dim), dtype=torch.bfloat16)
+        mask = torch.ones((1, 1), dtype=torch.bool)
+        with mock.patch.object(
+            self.model,
+            "_mlp",
+            side_effect=AssertionError("exact MLP ran on a v2 Crystal hit"),
+        ):
+            layer18_output, layer18_state = self.model._forward_layer(
+                hidden,
+                layer=18,
+                token_mask=mask,
+                state=None,
+                start_pos=1,
+                stateful=True,
+            )
+            layer63_output, layer63_state = self.model._forward_layer(
+                hidden,
+                layer=63,
+                token_mask=mask,
+                state=None,
+                start_pos=1,
+                stateful=True,
+            )
+
+        self.assertEqual(tuple(layer18_output.shape), (1, 1, self.config.dim))
+        self.assertEqual(tuple(layer63_output.shape), (1, 1, self.config.dim))
+        self.assertIsInstance(layer18_state, DeltaNetState)
+        self.assertIsInstance(layer63_state, AttentionState)
+        metrics = self.model.layer_mlp_crystal_metrics()
+        self.assertEqual(
+            metrics["schema"],
+            "immer.qwen3.8-layer-mlp-residual-crystal-registry-metrics/v2",
+        )
+        self.assertEqual(metrics["installed_layers"], [18, 63])
+        self.assertEqual(metrics["request_enabled_layers"], [18, 63])
+        self.assertEqual(metrics["physical_transitions"], 2)
+        self.assertEqual(metrics["transition_rows"], 2)
+        self.assertEqual(metrics["skipped_q4_matrix_calls"], 6)
+        self.assertEqual(
+            metrics["packed_weight_bytes_avoided"],
+            totals[18] + totals[63],
+        )
+        for layer in (18, 63):
+            row = metrics["layers"][str(layer)]
+            self.assertTrue(row["installed"])
+            self.assertTrue(row["request_enabled"])
+            self.assertEqual(row["physical_transitions"], 1)
+            self.assertEqual(row["transition_rows"], 1)
+            self.assertEqual(row["skipped_q4_matrix_calls"], 3)
+            self.assertEqual(row["packed_weight_bytes_avoided"], totals[layer])
+        json.dumps(metrics, allow_nan=False, sort_keys=True)
+        with self.assertRaises(TypeError):
+            self.model.layer_mlp_crystal_registry[18] = banks[18]
+
+    def test_layer_mlp_v2_miss_falls_back_to_the_exact_layer_mlp(self) -> None:
+        totals = self._layer_mlp_q4_inventory(18)
+        bank = self._generic_layer_mlp_bank(
+            18,
+            packed_weight_bytes_avoided=totals[18],
+            feature_center=1.0,
+            feature_radius=0.0,
+        )
+        self.model.set_layer_mlp_crystal_registry({18: (bank, 0.0)})
+        self.model.set_layer_mlp_crystal_registry_enabled([18])
+        self.pager.q4_bank = None
+        hidden = torch.randn((1, 1, self.config.dim), dtype=torch.bfloat16)
+        mask = torch.ones((1, 1), dtype=torch.bool)
+        with mock.patch.object(
+            self.model,
+            "_mlp",
+            wraps=self.model._mlp,
+        ) as exact_mlp:
+            output, state = self.model._forward_layer(
+                hidden,
+                layer=18,
+                token_mask=mask,
+                state=None,
+                start_pos=1,
+                stateful=True,
+            )
+
+        self.assertEqual(tuple(output.shape), (1, 1, self.config.dim))
+        self.assertIsInstance(state, DeltaNetState)
+        exact_mlp.assert_called_once()
+        self.assertEqual(bank.metrics().attempts, 1)
+        self.assertEqual(bank.metrics().fallbacks, 1)
+        self.assertEqual(self.model._layer_mlp_crystal_hits, 0)
+
+    def test_layer_mlp_v2_registry_rejects_wrong_layer_identity_and_bytes(
+        self,
+    ) -> None:
+        totals = self._layer_mlp_q4_inventory(18, 19)
+        bank = self._generic_layer_mlp_bank(
+            18,
+            packed_weight_bytes_avoided=totals[18],
+        )
+        with self.assertRaisesRegex(Qwen38RuntimeError, "identity.layer_index"):
+            self.model.set_layer_mlp_crystal_registry({19: bank})
+
+        wrong_identity = self._generic_layer_mlp_bank(
+            18,
+            packed_weight_bytes_avoided=totals[18],
+            q4_sha256="a" * 64,
+            state_suffix="-wrong-identity",
+        )
+        with self.assertRaisesRegex(Qwen38RuntimeError, "Q4 pin"):
+            self.model.set_layer_mlp_crystal_registry({18: wrong_identity})
+
+        wrong_bytes = self._generic_layer_mlp_bank(
+            18,
+            packed_weight_bytes_avoided=totals[18] - 1,
+            state_suffix="-wrong-bytes",
+        )
+        with self.assertRaisesRegex(Qwen38RuntimeError, "byte claim"):
+            self.model.set_layer_mlp_crystal_registry({18: wrong_bytes})
+        self.assertEqual(dict(self.model.layer_mlp_crystal_registry), {})
+        self.assertEqual(self.model.layer_mlp_crystal_enabled_layers, frozenset())
+
+    def test_layer_mlp_v2_never_executes_for_prefill_or_k2_and_is_stage_safe(
+        self,
+    ) -> None:
+        totals = self._layer_mlp_q4_inventory(18)
+        bank = self._generic_layer_mlp_bank(
+            18,
+            packed_weight_bytes_avoided=totals[18],
+        )
+        self.model.set_layer_mlp_crystal_registry({18: bank})
+        self.model.set_layer_mlp_crystal_registry_enabled([18])
+        self.pager.q4_bank = None
+
+        self.model.prefill([[1, 4]])
+        self.assertEqual(bank.metrics().attempts, 0)
+        k1_stage = self.model.stage_continuation_block([[9]])
+        self.assertEqual(bank.metrics().attempts, 0)
+        self.model.discard_continuation_block(k1_stage)
+        stage = self.model.stage_continuation_block([[9, 7]])
+        self.assertEqual(bank.metrics().attempts, 0)
+        with self.assertRaisesRegex(Qwen38RuntimeError, "during a stage"):
+            self.model.set_layer_mlp_crystal_registry_enabled([])
+        with self.assertRaisesRegex(Qwen38RuntimeError, "during a stage"):
+            self.model.clear_layer_mlp_crystal_registry()
+        self.model.discard_continuation_block(stage)
+        self.model.prefill([[1, 4]], tokenwise=True, reset=True)
+        self.assertEqual(bank.metrics().attempts, 0)
+        self.model.clear_layer_mlp_crystal_registry()
+        self.assertEqual(dict(self.model.layer_mlp_crystal_registry), {})
+        self.assertEqual(self.model.layer_mlp_crystal_enabled_layers, frozenset())
+
+        legacy = self._mlp_crystal_bank(
+            SimpleNamespace(
+                output=torch.zeros(
+                    (1, 1, self.config.dim), dtype=torch.bfloat16
+                ),
+                logical_weight_bytes_replaced=(
+                    self.model.LAYER63_MLP_Q4_WEIGHT_BYTES
+                ),
+            )
+        )
+        self.model.layer_mlp_crystal_bank = legacy
+        self.model.layer_mlp_crystal_enabled = True
+        legacy_stage = self.model.stage_continuation_block([[9]])
+        legacy.replace.assert_not_called()
+        self.model.discard_continuation_block(legacy_stage)
+
+    def test_layer_mlp_registry_clear_restores_exact_legacy_v1_metrics(self) -> None:
+        totals = self._layer_mlp_q4_inventory(18)
+        bank = self._generic_layer_mlp_bank(
+            18,
+            packed_weight_bytes_avoided=totals[18],
+        )
+        self.model.set_layer_mlp_crystal_registry({18: bank})
+        self.model.clear_layer_mlp_crystal_registry()
+        legacy = self._mlp_crystal_bank(None)
+        self.model.layer_mlp_crystal_bank = legacy
+        self.model.layer_mlp_crystal_enabled = True
+        self.model.layer_mlp_crystal_max_error_radius = 0.125
+
+        self.assertEqual(
+            self.model.layer_mlp_crystal_metrics(),
+            {
+                "atlas_revision_sha256": "a" * 64,
+                "attempts": 1,
+                "enabled": True,
+                "exact_kv_state_updates": 0,
+                "fallbacks": 0,
+                "graph_revision_sha256": "b" * 64,
+                "identity_sha256": "c" * 64,
+                "max_error_radius": 0.125,
+                "model_sha256": "d" * 64,
+                "packed_weight_bytes_avoided": 0,
+                "physical_transitions": 0,
+                "q4_sha256": "e" * 64,
+                "replacements": 1,
+                "schema": (
+                    "immer.qwen3.8-layer-mlp-residual-crystal-metrics/v1"
+                ),
+                "skipped_q4_matrix_calls": 0,
+                "transition_rows": 0,
+            },
+        )
+
+    def test_layer_mlp_registry_rejects_progress_callback_reentrancy(self) -> None:
+        totals = self._layer_mlp_q4_inventory(18)
+        bank = self._generic_layer_mlp_bank(
+            18,
+            packed_weight_bytes_avoided=totals[18],
+            feature_center=1.0,
+            feature_radius=0.0,
+        )
+        self.model.set_layer_mlp_crystal_registry({18: bank})
+        self.model.set_layer_mlp_crystal_registry_enabled([18])
+        self.pager.q4_bank = None
+        self.model.prefill([[1]])
+        rejected: list[str] = []
+
+        def mutate_registry(_row: dict[str, object]) -> None:
+            for label, mutation in (
+                (
+                    "enable",
+                    lambda: self.model.set_layer_mlp_crystal_registry_enabled([]),
+                ),
+                ("registry", self.model.clear_layer_mlp_crystal_registry),
+            ):
+                try:
+                    mutation()
+                except Qwen38RuntimeError as exc:
+                    self.assertIn("during a stage", str(exc))
+                    rejected.append(label)
+
+        self.model.decode([[4]], progress=mutate_registry)
+        self.assertEqual(rejected.count("enable"), self.config.n_layers)
+        self.assertEqual(rejected.count("registry"), self.config.n_layers)
+        self.assertEqual(self.model.layer_mlp_crystal_enabled_layers, frozenset({18}))
+
+        self.model.set_layer_mlp_crystal_registry_enabled([])
+        self.model.clear_layer_mlp_crystal_registry()
+        self.assertEqual(self.model._layer_stage_depth, 0)
 
     def test_layer_mlp_crystal_never_runs_for_k2_or_k4(self) -> None:
         layer = self.config.n_layers - 1
