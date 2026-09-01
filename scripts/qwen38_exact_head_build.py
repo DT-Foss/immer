@@ -19,6 +19,7 @@ from immer.runtimes.qwen3_8.config import (
 )
 from immer.runtimes.qwen3_8.exact_head import ExactHeadConfig, ExactHeadIndex
 from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+from immer.runtimes.qwen3_8.q4 import Q4Bank
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -37,11 +38,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-query-rows", type=int, default=16)
     parser.add_argument("--source-budget-mb", type=float, default=8192.0)
     parser.add_argument("--max-resident-mb", type=int, default=192)
+    parser.add_argument("--q4-root", type=Path)
+    parser.add_argument("--source-index", type=Path)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if (args.q4_root is None) != (args.source_index is None):
+        raise ValueError("--q4-root and --source-index must be provided together")
     config = ExactHeadConfig(
         subspace_width=args.subspace_width,
         codebook_size=args.codebook_size,
@@ -70,6 +75,18 @@ def main(argv: list[str] | None = None) -> int:
             if model_config.tie_word_embeddings
             else "lm_head.weight"
         )
+        q4_bank = None
+        if args.q4_root is not None:
+            source_metrics = mount.source.metrics()
+            q4_bank = Q4Bank.load(
+                args.q4_root,
+                bundle_receipt=bundle,
+                repo_id=identity.repo_id,
+                revision=identity.revision,
+                inventory_fingerprint=source_metrics[
+                    "inventory_source_fingerprint"
+                ],
+            )
         pager = Qwen38WeightPager(
             mount.source,
             device="cpu",
@@ -78,26 +95,38 @@ def main(argv: list[str] | None = None) -> int:
             close_source=False,
             require_source_identity=True,
             causal_tensor_reader=mount.tensor_reader,
+            q4_bank=q4_bank,
         )
         try:
-            index = ExactHeadIndex.build_from_pager(
-                pager,
-                name=head_name,
-                config=config,
-                sample_rows=args.sample_rows,
+            index = (
+                ExactHeadIndex.rebind_q4_head(
+                    ExactHeadIndex.load(args.source_index),
+                    pager,
+                    name=head_name,
+                )
+                if args.source_index is not None
+                else ExactHeadIndex.build_from_pager(
+                    pager,
+                    name=head_name,
+                    config=config,
+                    sample_rows=args.sample_rows,
+                )
             )
             receipt = index.save(args.output)
             report = {
                 "bundle": bundle,
-                "config": config.to_record(),
+                "config": index.config.to_record(),
                 "head_name": head_name,
+                "q4": None if q4_bank is None else dict(q4_bank.identity),
                 "pager": pager.metrics(),
                 "receipt": receipt.to_record(),
-                "schema": "immer.qwen3.8-exact-head-build-report/v1",
+                "schema": "immer.qwen3.8-exact-head-build-report/v2",
             }
             print(json.dumps(report, ensure_ascii=True, sort_keys=True))
         finally:
             pager.close()
+            if q4_bank is not None:
+                q4_bank.close()
     return 0
 
 

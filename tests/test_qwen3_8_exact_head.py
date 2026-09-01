@@ -13,6 +13,7 @@ import torch
 
 from immer.runtimes.qwen3_8.exact_head import (
     EXACT_HEAD_SCORE_ABI,
+    Q4_EXACT_HEAD_SCORE_ABI,
     ExactHeadBinding,
     ExactHeadConfig,
     ExactHeadError,
@@ -20,9 +21,11 @@ from immer.runtimes.qwen3_8.exact_head import (
     ExactHeadNotApplicable,
 )
 from immer.runtimes.qwen3_8.pager import Qwen38WeightPager
+from immer.runtimes.qwen3_8.q4 import Q4Bank, Q4BankBuilder
 from immer.runtimes.qwen3_8.config import OFFICIAL_REVISION
 
 from test_qwen3_8_config_pager import _RawBF16IntoSource
+from test_qwen3_8_q4 import _BUNDLE, _Pager as _Q4BuilderPager, _SOURCE
 
 
 _FINGERPRINT = "a" * 64
@@ -46,6 +49,14 @@ class _BoundHeadSource(_RawBF16IntoSource):
             "repo_id": self.repo_id,
             "revision": self.revision,
             "inventory_source_fingerprint": _FINGERPRINT,
+        }
+
+
+class _Q4BoundHeadSource(_BoundHeadSource):
+    def metrics(self) -> dict:
+        return {
+            **super().metrics(),
+            "inventory_source_fingerprint": _SOURCE["inventory_fingerprint"],
         }
 
 
@@ -158,6 +169,143 @@ class Qwen38ExactHeadTests(unittest.TestCase):
         payload.write_bytes(damaged)
         with self.assertRaisesRegex(ExactHeadError, "payload hash changed"):
             ExactHeadIndex.load(first)
+
+    def test_q8_rebound_index_matches_native_q4_topk_and_prunes_rows(self) -> None:
+        head = (
+            torch.arange(1, 65, dtype=torch.float32)[:, None]
+            * torch.linspace(0.5, 1.5, 64, dtype=torch.float32)[None, :]
+        ).to(torch.bfloat16)
+        config = ExactHeadConfig(
+            subspace_width=8,
+            codebook_size=8,
+            page_rows=8,
+            fanout=2,
+            kmeans_iterations=3,
+            assignment_chunk_rows=16,
+            max_query_rows=16,
+        )
+        binding = replace(
+            _binding(head),
+            inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+        )
+        bf16_index = ExactHeadIndex.build(
+            head,
+            binding=binding,
+            config=config,
+        )
+        q4_root = self.root / "q4-head"
+        Q4BankBuilder(
+            q4_root,
+            pager=_Q4BuilderPager({"lm_head.weight": head}),
+            bundle_receipt=_BUNDLE,
+            row_chunk=8,
+            threads=2,
+        ).build()
+        bank = Q4Bank.load(
+            q4_root,
+            bundle_receipt=_BUNDLE,
+            repo_id=_SOURCE["repo_id"],
+            revision=_SOURCE["revision"],
+            inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+            threads=2,
+        )
+        source = _Q4BoundHeadSource(head)
+        pager = Qwen38WeightPager(
+            source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=8 * 1024**2,
+            q4_bank=bank,
+        )
+        try:
+            q4_index = ExactHeadIndex.rebind_q4_head(
+                bf16_index,
+                pager,
+            )
+            self.assertTrue(q4_index.supports_q4)
+            self.assertEqual(
+                q4_index.binding.score_abi,
+                Q4_EXACT_HEAD_SCORE_ABI,
+            )
+            q4_index_root = self.root / "q4-exact-index"
+            q4_index.save(q4_index_root)
+            loaded_q4_index = ExactHeadIndex.load(
+                q4_index_root,
+                expected_binding=q4_index.binding,
+            )
+            loaded_q4_index.validate_mount(
+                pager,
+                name="lm_head.weight",
+                block_rows=17,
+            )
+            query = (
+                torch.linspace(0.25, 1.0, 16)[:, None]
+                * torch.linspace(0.2, 1.0, 64)[None, :]
+            ).to(torch.bfloat16)
+            for query_rows in (1, 2, 4, 8, 16):
+                for k in (1, 3, 7):
+                    with self.subTest(query_rows=query_rows, k=k):
+                        pager.attach_exact_head_index(None)
+                        expected_values, expected_ids = pager.topk_logits(
+                            query[:query_rows],
+                            k=k,
+                            block_rows=17,
+                        )
+                        pager.attach_exact_head_index(loaded_q4_index)
+                        actual_values, actual_ids = pager.topk_logits(
+                            query[:query_rows],
+                            k=k,
+                            block_rows=17,
+                        )
+                        self.assertTrue(
+                            torch.equal(actual_values, expected_values)
+                        )
+                        self.assertTrue(torch.equal(actual_ids, expected_ids))
+            random_query = torch.randn(
+                (16, 64),
+                generator=torch.Generator().manual_seed(90210),
+                dtype=torch.bfloat16,
+            )
+            for query_rows in (1, 2, 4, 8, 16):
+                for k in (1, 3, 7):
+                    with self.subTest(random_rows=query_rows, random_k=k):
+                        pager.attach_exact_head_index(None)
+                        expected_values, expected_ids = pager.topk_logits(
+                            random_query[:query_rows],
+                            k=k,
+                            block_rows=17,
+                        )
+                        pager.attach_exact_head_index(loaded_q4_index)
+                        actual_values, actual_ids = pager.topk_logits(
+                            random_query[:query_rows],
+                            k=k,
+                            block_rows=17,
+                        )
+                        self.assertTrue(
+                            torch.equal(actual_values, expected_values)
+                        )
+                        self.assertTrue(torch.equal(actual_ids, expected_ids))
+            metrics = loaded_q4_index.metrics()
+            self.assertGreater(metrics["rows_pruned"], 0)
+            self.assertGreater(metrics["logical_head_bytes_avoided"], 0)
+            self.assertEqual(metrics["packed_rows_avoided"], metrics["rows_pruned"])
+            self.assertGreater(metrics["packed_weight_bytes_avoided"], 0)
+
+            quantized_query = bank.quantized_input(query[:3], dtype=torch.float32)
+            caps = loaded_q4_index.row_caps(quantized_query, range(len(head)))
+            scores = bank.linear_rows(
+                query[:3],
+                "lm_head.weight",
+                tuple(range(len(head))),
+                output_dtype=torch.bfloat16,
+            )
+            self.assertTrue(
+                np.all(caps >= scores.float().numpy().astype(np.float64))
+            )
+        finally:
+            pager.close()
+            source.close()
+            bank.close()
 
     def test_weight_only_pager_builder_streams_without_model_forward(self) -> None:
         pager, source = self._pager()

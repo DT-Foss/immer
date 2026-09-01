@@ -15,7 +15,10 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from ..contracts import Component, ExecutionStatus, Request, Result
-from ..runtimes.qwen3_8.action_bank import physical_prefix_sinkhorn_executed
+from ..runtimes.qwen3_8.action_bank import (
+    physical_lm_head_coordinate_executed,
+    physical_prefix_sinkhorn_executed,
+)
 from .fertig.adapter import (
     CandidateVerification,
     CandidateVerificationStatus,
@@ -344,6 +347,9 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
     prefix_sinkhorn = evidence.get("prefix_sinkhorn")
     if isinstance(prefix_sinkhorn, dict):
         summary["prefix_sinkhorn"] = prefix_sinkhorn
+    exact_head = evidence.get("exact_head")
+    if isinstance(exact_head, dict):
+        summary["exact_head"] = exact_head
     contextual_continuation = evidence.get("contextual_continuation")
     if isinstance(contextual_continuation, dict):
         summary["contextual_continuation"] = {
@@ -880,6 +886,10 @@ class QwenFertigChat:
                     prefix_sinkhorn = qwen.get("prefix_sinkhorn")
                     if physical_prefix_sinkhorn_executed(prefix_sinkhorn):
                         actions.append("prefix_sinkhorn")
+                    if physical_lm_head_coordinate_executed(
+                        qwen.get("exact_head")
+                    ):
+                        actions.append("lm_head_coordinate")
                     if isinstance(qwen.get("draft"), Mapping):
                         actions.append("target_verified_draft")
                     generation = qwen.get("generation")

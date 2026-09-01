@@ -257,8 +257,12 @@ class Qwen38WeightPager:
         if q4_bank is not None:
             if torch.device(device).type != "cpu":
                 raise ValueError("Q4 execution requires the CPU device")
-            if exact_head_index is not None:
-                raise ValueError("Q4 execution and the exact BF16 head are exclusive")
+            if exact_head_index is not None and not bool(
+                getattr(exact_head_index, "supports_q4", False)
+            ):
+                raise ValueError(
+                    "Q4 execution requires a Q4-compatible exact head"
+                )
             if not all(
                 callable(getattr(q4_bank, method, None))
                 for method in (
@@ -319,8 +323,14 @@ class Qwen38WeightPager:
             self._ensure_open()
             if index is not None and not callable(getattr(index, "topk_logits", None)):
                 raise TypeError("exact head index must expose topk_logits()")
-            if index is not None and self.q4_bank is not None:
-                raise ValueError("Q4 execution and the exact BF16 head are exclusive")
+            if (
+                index is not None
+                and self.q4_bank is not None
+                and not bool(getattr(index, "supports_q4", False))
+            ):
+                raise ValueError(
+                    "Q4 execution requires a Q4-compatible exact head"
+                )
             self.exact_head_index = index
 
     @property
@@ -1638,6 +1648,42 @@ class Qwen38WeightPager:
             if compute_hidden.shape[-1] != columns:
                 raise Qwen38PagerError("hidden width disagrees with LM head")
             q4_bank = self.q4_bank
+            index = self.exact_head_index
+            if (
+                q4_bank is not None
+                and index is not None
+                and progress is None
+            ):
+                indexed = index.topk_logits(
+                    self,
+                    compute_hidden,
+                    k=k,
+                    name=name,
+                    block_rows=block_rows,
+                )
+                if indexed is not None:
+                    try:
+                        values, token_ids = indexed
+                    except (TypeError, ValueError) as exc:
+                        raise Qwen38PagerError(
+                            "Q4 exact head index returned an invalid result"
+                        ) from exc
+                    expected = (*compute_hidden.shape[:-1], k)
+                    if (
+                        not isinstance(values, self.torch.Tensor)
+                        or not isinstance(token_ids, self.torch.Tensor)
+                        or tuple(values.shape) != expected
+                        or tuple(token_ids.shape) != expected
+                        or values.device != self.device
+                        or token_ids.device != self.device
+                        or values.dtype != self.compute_dtype
+                        or token_ids.dtype != self.torch.long
+                    ):
+                        raise Qwen38PagerError(
+                            "Q4 exact head result differs from the pager ABI"
+                        )
+                    q4_bank.record_head()
+                    return values, token_ids
             if q4_bank is not None and q4_bank.has(name):
                 # Scan the exact packed head in bounded row intervals. The
                 # native selected-row kernel uses the same Q8 input quantizer

@@ -715,6 +715,19 @@ class QwenFertigChatTests(unittest.TestCase):
                 output=base.output,
                 evidence={
                     **dict(base.evidence),
+                    "exact_head": {
+                        "manifest_sha256": "b" * 64,
+                        "tensor_sha256": "c" * 64,
+                        "request": {
+                            "applicable_calls": 1,
+                            "logical_head_bytes_avoided": 4096,
+                            "manifest_sha256": "b" * 64,
+                            "packed_rows_avoided": 32,
+                            "packed_weight_bytes_avoided": 4096,
+                            "rows_pruned": 32,
+                            "schema": "immer.qwen3.8-exact-head-request/v1",
+                        },
+                    },
                     "prefix_sinkhorn": {
                         "action_identity_sha256": "a" * 64,
                         "active": True,
@@ -737,7 +750,11 @@ class QwenFertigChatTests(unittest.TestCase):
         directive = InferenceActionDirective(
             question_sha256=hashlib.sha256(question.encode("utf-8")).hexdigest(),
             runtime_profile_sha256="4" * 64,
-            primary_actions=("prefix_sinkhorn", "qwen_target"),
+            primary_actions=(
+                "lm_head_coordinate",
+                "prefix_sinkhorn",
+                "qwen_target",
+            ),
             fallback_actions=("qwen_target",),
             draft_enabled=None,
             source_signature_sha256s=("5" * 64,),
@@ -764,7 +781,7 @@ class QwenFertigChatTests(unittest.TestCase):
         self.assertTrue(result.ok, result.reason)
         self.assertEqual(
             result.evidence["inference_action_directive"]["applied"]["actions"],
-            ["prefix_sinkhorn", "qwen_target"],
+            ["lm_head_coordinate", "prefix_sinkhorn", "qwen_target"],
         )
 
     def test_failures_are_contained_and_never_trigger_a_second_qwen_call(self) -> None:

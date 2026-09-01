@@ -2351,6 +2351,55 @@ class Q4Bank:
             self._stats.output_bytes += result.numel() * result.element_size()
             return result
 
+    def quantized_input(self, values: Any, *, dtype: Any) -> Any:
+        """Return the exact dequantized Q8 input consumed by native Q4 dots."""
+
+        import torch
+
+        with self._lock:
+            if not isinstance(values, torch.Tensor):
+                values = torch.as_tensor(values)
+            if values.ndim < 1 or values.device.type != "cpu":
+                raise ValueError("Q4 input quantization requires CPU tensor rows")
+            leading = tuple(values.shape[:-1])
+            columns = int(values.shape[-1])
+            if columns <= 0 or columns % 32:
+                raise ValueError("Q4 input width must be positive and divisible by 32")
+            input_rows = values.numel() // columns
+            compute = (
+                values.detach()
+                .to(dtype=torch.float32)
+                .reshape(input_rows, columns)
+                .contiguous()
+            )
+            packed = np.empty(
+                input_rows * self.native.row_bytes(Q8_0, columns),
+                dtype=np.uint8,
+            )
+            self.native.quantize(
+                compute,
+                packed,
+                fmt=Q8_0,
+                threads=self.threads,
+            )
+            ids = torch.arange(input_rows, dtype=torch.int64)
+            output = torch.empty((input_rows, columns), dtype=torch.float32)
+            code = self.native.library.immer_q4_dequantize_rows_f32(
+                self.native._pointer(packed),
+                _FORMAT_CODES[Q8_0],
+                input_rows,
+                columns,
+                self.native._pointer(ids),
+                input_rows,
+                self.native._pointer(output),
+                self.threads,
+            )
+            if code:
+                raise Q4BankError(
+                    f"native Q8 input dequantization failed with code {code}"
+                )
+            return output.to(dtype=dtype).reshape(*leading, columns)
+
     def record_embedding(self, rows: int) -> None:
         with self._lock:
             self._stats.embedding_rows += rows

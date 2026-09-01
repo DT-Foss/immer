@@ -1709,10 +1709,8 @@ class Qwen38CausalChat:
                 raise ValueError(
                     "MLP page coordinates require bfloat16 compute_dtype"
                 )
-        if q4_root is not None and any(
-            value is not None for value in (exact_head_root, range_markov_state_path)
-        ):
-            raise ValueError("Q4 execution replaces exact-head and BF16 range prefetch")
+        if q4_root is not None and range_markov_state_path is not None:
+            raise ValueError("Q4 execution replaces BF16 range prefetch")
         if result_cell_code_revision is not None and (
             not isinstance(result_cell_code_revision, str)
             or len(result_cell_code_revision) not in _RESULT_CELL_CODE_REVISION_LENGTHS
@@ -4158,6 +4156,30 @@ class Qwen38CausalChat:
             raise _RequestRejected("prompt token is outside the checkpoint vocabulary")
 
         effective_qwen_actions = _effective_qwen_actions(action_directive)
+        lm_head_index = getattr(runtime, "exact_head_index", None)
+        lm_head_coordinate_directive_selected = (
+            "lm_head_coordinate" in effective_qwen_actions
+        )
+        lm_head_coordinate_explicitly_disabled = (
+            action_directive is not None
+            and "lm_head_coordinate" in action_directive.disabled_actions
+        )
+        lm_head_coordinate_applied = (
+            lm_head_index is not None
+            and not lm_head_coordinate_explicitly_disabled
+        )
+        restore_lm_head_index = None
+        if lm_head_index is not None and lm_head_coordinate_explicitly_disabled:
+            restore_lm_head_index = getattr(
+                runtime.model.pager,
+                "attach_exact_head_index",
+                None,
+            )
+            if not callable(restore_lm_head_index):
+                raise Qwen38ChatError(
+                    "runtime model cannot select LM-head coordinate actions"
+                )
+            restore_lm_head_index(None)
         delta_head_router = getattr(runtime, "delta_head_router", None)
         delta_head_directive_selected = (
             "mlp_head_coordinate" in effective_qwen_actions
@@ -4564,11 +4586,15 @@ class Qwen38CausalChat:
         )
         mlp_page_coordinate_before = self._mlp_page_coordinate_metrics()
         request_started = time.perf_counter()
-        raw_generated, raw_evidence = self._generate_locked(
-            runtime,
-            prompt_ids,
-            generation_options,
-        )
+        try:
+            raw_generated, raw_evidence = self._generate_locked(
+                runtime,
+                prompt_ids,
+                generation_options,
+            )
+        finally:
+            if restore_lm_head_index is not None:
+                restore_lm_head_index(lm_head_index)
         request_seconds = time.perf_counter() - request_started
         if delta_head_applied:
             assert callable(set_delta_head_router)
@@ -4838,6 +4864,13 @@ class Qwen38CausalChat:
                     ),
                     "mlp_page_coordinate_explicitly_disabled": (
                         mlp_page_coordinate_explicitly_disabled
+                    ),
+                    "lm_head_coordinate": lm_head_coordinate_applied,
+                    "lm_head_coordinate_directive_selected": (
+                        lm_head_coordinate_directive_selected
+                    ),
+                    "lm_head_coordinate_explicitly_disabled": (
+                        lm_head_coordinate_explicitly_disabled
                     ),
                     "prefix_sinkhorn": prefix_sinkhorn_applied,
                     "prefix_sinkhorn_directive_selected": (

@@ -1990,20 +1990,20 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 fast_mlp_selected_block_count=96,
             )
 
-        for options in (
-            {"exact_head_root": "/artifacts/head"},
-            {"range_markov_state_path": "/state/ranges"},
-        ):
-            with (
-                self.subTest(options=options),
-                self.assertRaisesRegex(ValueError, "Q4 execution replaces"),
-            ):
-                Qwen38CausalChat(
-                    "unused.causal",
-                    "unused-tokenizer.json",
-                    q4_root="/models/qwen-q4",
-                    **options,
-                )
+        exact_q4 = Qwen38CausalChat(
+            "unused.causal",
+            "unused-tokenizer.json",
+            q4_root="/models/qwen-q4",
+            exact_head_root="/artifacts/head",
+        )
+        exact_q4.close()
+        with self.assertRaisesRegex(ValueError, "Q4 execution replaces"):
+            Qwen38CausalChat(
+                "unused.causal",
+                "unused-tokenizer.json",
+                q4_root="/models/qwen-q4",
+                range_markov_state_path="/state/ranges",
+            )
 
     def test_direct_markov_page_route_requires_q4_and_replaces_legacy_sparse(self) -> None:
         component = Qwen38CausalChat(
@@ -2514,6 +2514,9 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 "attention_output_crystal_explicitly_disabled": False,
                 "draft_enabled": False,
                 "draft_window_ceiling": None,
+                "lm_head_coordinate": False,
+                "lm_head_coordinate_directive_selected": False,
+                "lm_head_coordinate_explicitly_disabled": False,
                 "mlp_head_coordinate": False,
                 "mlp_head_coordinate_directive_selected": False,
                 "mlp_page_coordinate": False,
@@ -5796,6 +5799,37 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(exact["request"]["calls"], 1)
         self.assertEqual(exact["request"]["pages_pruned"], 2)
         self.assertEqual(exact["request"]["rows_pruned"], 8)
+
+        attachments = []
+        runtime.model.pager.attach_exact_head_index = attachments.append
+        disabled = InferenceActionDirective(
+            question_sha256=hashlib.sha256(b"hello").hexdigest(),
+            runtime_profile_sha256="2" * 64,
+            primary_actions=("qwen_target",),
+            fallback_actions=("qwen_target",),
+            draft_enabled=None,
+            source_signature_sha256s=("8" * 64,),
+            support=1,
+            saved_qwen_forwards=0,
+            disabled_actions=("lm_head_coordinate",),
+        )
+        disabled_result = _chat(
+            runtime,
+            exact_head_root="/artifacts/qwen-head",
+        ).handle(
+            Request(
+                "chat",
+                "hello",
+                {QWEN38_INFERENCE_ACTION_METADATA: disabled.to_document()},
+            )
+        )
+        self.assertTrue(disabled_result.ok, disabled_result.reason)
+        self.assertEqual(attachments, [None, runtime.exact_head_index])
+        self.assertFalse(
+            disabled_result.evidence["inference_action_directive"]["applied"][
+                "lm_head_coordinate"
+            ]
+        )
 
     def test_cli_wires_persistent_markov_drafting_without_bundle(self) -> None:
         qwen = _chat(_Runtime())

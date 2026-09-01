@@ -25,6 +25,7 @@ from ..ooe.identity import canonical_json_bytes, require_sha256
 EXACT_HEAD_SCHEMA = "immer.qwen3.8-exact-head-pq/v1"
 EXACT_HEAD_MANIFEST_SCHEMA = "immer.qwen3.8-exact-head-manifest/v1"
 EXACT_HEAD_SCORE_ABI = "cpu-bf16-explicit-fp32-accumulate-rne/v1"
+Q4_EXACT_HEAD_SCORE_ABI = "cpu-q8_0xq8_0-native-f32-topk-bf16-rne/v1"
 _ROW_BOUND_PROBE_PAGES = 64
 _MANIFEST_NAME = "manifest.json"
 _PAYLOAD_NAME = "index.safetensors"
@@ -68,6 +69,21 @@ def _backend_sha256() -> str:
         "torch_version": str(torch.__version__),
     }
     return _sha256_bytes(canonical_json_bytes(identity))
+
+
+def _q4_backend_sha256(q4_bank: Any) -> str:
+    identity = getattr(q4_bank, "identity", None)
+    if not isinstance(identity, Mapping):
+        raise ExactHeadError("Q4 exact-head backend identity is unavailable")
+    return _sha256_bytes(
+        canonical_json_bytes(
+            {
+                "host_backend_sha256": _backend_sha256(),
+                "q4_bank": dict(identity),
+                "score_abi": Q4_EXACT_HEAD_SCORE_ABI,
+            }
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,7 +165,10 @@ class ExactHeadBinding:
             "backend_sha256",
             require_sha256(backend, field="backend_sha256"),
         )
-        if self.tensor_dtype != "BF16" or self.score_abi != EXACT_HEAD_SCORE_ABI:
+        if (self.tensor_dtype, self.score_abi) not in {
+            ("BF16", EXACT_HEAD_SCORE_ABI),
+            ("Q8_0", Q4_EXACT_HEAD_SCORE_ABI),
+        }:
             raise ValueError("exact-head binding scorer ABI is unsupported")
         for field in ("vocab_size", "hidden_size"):
             value = getattr(self, field)
@@ -202,6 +221,9 @@ class ExactHeadMetrics:
     selected_row_logical_bytes: int = 0
     row_certificate_logical_bytes_avoided: int = 0
     logical_head_bytes_avoided: int = 0
+    packed_rows_scored: int = 0
+    packed_rows_avoided: int = 0
+    packed_weight_bytes_avoided: int = 0
     last_fallback_reason: str = ""
 
 
@@ -402,6 +424,10 @@ class ExactHeadIndex:
         self._runtime_lock = threading.RLock()
         self._closed = False
 
+    @property
+    def supports_q4(self) -> bool:
+        return self.binding.score_abi == Q4_EXACT_HEAD_SCORE_ABI
+
     @classmethod
     def build(
         cls,
@@ -565,6 +591,62 @@ class ExactHeadIndex:
         norms = _norm_upper(source)
         return codes, residual, norms
 
+    @staticmethod
+    def _fixed_encoding_stats(
+        source: np.ndarray,
+        *,
+        codebooks: np.ndarray,
+        codes: np.ndarray,
+        config: ExactHeadConfig,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Recompute certified residuals after the physical head is quantized."""
+
+        if source.ndim != 2 or not np.isfinite(source).all():
+            raise ValueError("fixed PQ source must be a finite matrix")
+        vocab, width = source.shape
+        if codes.shape != (vocab, codebooks.shape[0]):
+            raise ValueError("fixed PQ codes do not match the source rows")
+        residual_squared = np.zeros(vocab, dtype=np.float64)
+        residual_absolute = np.zeros(vocab, dtype=np.float64)
+        for subspace in range(codebooks.shape[0]):
+            begin = subspace * config.subspace_width
+            end = min(width, begin + config.subspace_width)
+            reconstructed = codebooks[
+                subspace,
+                codes[:, subspace],
+                : end - begin,
+            ]
+            delta = np.asarray(source[:, begin:end], dtype=np.float64) - np.asarray(
+                reconstructed,
+                dtype=np.float64,
+            )
+            local_squared = np.sum(delta * delta, axis=1, dtype=np.float64)
+            local_width = end - begin
+            local_gamma = (local_width + 2) * 2.0**-53 / (
+                1.0 - (local_width + 2) * 2.0**-53
+            )
+            local_upper = np.nextafter(
+                local_squared
+                * (1.0 + 2.0**-53)
+                / (1.0 - local_gamma)
+                + local_width * 2.0**-1074,
+                np.inf,
+            )
+            residual_squared += local_upper
+            residual_absolute += np.abs(local_upper)
+        u64 = 2.0**-53
+        gamma = (codebooks.shape[0] + 1) * u64 / (
+            1.0 - (codebooks.shape[0] + 1) * u64
+        )
+        residual_squared = np.nextafter(
+            residual_squared
+            + gamma * residual_absolute
+            + width * 2.0**-1074,
+            np.inf,
+        )
+        residual = _ceil_float32(np.nextafter(np.sqrt(residual_squared), np.inf))
+        return residual, _norm_upper(source)
+
     @classmethod
     def build_from_pager(
         cls,
@@ -658,6 +740,106 @@ class ExactHeadIndex:
             raise ExactHeadError(
                 "head source lacks an immutable build identity"
             ) from exc
+        tensors = cls._tree_tensors(
+            codebooks=codebooks,
+            codes=codes,
+            residual=residual,
+            norms=norms,
+            config=config,
+        )
+        tensors.update(
+            {
+                "codebooks": torch.from_numpy(codebooks),
+                "codes": torch.from_numpy(codes),
+                "residual_radii": torch.from_numpy(residual),
+                "row_norms": torch.from_numpy(norms),
+            }
+        )
+        return cls(config=config, binding=binding, tensors=tensors)
+
+    @classmethod
+    def rebind_q4_head(
+        cls,
+        source: "ExactHeadIndex",
+        pager: Any,
+        *,
+        name: str = "lm_head.weight",
+    ) -> "ExactHeadIndex":
+        """Re-certify an existing PQ partition against the packed Q8 head."""
+
+        if not isinstance(source, ExactHeadIndex) or source._closed:
+            raise TypeError("source must be an open ExactHeadIndex")
+        if (
+            source.binding.score_abi != EXACT_HEAD_SCORE_ABI
+            or source.binding.tensor_name != name
+        ):
+            raise ExactHeadError("Q4 rebinding requires a BF16 source index")
+        q4_bank = getattr(pager, "q4_bank", None)
+        if q4_bank is None or not bool(getattr(q4_bank, "has", lambda _name: False)(name)):
+            raise ExactHeadError("Q4 rebinding requires the packed output head")
+        try:
+            entry = q4_bank.entries[name]
+        except (AttributeError, KeyError) as exc:
+            raise ExactHeadError("Q4 output-head entry is unavailable") from exc
+        if (
+            entry.format != "q8_0"
+            or tuple(entry.shape)
+            != (source.binding.vocab_size, source.binding.hidden_size)
+        ):
+            raise ExactHeadError("Q4 exact-head requires the bound Q8_0 matrix")
+        metrics = pager.source.metrics()
+        expected_source = {
+            "repo_id": source.binding.repo_id,
+            "revision": source.binding.revision,
+            "inventory_source_fingerprint": (
+                source.binding.inventory_fingerprint
+            ),
+        }
+        if any(metrics.get(field) != value for field, value in expected_source.items()):
+            raise ExactHeadError("Q4 target source differs from the BF16 index")
+
+        config = source.config
+        codebooks = np.asarray(
+            source._tensors["codebooks"].numpy(),
+            dtype=np.float32,
+        ).copy()
+        codes = np.asarray(source._tensors["codes"].numpy(), dtype=np.uint8).copy()
+        residual = np.empty(source.binding.vocab_size, dtype=np.float32)
+        norms = np.empty(source.binding.vocab_size, dtype=np.float32)
+        for start in range(0, source.binding.vocab_size, config.assignment_chunk_rows):
+            count = min(
+                config.assignment_chunk_rows,
+                source.binding.vocab_size - start,
+            )
+            row_ids = tuple(range(start, start + count))
+            rows = q4_bank.rows(name, row_ids, dtype=torch.float32)
+            try:
+                radii, row_norms = cls._fixed_encoding_stats(
+                    rows.numpy(),
+                    codebooks=codebooks,
+                    codes=codes[start : start + count],
+                    config=config,
+                )
+                residual[start : start + count] = radii
+                norms[start : start + count] = row_norms
+            finally:
+                del rows
+                discard = getattr(q4_bank, "discard_rows", None)
+                if callable(discard):
+                    discard(name, start, count)
+        binding = ExactHeadBinding(
+            repo_id=source.binding.repo_id,
+            revision=source.binding.revision,
+            inventory_fingerprint=source.binding.inventory_fingerprint,
+            tensor_name=name,
+            tensor_sha256=entry.payload_sha256,
+            vocab_size=source.binding.vocab_size,
+            hidden_size=source.binding.hidden_size,
+            tensor_dtype="Q8_0",
+            score_abi=Q4_EXACT_HEAD_SCORE_ABI,
+            torch_version=torch.__version__,
+            backend_sha256=_q4_backend_sha256(q4_bank),
+        )
         tensors = cls._tree_tensors(
             codebooks=codebooks,
             codes=codes,
@@ -1062,15 +1244,14 @@ class ExactHeadIndex:
         if (
             str(pager.device) != "cpu"
             or pager.compute_dtype != torch.bfloat16
-            or self.binding.score_abi != EXACT_HEAD_SCORE_ABI
-            or getattr(pager, "HEAD_SCORE_POLICY", None) != self.binding.score_abi
             or self.binding.torch_version != torch.__version__
-            or self.binding.backend_sha256 != _backend_sha256()
         ):
             raise ExactHeadNotApplicable(
                 "exact-head score ABI differs from the pager"
             )
-        if name != self.binding.tensor_name or block_rows != self.config.page_rows:
+        if name != self.binding.tensor_name or (
+            not self.supports_q4 and block_rows != self.config.page_rows
+        ):
             raise ExactHeadNotApplicable(
                 "exact-head head/page ABI differs from the pager"
             )
@@ -1080,6 +1261,32 @@ class ExactHeadIndex:
             self.binding.hidden_size,
         ):
             raise ExactHeadError("exact-head layout differs from the pager")
+        if self.supports_q4:
+            q4_bank = getattr(pager, "q4_bank", None)
+            try:
+                entry = q4_bank.entries[name]
+            except (AttributeError, KeyError) as exc:
+                raise ExactHeadNotApplicable(
+                    "Q4 exact-head packed matrix is unavailable"
+                ) from exc
+            if (
+                entry.format != "q8_0"
+                or tuple(entry.shape) != tuple(layout.shape)
+                or entry.payload_sha256 != self.binding.tensor_sha256
+                or self.binding.tensor_dtype != "Q8_0"
+                or self.binding.backend_sha256 != _q4_backend_sha256(q4_bank)
+            ):
+                raise ExactHeadNotApplicable(
+                    "Q4 exact-head score ABI differs from the packed target"
+                )
+        elif (
+            self.binding.score_abi != EXACT_HEAD_SCORE_ABI
+            or getattr(pager, "HEAD_SCORE_POLICY", None) != self.binding.score_abi
+            or self.binding.backend_sha256 != _backend_sha256()
+        ):
+            raise ExactHeadNotApplicable(
+                "exact-head score ABI differs from the pager"
+            )
         metrics = pager.source.metrics()
         if (
             metrics.get("repo_id") != self.binding.repo_id
@@ -1089,7 +1296,7 @@ class ExactHeadIndex:
         ):
             raise ExactHeadError("exact-head source identity differs from the pager")
         find = getattr(pager.source, "find", None)
-        if callable(find):
+        if callable(find) and not self.supports_q4:
             metadata = find(name)
             raw_sha256 = metadata.get("raw_sha256") if isinstance(metadata, Mapping) else None
             if raw_sha256 is not None and raw_sha256 != self.binding.tensor_sha256:
@@ -1301,7 +1508,13 @@ class ExactHeadIndex:
                 self._metrics.applicable_calls += 1
             leading = tuple(hidden.shape[:-1])
             flat = hidden.reshape(-1, self.binding.hidden_size)
-            bound_tables = self._query_bound_tables(flat)
+            q4_bank = getattr(pager, "q4_bank", None) if self.supports_q4 else None
+            bound_hidden = (
+                q4_bank.quantized_input(flat, dtype=torch.float32)
+                if q4_bank is not None
+                else flat
+            )
+            bound_tables = self._query_bound_tables(bound_hidden)
             caps = self._node_caps_from_tables(bound_tables)
             child_start = self._tensors["node_child_start"]
             child_count = self._tensors["node_child_count"]
@@ -1397,54 +1610,85 @@ class ExactHeadIndex:
                         pages_pruned += 1
                         continue
 
-                selected_reader = getattr(pager, "_selected_rows", None)
-                score_preflight = getattr(pager, "_preflight_head_score", None)
-                use_selected = (
-                    len(selected_ids) < count
-                    and callable(selected_reader)
-                    and callable(score_preflight)
-                    and self._selected_read_is_economic(selected_ids, count)
-                )
-                if use_selected:
-                    row_bound_saving_pages += 1
-                    score_preflight(
-                        query_rows=len(flat),
-                        head_rows=count,
-                        columns=self.binding.hidden_size,
+                rows = None
+                if q4_bank is not None:
+                    use_selected = len(selected_ids) < count
+                    if use_selected:
+                        row_bound_saving_pages += 1
+                        selected_row_reads += 1
+                        selected_rows_scored += len(selected_ids)
+                    else:
+                        full_leaf_fallbacks += 1
+                    preflight = getattr(pager, "_preflight_q4_linear_rows", None)
+                    if not callable(preflight):
+                        raise ExactHeadError(
+                            "Q4 exact-head scorer lacks selected-row preflight"
+                        )
+                    preflight(
+                        pager._layout(name),
+                        input_rows=len(flat),
+                        selected_rows=len(selected_ids),
+                        output_dtype=pager.compute_dtype,
+                        label=f"{name} exact-head survivors",
                     )
-                    rows = selected_reader(name, selected_ids)
-                    selected_offsets = torch.tensor(
-                        [token_id - start for token_id in selected_ids],
-                        device=pager.device,
-                        dtype=torch.long,
-                    )
-                    score_rows = torch.zeros(
-                        (count, self.binding.hidden_size),
-                        device=pager.device,
-                        dtype=pager.compute_dtype,
-                    )
-                    score_rows.index_copy_(0, selected_offsets, rows)
-                    del rows
-                    page_logits = pager._score_head_rows(flat, score_rows)
-                    logits = page_logits.index_select(-1, selected_offsets)
-                    del page_logits, score_rows, selected_offsets
-                    selected_row_reads += 1
-                    selected_rows_scored += len(selected_ids)
+                    try:
+                        logits = q4_bank.linear_rows(
+                            flat,
+                            name,
+                            selected_ids,
+                            output_dtype=pager.compute_dtype,
+                        )
+                    finally:
+                        q4_bank.discard_rows(name, start, count)
                 else:
-                    if len(selected_ids) < count:
-                        selected_row_cost_fallbacks += 1
-                        rows_pruned -= count - len(selected_ids)
-                        row_certificate_rows_pruned -= count - len(selected_ids)
-                        selected_ids = tuple(range(start, start + count))
-                    full_leaf_fallbacks += 1
-                    rows = pager._read_rows(
-                        name,
-                        start,
-                        count,
-                        dtype=pager.compute_dtype,
-                        device=pager.device,
+                    selected_reader = getattr(pager, "_selected_rows", None)
+                    score_preflight = getattr(pager, "_preflight_head_score", None)
+                    use_selected = (
+                        len(selected_ids) < count
+                        and callable(selected_reader)
+                        and callable(score_preflight)
+                        and self._selected_read_is_economic(selected_ids, count)
                     )
-                    logits = pager._score_head_rows(flat, rows)
+                    if use_selected:
+                        row_bound_saving_pages += 1
+                        score_preflight(
+                            query_rows=len(flat),
+                            head_rows=count,
+                            columns=self.binding.hidden_size,
+                        )
+                        rows = selected_reader(name, selected_ids)
+                        selected_offsets = torch.tensor(
+                            [token_id - start for token_id in selected_ids],
+                            device=pager.device,
+                            dtype=torch.long,
+                        )
+                        score_rows = torch.zeros(
+                            (count, self.binding.hidden_size),
+                            device=pager.device,
+                            dtype=pager.compute_dtype,
+                        )
+                        score_rows.index_copy_(0, selected_offsets, rows)
+                        del rows
+                        page_logits = pager._score_head_rows(flat, score_rows)
+                        logits = page_logits.index_select(-1, selected_offsets)
+                        del page_logits, score_rows, selected_offsets
+                        selected_row_reads += 1
+                        selected_rows_scored += len(selected_ids)
+                    else:
+                        if len(selected_ids) < count:
+                            selected_row_cost_fallbacks += 1
+                            rows_pruned -= count - len(selected_ids)
+                            row_certificate_rows_pruned -= count - len(selected_ids)
+                            selected_ids = tuple(range(start, start + count))
+                        full_leaf_fallbacks += 1
+                        rows = pager._read_rows(
+                            name,
+                            start,
+                            count,
+                            dtype=pager.compute_dtype,
+                            device=pager.device,
+                        )
+                        logits = pager._score_head_rows(flat, rows)
                 if (
                     row_bounds_enabled
                     and row_bound_probe_pages >= _ROW_BOUND_PROBE_PAGES
@@ -1461,7 +1705,7 @@ class ExactHeadIndex:
                     logits, token_ids, min(k, len(selected_ids))
                 )
                 del logits
-                if not use_selected:
+                if q4_bank is None and not use_selected:
                     del rows
                 pager._stats.head_rows += len(selected_ids)
                 pager._stats.materialized_weight_releases += 1
@@ -1494,22 +1738,35 @@ class ExactHeadIndex:
                 )
                 self._metrics.row_bound_probe_pages += row_bound_probe_pages
                 self._metrics.row_bound_disabled_calls += int(row_bounds_disabled)
-                selected_bytes = (
-                    selected_rows_scored * self.binding.hidden_size * 2
+                logical_row_bytes = (
+                    q4_bank.entries[name].row_bytes
+                    if q4_bank is not None
+                    else self.binding.hidden_size * 2
                 )
+                selected_bytes = selected_rows_scored * logical_row_bytes
                 row_avoided_bytes = (
-                    row_certificate_rows_pruned * self.binding.hidden_size * 2
+                    row_certificate_rows_pruned * logical_row_bytes
                 )
                 self._metrics.selected_row_logical_bytes += selected_bytes
                 self._metrics.row_certificate_logical_bytes_avoided += (
                     row_avoided_bytes
                 )
                 self._metrics.logical_head_bytes_avoided += (
-                    rows_pruned * self.binding.hidden_size * 2
+                    rows_pruned * logical_row_bytes
                 )
+                if q4_bank is not None:
+                    self._metrics.packed_rows_scored += rows_scored
+                    self._metrics.packed_rows_avoided += rows_pruned
+                    self._metrics.packed_weight_bytes_avoided += (
+                        rows_pruned * logical_row_bytes
+                    )
                 self._metrics.last_fallback_reason = ""
             return (
-                best_values.reshape(*leading, k),
+                (
+                    best_values.to(dtype=pager.compute_dtype)
+                    if q4_bank is not None
+                    else best_values
+                ).reshape(*leading, k),
                 best_ids.reshape(*leading, k),
             )
 
@@ -1518,6 +1775,7 @@ __all__ = [
     "EXACT_HEAD_MANIFEST_SCHEMA",
     "EXACT_HEAD_SCHEMA",
     "EXACT_HEAD_SCORE_ABI",
+    "Q4_EXACT_HEAD_SCORE_ABI",
     "ExactHeadBinding",
     "ExactHeadConfig",
     "ExactHeadError",

@@ -241,6 +241,56 @@ class InferenceActionReceiptTests(unittest.TestCase):
             ),
         )
 
+    def test_exact_q8_head_pruning_is_recorded_as_lm_head_coordinate(self) -> None:
+        economics = _economics(
+            "q8-head-coordinate",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "exact_head": {
+                    "manifest_sha256": "a" * 64,
+                    "tensor_sha256": "b" * 64,
+                    "request": {
+                        "applicable_calls": 3,
+                        "logical_head_bytes_avoided": 4096,
+                        "manifest_sha256": "a" * 64,
+                        "packed_rows_avoided": 32,
+                        "packed_weight_bytes_avoided": 4096,
+                        "rows_pruned": 32,
+                        "schema": "immer.qwen3.8-exact-head-request/v1",
+                    },
+                }
+            },
+        )
+        self.assertEqual(
+            executed_actions_from_result(result, economics),
+            ("lm_head_coordinate", "qwen_target"),
+        )
+        no_savings = Result(
+            result.status,
+            result.component,
+            output=result.output,
+            evidence={
+                "exact_head": {
+                    **dict(result.evidence["exact_head"]),
+                    "request": {
+                        **dict(result.evidence["exact_head"]["request"]),
+                        "packed_weight_bytes_avoided": 0,
+                    },
+                }
+            },
+        )
+        self.assertEqual(
+            executed_actions_from_result(no_savings, economics),
+            ("qwen_target",),
+        )
+
     def test_delta_head_identity_without_saved_request_work_is_not_an_action(
         self,
     ) -> None:
@@ -778,6 +828,37 @@ class InferenceActionBankTests(unittest.TestCase):
         self.assertIn("attention_output_crystal", directive.primary_actions)
         self.assertIn("target_verified_draft", directive.primary_actions)
         self.assertTrue(directive.draft_enabled)
+
+    def test_lm_head_coordinate_is_safe_additive_across_runtime_profiles(self) -> None:
+        economics = _economics(
+            "lm-head-coordinate-runtime",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        actions = ("lm_head_coordinate", "qwen_target")
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            bank.observe(economics, executed_actions=actions)
+            directive = bank.recommend(
+                question_sha256=_sha("other lm-head question"),
+                runtime_profile_sha256=_sha("other profile"),
+            )
+
+        assert directive is not None
+        self.assertEqual(directive.primary_actions, actions)
+        self.assertEqual(directive.fallback_actions, actions)
+        with self.assertRaises(ValueError):
+            InferenceActionDirective(
+                question_sha256=_sha("invalid lm-head coordinate"),
+                runtime_profile_sha256=_sha("profile"),
+                primary_actions=("lm_head_coordinate",),
+                fallback_actions=("qwen_target",),
+                draft_enabled=None,
+                source_signature_sha256s=("7" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+            )
 
     def test_delta_coordinate_is_recommended_only_for_the_same_runtime(self) -> None:
         economics = _economics(

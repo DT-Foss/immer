@@ -30,6 +30,7 @@ ACTION_CATALOG = (
     "dynamic_mlp_pages",
     "external_drafter",
     "fertig_exact",
+    "lm_head_coordinate",
     "mlp_head_coordinate",
     "mlp_page_coordinate",
     "parametric_program",
@@ -83,6 +84,31 @@ def physical_prefix_sinkhorn_executed(value: object) -> bool:
             for field in (
                 "base_softmax_head_rows_skipped",
                 "base_softmax_probability_elements_skipped",
+            )
+        )
+    )
+
+
+def physical_lm_head_coordinate_executed(value: object) -> bool:
+    """Accept only exact-head evidence with positive physical row pruning."""
+
+    if not isinstance(value, Mapping):
+        return False
+    request = value.get("request")
+    return (
+        _is_sha256(value.get("manifest_sha256"))
+        and _is_sha256(value.get("tensor_sha256"))
+        and isinstance(request, Mapping)
+        and request.get("schema") == "immer.qwen3.8-exact-head-request/v1"
+        and request.get("manifest_sha256") == value.get("manifest_sha256")
+        and all(
+            isinstance(request.get(field), int)
+            and not isinstance(request.get(field), bool)
+            and request.get(field, 0) > 0
+            for field in (
+                "applicable_calls",
+                "packed_rows_avoided",
+                "packed_weight_bytes_avoided",
             )
         )
     )
@@ -146,6 +172,7 @@ def executed_actions_from_result(
     anchor = execution.get("anchor_cache")
     conversation = execution.get("conversation")
     prefix_sinkhorn = execution.get("prefix_sinkhorn")
+    exact_head = execution.get("exact_head")
     delta_head_router = execution.get("delta_head_router")
     attention_output_crystal = execution.get("attention_output_crystal")
     mlp_page_coordinate = execution.get("mlp_page_coordinate")
@@ -165,6 +192,10 @@ def executed_actions_from_result(
         prefix_sinkhorn
     ):
         actions = tuple(sorted({*actions, "prefix_sinkhorn"}))
+    if "qwen_target" in actions and physical_lm_head_coordinate_executed(
+        exact_head
+    ):
+        actions = tuple(sorted({*actions, "lm_head_coordinate"}))
     if isinstance(delta_head_router, Mapping):
         request = delta_head_router.get("request")
         if isinstance(request, Mapping) and all(
@@ -282,6 +313,7 @@ class InferenceActionReceipt:
             action in self.actions
             for action in (
                 "attention_output_crystal",
+                "lm_head_coordinate",
                 "mlp_head_coordinate",
                 "mlp_page_coordinate",
                 "prefix_sinkhorn",
@@ -460,6 +492,10 @@ class InferenceActionDirective:
             if "mlp_head_coordinate" in actions and "qwen_target" not in actions:
                 raise ValueError(
                     f"{name} mlp_head_coordinate requires qwen_target"
+                )
+            if "lm_head_coordinate" in actions and "qwen_target" not in actions:
+                raise ValueError(
+                    f"{name} lm_head_coordinate requires qwen_target"
                 )
             if "mlp_page_coordinate" in actions and "qwen_target" not in actions:
                 raise ValueError(
@@ -826,6 +862,7 @@ class InferenceActionBank:
             and "qwen_target" in receipt.actions
             and (
                 "attention_output_crystal" in receipt.actions
+                or "lm_head_coordinate" in receipt.actions
                 or "mlp_head_coordinate" in receipt.actions
                 or "mlp_page_coordinate" in receipt.actions
                 or "prefix_sinkhorn" in receipt.actions
@@ -842,6 +879,7 @@ class InferenceActionBank:
             and "qwen_target" in receipt.actions
             and (
                 "attention_output_crystal" in receipt.actions
+                or "lm_head_coordinate" in receipt.actions
                 or "mlp_page_coordinate" in receipt.actions
                 or (
                     "target_verified_draft" in receipt.actions
@@ -870,6 +908,7 @@ class InferenceActionBank:
                     "compute_crystal",
                     "continuation_battery",
                     "dynamic_mlp_pages",
+                    "lm_head_coordinate",
                     "mlp_page_coordinate",
                     "prefix_sinkhorn",
                     "qwen_target",
@@ -889,6 +928,8 @@ class InferenceActionBank:
             )
         if any("mlp_page_coordinate" in receipt.actions for receipt in runtime):
             runtime_action_set.update({"mlp_page_coordinate", "qwen_target"})
+        if any("lm_head_coordinate" in receipt.actions for receipt in runtime):
+            runtime_action_set.update({"lm_head_coordinate", "qwen_target"})
         if exact_runtime and any(
             "mlp_head_coordinate" in receipt.actions for receipt in exact_runtime
         ):
@@ -950,5 +991,6 @@ __all__ = [
     "InferenceActionObservation",
     "InferenceActionReceipt",
     "executed_actions_from_result",
+    "physical_lm_head_coordinate_executed",
     "physical_prefix_sinkhorn_executed",
 ]
