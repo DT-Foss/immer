@@ -6,6 +6,31 @@ All notable changes to IMMER are recorded here.
 
 ### Stored-compute v2
 
+- `544a27a` mounts the native continuation-state battery in canonical chat and
+  carries authenticated anchor/conversation hits into Action Bank receipts.
+  `361a6da` composes restored prefixes with the deployed hybrid Markov/MTP
+  drafter: a restore without matching MTP carry continues through Markov
+  without replaying the prefix.
+- `5a717f8` distinguishes a valid snapshot from an older runtime identity from
+  corrupt state. The former is removed reference-first, hash-verified, and
+  recharged as a cache miss. Index, manifest, payload, seed, and receipt damage
+  remain hard failures. The deployed stale three-token anchor was replaced in
+  the next ordinary request.
+- `16bf54f` and `9c46a24` account the physical dynamic-MLP execution plane.
+  Savings are now `page_count × page_mlp_rows − selected_pages`; exact fallback
+  rows cancel instead of entering the routed denominator. The live 90-token
+  request omitted 486,400 64-neuron page-row kernel actions, 29.41% of routed
+  MLP work and 20.54% including exact learning rows.
+- `4f68596` passes native layer-27 Prefix-Sinkhorn through the product
+  constructor and service identity. It remains an explicit attention action.
+- `39204cb` removes the historical Fast-MLP dependency from packed DeltaNet
+  coordinate execution. Q4 plus dynamic MLP pages can now select 24/32/40 of
+  48 value heads across all DeltaNet layers or an exact configured subset.
+  Semantic replay is disabled for this output-affecting runtime. FERTIG receipts
+  retain compact router identity and real request counters; the Action Bank
+  records `mlp_head_coordinate` only after calls, rows, and omitted logical
+  bytes are all positive.
+
 - `55c9983` derives a passive content-addressed Action Bank from every normal
   Inference Economics receipt. Each request produces an input-contract hash,
   runtime-bound action signature, result/quality authority, actual target and

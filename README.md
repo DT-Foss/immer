@@ -79,6 +79,22 @@ Release: **1.0.0** · [Runtime card](MODEL_CARD.md) ·
   Unready layers execute the full MLP; speculative continuation commits only
   accepted learning rows. `--mlp-page-width` controls the route and
   `--no-mlp-page-route` restores full-MLP execution.
+- **Authenticated continuation battery.** Canonical chat restores the deepest
+  matching native Qwen prefix state before generation. A hit skips the covered
+  prefix across all 64 layers; an exact hit also removes one complete prefill
+  and checkpoint sweep. Snapshot payloads, head seeds, model identity, source
+  identity, and runtime identity are authenticated before state enters the
+  model. A valid snapshot from an older runtime is evicted and recharged as a
+  cache miss; payload or receipt damage remains a hard error.
+- **Packed DeltaNet coordinate execution.** The Markov-Sinkhorn head router now
+  runs directly beside Q4 and dynamic MLP pages, without the legacy Fast-MLP
+  mount. It selects 24, 32, or 40 of 48 DeltaNet value heads and sends only
+  their Q4 input blocks through the native `out_proj` kernel while preserving
+  the full convolution and recurrent-state update. `--delta-head-online-state`
+  enables it across every DeltaNet layer; `--delta-head-layers` binds an exact
+  subset. The route is output-affecting and therefore explicit. Every executed
+  request records calls, rows, selected blocks, and physically omitted logical
+  weight bytes as an Action Bank coordinate action.
 - **Predictive weight transport.** A persistent two-agent operation Markov
   model learns the exact tensor/range sequence already emitted by the
   Streamer. Order-1/2 Fixed Share, surprise regimes, and Ricci retention
@@ -151,6 +167,14 @@ Release: **1.0.0** · [Runtime card](MODEL_CARD.md) ·
   Route credit is advantage-centered and restricted to executed pages.
   Repeated receipts are idempotent; independent Draft/Page disk failures retain
   their pending work until retry or explicit owner retirement.
+- **Measured novelty boundary.** A natural 90-token response used the deployed
+  continuation battery and dynamic Q4 pages. The anchor skipped 192 prompt-layer
+  evaluations. The MLP route omitted 486,400 page-row kernel actions: 29.41% of
+  routed MLP work and 20.54% after full exact-learning rows are included. Draft
+  yield was one accepted token from six proposals, so the request still paid 90
+  complete target forwards, 386.34 seconds, and 1.63 GB peak RSS. Cold
+  Attention/DeltaNet and whole target waves are now the dominant inference
+  cost.
 - **Embedded MTP drafting.** The target checkpoint's own one-layer Qwen3.5 MTP
   branch now runs through the same causal Q4 bank, shared embedding, native
   bounded LM head, and exact rolling target verifier. Shifted token embeddings
