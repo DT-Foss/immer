@@ -2911,8 +2911,50 @@ class FingerprintRollingK4DraftProvider:
                     "planner_token_ids": list(planner_tokens),
                 }
             )
-        self._layer_context_crystal_phrase_options = tuple(phrase_options)
-        self._layer_context_crystal_last_query = tuple(query_evidence)
+        consensus: dict[tuple[int, ...], list[MarkovPhraseOption]] = {}
+        for phrase in phrase_options:
+            consensus.setdefault(phrase.token_ids, []).append(phrase)
+        consensus_layers = {
+            token_ids: tuple(
+                sorted(
+                    phrase.crystal_layer
+                    for phrase in members
+                    if phrase.crystal_layer is not None
+                )
+            )
+            for token_ids, members in consensus.items()
+        }
+        weighted_options: list[MarkovPhraseOption] = []
+        for token_ids, members in consensus.items():
+            support = sum(phrase.support for phrase in members)
+            total = sum(phrase.total for phrase in members)
+            weighted_options.extend(
+                replace(
+                    phrase,
+                    support=support,
+                    total=total,
+                )
+                for phrase in members
+            )
+        self._layer_context_crystal_phrase_options = tuple(weighted_options)
+        self._layer_context_crystal_last_query = tuple(
+            dict(row)
+            | {
+                "consensus_layers": list(
+                    consensus_layers.get(
+                        tuple(row.get("planner_token_ids", ())),
+                        (),
+                    )
+                ),
+                "consensus_size": len(
+                    consensus_layers.get(
+                        tuple(row.get("planner_token_ids", ())),
+                        (),
+                    )
+                ),
+            }
+            for row in query_evidence
+        )
 
     def _persistent_symbols(self) -> tuple[str, ...]:
         cached = self._persistent_symbols_cache

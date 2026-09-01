@@ -514,6 +514,22 @@ class LayerContextualContinuationDraftTests(unittest.TestCase):
 
     def test_duplicate_layer_tails_count_only_the_selected_planner_work(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
+            hidden = torch.ones((1, 1, 8))
+            legacy_bank = ContextualContinuationBank(
+                Path(temporary) / "legacy.json",
+                _identity(),
+                max_cells=16,
+            )
+            legacy_bank.settle(
+                captures=(
+                    legacy_bank.make_capture(
+                        hidden,
+                        10,
+                        3,
+                        (20, 21, 22),
+                    ),
+                )
+            )
             bank = LayerContextualContinuationBank(
                 Path(temporary) / "layers.json",
                 _layer_identity((1, 3)),
@@ -525,15 +541,17 @@ class LayerContextualContinuationDraftTests(unittest.TestCase):
             provider = self._provider(
                 bank,
                 _LayerTransactions(current, (current,)),
+                contextual_bank=legacy_bank,
             )
             provider.begin_request((1, 2, 3))
 
             proposal = provider.propose_round_state(
                 (1, 2, 3),
                 10,
-                torch.ones((1, 1, 8)),
+                hidden,
             )
             self.assertEqual(proposal.token_ids, (20, 21, 22))
+            self.assertIsNotNone(provider._pending_phrase_option.crystal_layer)
             provider.observe_verification(3, 3)
             provider.reconcile_prefix((1, 2, 3, 10, 20, 21, 22))
             provider.observe_final((1, 2, 3, 10, 20, 21, 22))
@@ -541,8 +559,8 @@ class LayerContextualContinuationDraftTests(unittest.TestCase):
             metrics = provider.metrics()
             layer = metrics.layer_context_crystal
             assert layer is not None
-            self.assertEqual(metrics.crystal_queries, 2)
-            self.assertEqual(metrics.crystal_query_hits, 2)
+            self.assertEqual(metrics.crystal_queries, 3)
+            self.assertEqual(metrics.crystal_query_hits, 3)
             self.assertEqual(metrics.crystal_proposed_tokens, 3)
             self.assertEqual(metrics.crystal_verified_tokens, 3)
             self.assertEqual(metrics.crystal_accepted_tokens, 3)
