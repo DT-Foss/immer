@@ -68,7 +68,7 @@ from .model import (
     QWEN38_COMPONENT_TIMING_COUNTER_SCHEMA,
     StreamedQwen38,
 )
-from .local_draft import Qwen35K4DraftProvider
+from .local_draft import QWEN35_K4_DRAFT_PROVIDER_SCHEMA, Qwen35K4DraftProvider
 from .markov_draft import (
     MARKOV_DRAFT_PROVIDER_ABI,
     MARKOV_RICCI_WORKING_SET_POLICY,
@@ -2417,8 +2417,6 @@ class Qwen38CausalChat:
             raise ValueError("markov draft mode does not use a draft bundle")
         if draft_mode == "mtp" and draft_bundle_path is not None:
             raise ValueError("MTP draft mode uses the target checkpoint branch")
-        if draft_mode == "hybrid" and draft_bundle_path is not None:
-            raise ValueError("hybrid draft mode uses Markov plus target MTP")
         if draft_mode == "mtp" and q4_root is None:
             raise ValueError("MTP draft mode requires the local Q4 bank")
         if draft_mode == "hybrid" and q4_root is None:
@@ -3183,6 +3181,13 @@ class Qwen38CausalChat:
                     "round_window_selector": "markov-prefix-utility/v2",
                     "target_hidden_conditioning": True,
                 }
+                if self._draft_bundle_path is not None:
+                    policy["hybrid_draft"]["qwen35_external"] = {
+                        "provider_abi": QWEN35_K4_DRAFT_PROVIDER_SCHEMA,
+                        "repo_id": QWEN35_DRAFTER_REPO_ID,
+                        "revision": QWEN35_DRAFTER_REVISION,
+                        "window_cap": 4,
+                    }
             if self._markov_atlas is not None:
                 policy["markov_atlas"] = {
                     "context_count": self._markov_atlas.context_count,
@@ -3571,6 +3576,7 @@ class Qwen38CausalChat:
         contextual_continuation_enabled: bool | None = None,
         contextual_continuation_identity_sha256: str | None = None,
         layer_contextual_continuation_enabled: bool | None = None,
+        external_drafter_enabled: bool | None = None,
     ) -> str:
         bundle = self._bundle_receipt
         tokenizer_sha256 = self._tokenizer_sha256
@@ -3582,6 +3588,13 @@ class Qwen38CausalChat:
             markov_provider_abi = MARKOV_DRAFT_PROVIDER_ABI
         if hybrid_provider_abi is None:
             hybrid_provider_abi = _DRAFT_WINDOW_HYBRID_ECONOMICS_ABI
+        external_enabled = (
+            self._draft_bundle_path is not None
+            if external_drafter_enabled is None
+            else external_drafter_enabled
+        )
+        if not isinstance(external_enabled, bool):
+            raise TypeError("external_drafter_enabled must be boolean or None")
         if self._draft_mode == "markov":
             provider: dict[str, Any] = {
                 "abi": markov_provider_abi,
@@ -3651,6 +3664,18 @@ class Qwen38CausalChat:
                 ).get("manifest_sha256"),
                 "selection": "round-wise-markov-first-mtp-fallback/v18",
             }
+            if external_enabled:
+                if self._draft_bundle_path is None:
+                    raise Qwen38ChatError(
+                        "draft-window identity lacks the external draft bundle"
+                    )
+                provider["qwen35"] = {
+                    "bundle_path": str(self._draft_bundle_path),
+                    "provider_abi": QWEN35_K4_DRAFT_PROVIDER_SCHEMA,
+                    "repo_id": QWEN35_DRAFTER_REPO_ID,
+                    "revision": QWEN35_DRAFTER_REVISION,
+                    "window_cap": 4,
+                }
         else:
             raise Qwen38ChatError("draft-window identity lacks a draft provider")
         if self._draft_mode in {"hybrid", "markov"} and self._markov_atlas is not None:
@@ -3757,6 +3782,23 @@ class Qwen38CausalChat:
             return ()
         identities: set[str] = set()
         if self._draft_mode in {"hybrid", "markov"}:
+            identities.add(
+                self._draft_window_runtime_identity(
+                    markov_provider_abi=(
+                        "immer.qwen3.8-markov-draft-provider/v48"
+                    ),
+                    hybrid_provider_abi=(
+                        "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
+                    ),
+                    external_drafter_enabled=False,
+                )
+            )
+            if self._draft_mode == "hybrid" and self._draft_bundle_path is not None:
+                identities.add(
+                    self._draft_window_runtime_identity(
+                        external_drafter_enabled=False,
+                    )
+                )
             if self._layer_contextual_continuation_state_path is not None:
                 identities.add(
                     self._draft_window_runtime_identity(
@@ -4180,6 +4222,10 @@ class Qwen38CausalChat:
         if generation_options.get("draft_enabled") is False:
             return None
         mode = self._draft_mode
+        if generation_options.get("external_drafter_enabled") is False and mode == (
+            "qwen35"
+        ):
+            return None
         if generation_options.get("mtp_enabled") is False:
             if mode == "hybrid":
                 mode = "markov"
@@ -4311,6 +4357,7 @@ class Qwen38CausalChat:
             direct_options = dict(generation_options)
             direct_options.pop("draft_enabled", None)
             direct_options.pop("draft_window_ceiling", None)
+            direct_options.pop("external_drafter_enabled", None)
             direct_options.pop("mtp_enabled", None)
             direct_options.pop("restored_mtp_carry", None)
             direct_options.pop("restored_mtp_carry_bytes", None)
@@ -4435,10 +4482,27 @@ class Qwen38CausalChat:
                     initial_carry=initial_mtp_carry,
                 )
 
+            qwen35_factory = None
+            if (
+                self._draft_bundle_path is not None
+                and generation_options.get("external_drafter_enabled") is not False
+            ):
+
+                def qwen35_factory() -> Qwen35K4DraftProvider:
+                    draft = self._load_draft_locked(runtime)
+                    return Qwen35K4DraftProvider(
+                        draft.model,
+                        eos_token_ids=eos,
+                        head_block_rows=self._head_block_rows,
+                        window_size=min(4, draft_window),
+                    )
+
             provider = Qwen38MarkovMtpDraftProvider(
                 markov_provider,
                 mtp_factory,
                 restored_prefix_length=restored_prefix_length,
+                qwen35_factory=qwen35_factory,
+                max_new_tokens=self._max_new_tokens,
             )
         adaptive_rounds = (
             effective_draft_mode
@@ -4570,34 +4634,100 @@ class Qwen38CausalChat:
             provider_metrics = provider.metrics()
             provider_source_body_bytes = int(provider_metrics.source_body_bytes)
             provider_linear_calls = int(provider_metrics.linear_calls)
+            split_provider_accounting = all(
+                hasattr(provider_metrics, field)
+                for field in (
+                    "external_source_body_bytes",
+                    "external_linear_calls",
+                    "mtp_shared_source_body_bytes",
+                    "mtp_shared_linear_calls",
+                )
+            )
+            if split_provider_accounting:
+                external_provider_source_body_bytes = int(
+                    provider_metrics.external_source_body_bytes
+                )
+                external_provider_linear_calls = int(
+                    provider_metrics.external_linear_calls
+                )
+                shared_provider_source_body_bytes = int(
+                    provider_metrics.mtp_shared_source_body_bytes
+                )
+                shared_provider_linear_calls = int(
+                    provider_metrics.mtp_shared_linear_calls
+                )
+            else:
+                external_provider_source_body_bytes = (
+                    provider_source_body_bytes
+                    if effective_draft_mode == "qwen35"
+                    else 0
+                )
+                external_provider_linear_calls = (
+                    provider_linear_calls
+                    if effective_draft_mode == "qwen35"
+                    else 0
+                )
+                shared_provider_source_body_bytes = (
+                    provider_source_body_bytes
+                    if effective_draft_mode in {"hybrid", "mtp"}
+                    else 0
+                )
+                shared_provider_linear_calls = (
+                    provider_linear_calls
+                    if effective_draft_mode in {"hybrid", "mtp"}
+                    else 0
+                )
+            if (
+                external_provider_source_body_bytes
+                + shared_provider_source_body_bytes
+                != provider_source_body_bytes
+                or external_provider_linear_calls + shared_provider_linear_calls
+                != provider_linear_calls
+            ):
+                raise Qwen38ChatError(
+                    "draft provider cost split differs from its total work"
+                )
             shared_target_pager = effective_draft_mode in {"hybrid", "mtp"}
             if shared_target_pager:
-                combined_source_body_bytes = max(
+                target_pager_source_body_bytes = max(
                     int(evidence.source_body_bytes),
                     max(
                         0,
                         _runtime_source_body_bytes(runtime) - rolling_source_start,
                     ),
                 )
-                combined_linear_calls = int(evidence.linear_calls)
+                target_pager_linear_calls = int(evidence.linear_calls)
                 if (
-                    provider_source_body_bytes > combined_source_body_bytes
-                    or provider_linear_calls > combined_linear_calls
+                    shared_provider_source_body_bytes
+                    > target_pager_source_body_bytes
+                    or shared_provider_linear_calls > target_pager_linear_calls
                 ):
                     raise Qwen38ChatError(
                         "shared-pager draft accounting exceeds combined execution"
                     )
                 target_source_body_bytes = (
-                    combined_source_body_bytes - provider_source_body_bytes
+                    target_pager_source_body_bytes
+                    - shared_provider_source_body_bytes
                 )
-                target_linear_calls = combined_linear_calls - provider_linear_calls
+                target_linear_calls = (
+                    target_pager_linear_calls - shared_provider_linear_calls
+                )
+                combined_source_body_bytes = (
+                    target_pager_source_body_bytes
+                    + external_provider_source_body_bytes
+                )
+                combined_linear_calls = (
+                    target_pager_linear_calls + external_provider_linear_calls
+                )
             else:
                 target_source_body_bytes = int(evidence.source_body_bytes)
                 target_linear_calls = int(evidence.linear_calls)
                 combined_source_body_bytes = (
-                    target_source_body_bytes + provider_source_body_bytes
+                    target_source_body_bytes + external_provider_source_body_bytes
                 )
-                combined_linear_calls = target_linear_calls + provider_linear_calls
+                combined_linear_calls = (
+                    target_linear_calls + external_provider_linear_calls
+                )
             mapped_evidence = {
                 "prompt_token_ids": evidence.prompt_token_ids,
                 "generated_token_ids": evidence.generated_token_ids,
@@ -4638,10 +4768,15 @@ class Qwen38CausalChat:
                     effective_draft_mode != configured_draft_mode
                 ),
                 "draft_source_body_bytes": provider_source_body_bytes,
+                "external_source_body_bytes": external_provider_source_body_bytes,
+                "shared_source_body_bytes": shared_provider_source_body_bytes,
                 "aux_source_body_bytes": aux_source_body_bytes,
                 "draft_linear_calls": provider_linear_calls,
+                "external_linear_calls": external_provider_linear_calls,
+                "shared_linear_calls": shared_provider_linear_calls,
                 "target_source_body_bytes": target_source_body_bytes,
                 "target_linear_calls": target_linear_calls,
+                "target_forward_passes": evidence.forward_passes,
                 "total_source_body_bytes": (
                     combined_source_body_bytes + aux_source_body_bytes
                 ),
@@ -7695,7 +7830,7 @@ class Qwen38CausalChat:
         if action_directive is not None and action_directive.draft_enabled is not None:
             generation_options["draft_enabled"] = action_directive.draft_enabled
         if external_drafter_explicitly_disabled:
-            generation_options["mtp_enabled"] = False
+            generation_options["external_drafter_enabled"] = False
         if (
             action_directive is not None
             and action_directive.draft_window_ceiling is not None
@@ -8447,9 +8582,9 @@ class Qwen38CausalChat:
                 )
             )
             external_drafter_applied = (
-                isinstance(provider_evidence.get("mtp_rounds"), int)
-                and not isinstance(provider_evidence.get("mtp_rounds"), bool)
-                and provider_evidence.get("mtp_rounds", 0) > 0
+                isinstance(provider_evidence.get("qwen35_rounds"), int)
+                and not isinstance(provider_evidence.get("qwen35_rounds"), bool)
+                and provider_evidence.get("qwen35_rounds", 0) > 0
             )
             evidence["inference_action_directive"] = {
                 "applied": {

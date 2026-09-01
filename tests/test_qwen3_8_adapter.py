@@ -1947,6 +1947,40 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn(current, compatible)
         chat.close()
 
+    def test_hybrid_external_drafter_migrates_prior_window_economics(self) -> None:
+        runtime = _Runtime()
+        chat = _chat(
+            runtime,
+            draft_bundle_path="/models/Qwen3.5-0.8B",
+            draft_mode="hybrid",
+            q4_root="/q4",
+        )
+        chat._runtime = runtime
+        chat._bundle_receipt = _BUNDLE_RECEIPT
+        chat._tokenizer_sha256 = _DIGEST
+        chat._draft_window_controller = Mock()
+        previous = chat._draft_window_runtime_identity(
+            external_drafter_enabled=False,
+        )
+        deployed_previous = chat._draft_window_runtime_identity(
+            markov_provider_abi=(
+                "immer.qwen3.8-markov-draft-provider/v48"
+            ),
+            hybrid_provider_abi=(
+                "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
+            ),
+            external_drafter_enabled=False,
+        )
+        current = chat._draft_window_runtime_identity()
+
+        compatible = chat._draft_window_compatible_previous_identities()
+
+        self.assertNotEqual(previous, current)
+        self.assertIn(previous, compatible)
+        self.assertIn(deployed_previous, compatible)
+        self.assertNotIn(current, compatible)
+        chat.close()
+
     def test_draft_window_migrates_from_authenticated_previous_context_bank(
         self,
     ) -> None:
@@ -5387,6 +5421,78 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(draft["total_linear_calls"], 10)
         chat.close()
 
+    def test_hybrid_splits_shared_mtp_and_external_qwen35_work(self) -> None:
+        target = _Runtime()
+        target.q4_bank = SimpleNamespace(has=lambda _name: True)
+        target.model.pager = SimpleNamespace(q4_bank=target.q4_bank)
+        chat = _chat(
+            target,
+            draft_bundle_path="/models/Qwen3.5-0.8B",
+            draft_mode="hybrid",
+            q4_root="/models/q4-mtp",
+            max_new_tokens=4,
+        )
+        evidence = SimpleNamespace(
+            accepted_draft_tokens=2,
+            source_body_bytes=100,
+            linear_calls=10,
+            seconds=1.0,
+            state_bytes=456,
+            stopped_on_eos=False,
+            prompt_token_ids=(11, 12),
+            generated_token_ids=(7, 8, 9, 10),
+            forward_passes=3,
+            rounds=(object(),),
+            schema="immer.qwen3.8-rolling-speculative-generation/v2",
+            final_state_committed=False,
+        )
+        generated = SimpleNamespace(token_ids=(7, 8, 9, 10), evidence=evidence)
+        decoder = SimpleNamespace(generate_rolling=lambda *args, **kwargs: generated)
+        metrics = SimpleNamespace(
+            source_body_bytes=35,
+            linear_calls=5,
+            external_source_body_bytes=15,
+            external_linear_calls=2,
+            mtp_shared_source_body_bytes=20,
+            mtp_shared_linear_calls=3,
+            last_confidence=0.7,
+            last_disagreement=0.0,
+            last_phrase_confidence=0.0,
+            last_phrase_support=0,
+            last_phrase_width=0,
+        )
+        provider = SimpleNamespace(metrics=lambda: metrics, close=lambda: None)
+        with (
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38MarkovMtpDraftProvider",
+                return_value=provider,
+            ) as hybrid_constructor,
+            patch(
+                "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+                return_value=decoder,
+            ),
+        ):
+            result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(result.evidence["generation"]["source_body_bytes"], 80)
+        self.assertEqual(result.evidence["generation"]["linear_calls"], 7)
+        draft = result.evidence["draft"]
+        self.assertEqual(draft["target_source_body_bytes"], 80)
+        self.assertEqual(draft["shared_source_body_bytes"], 20)
+        self.assertEqual(draft["external_source_body_bytes"], 15)
+        self.assertEqual(draft["draft_source_body_bytes"], 35)
+        self.assertEqual(draft["total_source_body_bytes"], 115)
+        self.assertEqual(draft["target_linear_calls"], 7)
+        self.assertEqual(draft["shared_linear_calls"], 3)
+        self.assertEqual(draft["external_linear_calls"], 2)
+        self.assertEqual(draft["total_linear_calls"], 12)
+        self.assertTrue(
+            callable(hybrid_constructor.call_args.kwargs["qwen35_factory"])
+        )
+        self.assertEqual(hybrid_constructor.call_args.kwargs["max_new_tokens"], 4)
+        chat.close()
+
     def test_mtp_generation_policy_matches_adaptive_round_execution(self) -> None:
         chat = _chat(
             _Runtime(),
@@ -5473,6 +5579,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
         mtp = _chat(_Runtime(), draft_mode="mtp", q4_root="/q4")
 
         self.assertEqual(hybrid._draft_mode_for_request({}), "hybrid")
+        self.assertEqual(
+            hybrid._draft_mode_for_request(
+                {"external_drafter_enabled": False}
+            ),
+            "hybrid",
+        )
         self.assertEqual(
             hybrid._draft_mode_for_request({"mtp_enabled": False}),
             "markov",
@@ -7988,6 +8100,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
             markov_state = Path(temporary) / "qwen-markov.bin"
             markov_state.write_bytes(b"fixture")
             mtp_state = Path(temporary) / "qwen-mtp.json"
+            qwen35 = Path(temporary) / "Qwen3.5-0.8B"
+            qwen35.mkdir()
             page_state = Path(temporary) / "qwen-mlp-pages.json"
             coordinate_state = Path(temporary) / "qwen-mlp-coordinate.json"
             context_state = Path(temporary) / "qwen-context.json"
@@ -7999,6 +8113,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                     markov_state,
                 ),
                 patch("immer.cli._QWEN38_DEPLOYMENT_MTP_STATE", mtp_state),
+                patch("immer.cli._QWEN35_DEPLOYMENT_DRAFT_ROOT", qwen35),
                 patch(
                     "immer.cli._QWEN38_DEPLOYMENT_MLP_PAGE_STATE",
                     page_state,
@@ -8027,6 +8142,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             16_384 * 1024**2,
         )
         self.assertEqual(options["draft_mode"], "hybrid")
+        self.assertEqual(options["draft_bundle_path"], str(qwen35))
         self.assertEqual(options["markov_draft_state_path"], str(markov_state))
         self.assertEqual(options["mtp_draft_state_path"], str(mtp_state))
         self.assertEqual(options["mlp_page_state_path"], page_state)

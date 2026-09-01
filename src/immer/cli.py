@@ -116,6 +116,7 @@ def _artifact_root(
 
 
 _QWEN38_DEPLOYMENT_ROOT = Path("/") / "app" / "models" / "Qwen3.8-27B"
+_QWEN35_DEPLOYMENT_DRAFT_ROOT = Path("/") / "app" / "models" / "Qwen3.5-0.8B"
 _QWEN38_DEPLOYMENT_PRIVATE = (
     Path("/") / "root" / "immer-runtime" / "artifacts" / "private"
 )
@@ -174,8 +175,8 @@ _QWEN38_DEPLOYMENT_LAYER_MLP_CRYSTAL_REGISTRY = (
     / "qwen-layer-mlp-crystals-v2"
     / "layer-mlp-o1-registry.json"
 )
-_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v48"
-_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v30"
+_QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v49"
+_QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v31"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
 _QWEN38_GROWING_WARM_ABI_SHA256 = hashlib.sha256(
     b"immer:qwen3.8-growing-warm-runtime/v3"
@@ -987,6 +988,7 @@ def _qwen38_service_profile(
         "max_resident_mb",
         "mlp_page_width",
         "no_inference_economics",
+        "no_external_drafter",
         "no_context_crystal",
         "no_attention_output_crystal",
         "prefix_sinkhorn",
@@ -1146,6 +1148,24 @@ def _qwen38_growing_warm_profile(
     q4_manifest = q4_root / "manifest.json"
     if not q4_manifest.is_file() or not tokenizer_path.is_file():
         return None
+    external_drafter = None
+    if draft_mode == "hybrid" and getattr(args, "draft_bundle", None) is not None:
+        from .runtimes.qwen3_8.config import (
+            QWEN35_DRAFTER_REPO_ID,
+            QWEN35_DRAFTER_REVISION,
+        )
+        from .runtimes.qwen3_8.local_draft import (
+            QWEN35_K4_DRAFT_PROVIDER_SCHEMA,
+        )
+
+        external_drafter = {
+            "bundle_path_sha256": hashlib.sha256(
+                str(Path(args.draft_bundle).expanduser().absolute()).encode("utf-8")
+            ).hexdigest(),
+            "provider_abi": QWEN35_K4_DRAFT_PROVIDER_SCHEMA,
+            "repo_id": QWEN35_DRAFTER_REPO_ID,
+            "revision": QWEN35_DRAFTER_REVISION,
+        }
     mlp_page_route = None
     if mlp_page_state_path is not None:
         from .runtimes.qwen3_8.mlp_page_markov import (
@@ -1193,6 +1213,7 @@ def _qwen38_growing_warm_profile(
         "compute_dtype": args.compute_dtype,
         "device": "cpu" if args.device == "auto" else args.device,
         "draft_mode": draft_mode,
+        "external_drafter": external_drafter,
         "draft_window": args.draft_window,
         "head_block_rows": args.head_block_rows,
         "draft_provider_abi": (
@@ -2183,6 +2204,21 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             bundle_path,
             q4_root,
         )
+        disable_external_drafter = bool(
+            getattr(args, "no_external_drafter", False)
+        )
+        if disable_external_drafter and getattr(args, "draft_bundle", None) is not None:
+            raise ValueError(
+                "--draft-bundle and --no-external-drafter are mutually exclusive"
+            )
+        if (
+            not disable_external_drafter
+            and draft_mode == "hybrid"
+            and getattr(args, "draft_bundle", None) is None
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+            and _QWEN35_DEPLOYMENT_DRAFT_ROOT.is_dir()
+        ):
+            args.draft_bundle = str(_QWEN35_DEPLOYMENT_DRAFT_ROOT)
         markov_atlas_path = _chat_path(
             getattr(args, "markov_atlas", None),
             "IMMER_QWEN38_MARKOV_ATLAS",
@@ -4401,6 +4437,11 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument(
         "--draft-bundle",
         help="optional local causal Qwen3.5-0.8B bundle for rolling drafting",
+    )
+    chat.add_argument(
+        "--no-external-drafter",
+        action="store_true",
+        help="disable the deployed Qwen3.5-0.8B hybrid novelty expert",
     )
     chat.add_argument(
         "--draft-mode",
