@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -24,12 +25,15 @@ from immer.runtimes.qwen3_8.layer_mlp_o1 import (
 from immer.runtimes.qwen3_8.layer_mlp_registry import (
     DEFAULT_LAYER_MLP_O1_REGISTRY_BASENAME,
     LAYER_MLP_O1_REGISTRY_ENVELOPE_SCHEMA,
+    LayerMlpO1RegistryDescriptor,
     LayerMlpO1RegistryIntegrityError,
     LayerMlpO1RegistryNotMountableError,
     layer_mlp_o1_state_path_for_layer,
     load_layer_mlp_o1_registry,
     publish_layer_mlp_o1_registry,
+    read_layer_mlp_o1_registry_manifest,
 )
+from immer.runtimes.qwen3_8 import layer_mlp_registry as registry_module
 from immer.runtimes.qwen3_8.layer_transition_crystal import (
     LayerTransitionProjectionIdentity,
     _sealed_document,
@@ -227,6 +231,54 @@ class LayerMlpO1RegistryTests(unittest.TestCase):
                     summary.manifest_path,
                     require_mountable=True,
                 )
+            descriptor = read_layer_mlp_o1_registry_manifest(summary.manifest_path)
+            self.assertFalse(descriptor.mountable)
+            with self.assertRaises(LayerMlpO1RegistryNotMountableError):
+                read_layer_mlp_o1_registry_manifest(
+                    summary.manifest_path,
+                    require_mountable=True,
+                )
+
+    def test_metadata_descriptor_performs_zero_bank_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _legacy, _output, summary, registry = self._published(root)
+            original_read = registry_module._read_regular
+            with (
+                mock.patch.object(
+                    Layer63MlpResidualCrystalBank,
+                    "load",
+                    side_effect=AssertionError("legacy bank read"),
+                ) as legacy_load,
+                mock.patch.object(
+                    LayerMlpResidualCrystalBank,
+                    "load",
+                    side_effect=AssertionError("generic bank read"),
+                ) as generic_load,
+                mock.patch.object(
+                    registry_module,
+                    "_read_regular",
+                    wraps=original_read,
+                ) as regular_read,
+            ):
+                descriptor = read_layer_mlp_o1_registry_manifest(
+                    summary.manifest_path,
+                    require_mountable=True,
+                )
+
+        self.assertIsInstance(descriptor, LayerMlpO1RegistryDescriptor)
+        self.assertEqual(descriptor.manifest_file_sha, summary.manifest_file_sha256)
+        self.assertEqual(descriptor.registry_sha, summary.registry_sha256)
+        self.assertEqual(descriptor.entries, registry.entries)
+        self.assertEqual(descriptor.mounted_layers, (0, 63))
+        self.assertTrue(descriptor.mountable)
+        legacy_load.assert_not_called()
+        generic_load.assert_not_called()
+        self.assertEqual(regular_read.call_count, 1)
+        self.assertEqual(
+            Path(regular_read.call_args.args[0]),
+            summary.manifest_path,
+        )
 
     def test_manifest_and_bank_tamper_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -235,6 +287,8 @@ class LayerMlpO1RegistryTests(unittest.TestCase):
             raw = bytearray(summary.manifest_path.read_bytes())
             raw[len(raw) // 2] ^= 1
             summary.manifest_path.write_bytes(raw)
+            with self.assertRaises(LayerMlpO1RegistryIntegrityError):
+                read_layer_mlp_o1_registry_manifest(summary.manifest_path)
             with self.assertRaises(LayerMlpO1RegistryIntegrityError):
                 load_layer_mlp_o1_registry(summary.manifest_path)
 

@@ -479,8 +479,64 @@ class LayerMlpO1MountedBank:
 
 
 @dataclass(frozen=True, slots=True)
+class LayerMlpO1RegistryDescriptor:
+    """Verified manifest metadata that never opens a referenced bank file."""
+
+    manifest_path: Path
+    manifest_file_sha256: str
+    registry_sha256: str
+    pins: LayerMlpO1RegistryPins
+    configured_layers: tuple[int, ...]
+    pending: tuple[LayerMlpO1PendingState, ...]
+    entries: tuple[LayerMlpO1RegistryEntry, ...]
+
+    @classmethod
+    def read(
+        cls,
+        manifest_path: str | os.PathLike[str],
+        *,
+        require_mountable: bool = False,
+    ) -> "LayerMlpO1RegistryDescriptor":
+        return read_layer_mlp_o1_registry_manifest(
+            manifest_path,
+            require_mountable=require_mountable,
+        )
+
+    @property
+    def manifest_file_sha(self) -> str:
+        return self.manifest_file_sha256
+
+    @property
+    def registry_sha(self) -> str:
+        return self.registry_sha256
+
+    @property
+    def pending_layers(self) -> tuple[int, ...]:
+        return tuple(item.layer_index for item in self.pending)
+
+    @property
+    def mounted_layers(self) -> tuple[int, ...]:
+        return tuple(entry.layer_index for entry in self.entries)
+
+    @property
+    def published_layers(self) -> tuple[int, ...]:
+        return self.mounted_layers
+
+    @property
+    def mountable(self) -> bool:
+        return bool(self.entries)
+
+    def require_mountable(self) -> "LayerMlpO1RegistryDescriptor":
+        if not self.mountable:
+            raise LayerMlpO1RegistryNotMountableError(
+                "O1 registry is valid but has no ready bank to mount"
+            )
+        return self
+
+
+@dataclass(frozen=True, slots=True)
 class LayerMlpO1MountRegistry:
-    """A verified manifest; empty registries are valid but not mountable."""
+    """A verified manifest and all fully authenticated referenced banks."""
 
     manifest_path: Path
     manifest_file_sha256: str
@@ -730,20 +786,12 @@ def _expected_pins(
             _integrity("O1 registry projection differs from the expected pin")
 
 
-def load_layer_mlp_o1_registry(
+def read_layer_mlp_o1_registry_manifest(
     manifest_path: str | os.PathLike[str],
     *,
-    expected_pins: LayerMlpO1RegistryPins | None = None,
-    expected_identity: _Identity | None = None,
-    expected_model_sha256: str | None = None,
-    expected_q4_sha256: str | None = None,
-    expected_atlas_revision_sha256: str | None = None,
-    expected_graph_revision_sha256: str | None = None,
-    expected_compute_graph_revision_sha256: str | None = None,
-    expected_projection: LayerTransitionProjectionIdentity | None = None,
     require_mountable: bool = False,
-) -> LayerMlpO1MountRegistry:
-    """Load and fully authenticate a registry and every referenced bank."""
+) -> LayerMlpO1RegistryDescriptor:
+    """Read and authenticate only manifest metadata, without touching banks."""
 
     if not isinstance(require_mountable, bool):
         raise TypeError("require_mountable must be a boolean")
@@ -790,8 +838,40 @@ def load_layer_mlp_o1_registry(
         _integrity("O1 registry layer is both mounted and pending")
     if tuple(sorted((*entry_layers, *pending_layers))) != configured_layers:
         _integrity("O1 registry does not settle every configured layer")
+    descriptor = LayerMlpO1RegistryDescriptor(
+        manifest_path=path,
+        manifest_file_sha256=_sha256_bytes(raw),
+        registry_sha256=_sha256_document(body),
+        pins=pins,
+        configured_layers=configured_layers,
+        pending=pending,
+        entries=entries,
+    )
+    if require_mountable:
+        descriptor.require_mountable()
+    return descriptor
+
+
+def load_layer_mlp_o1_registry(
+    manifest_path: str | os.PathLike[str],
+    *,
+    expected_pins: LayerMlpO1RegistryPins | None = None,
+    expected_identity: _Identity | None = None,
+    expected_model_sha256: str | None = None,
+    expected_q4_sha256: str | None = None,
+    expected_atlas_revision_sha256: str | None = None,
+    expected_graph_revision_sha256: str | None = None,
+    expected_compute_graph_revision_sha256: str | None = None,
+    expected_projection: LayerTransitionProjectionIdentity | None = None,
+    require_mountable: bool = False,
+) -> LayerMlpO1MountRegistry:
+    """Load the manifest descriptor, then authenticate every referenced bank."""
+
+    if not isinstance(require_mountable, bool):
+        raise TypeError("require_mountable must be a boolean")
+    descriptor = read_layer_mlp_o1_registry_manifest(manifest_path)
     _expected_pins(
-        pins,
+        descriptor.pins,
         expected_pins=expected_pins,
         expected_identity=expected_identity,
         expected_model_sha256=expected_model_sha256,
@@ -803,14 +883,17 @@ def load_layer_mlp_o1_registry(
         ),
         expected_projection=expected_projection,
     )
-    mounts = tuple(_verify_bank(path.parent, entry, pins) for entry in entries)
+    mounts = tuple(
+        _verify_bank(descriptor.manifest_path.parent, entry, descriptor.pins)
+        for entry in descriptor.entries
+    )
     registry = LayerMlpO1MountRegistry(
-        manifest_path=path,
-        manifest_file_sha256=_sha256_bytes(raw),
-        registry_sha256=_sha256_document(body),
-        pins=pins,
-        configured_layers=configured_layers,
-        pending=pending,
+        manifest_path=descriptor.manifest_path,
+        manifest_file_sha256=descriptor.manifest_file_sha256,
+        registry_sha256=descriptor.registry_sha256,
+        pins=descriptor.pins,
+        configured_layers=descriptor.configured_layers,
+        pending=descriptor.pending,
         mounts=mounts,
     )
     if require_mountable:
@@ -1126,6 +1209,7 @@ __all__ = [
     "LayerMlpO1MountedBank",
     "LayerMlpO1PendingState",
     "LayerMlpO1PublishSummary",
+    "LayerMlpO1RegistryDescriptor",
     "LayerMlpO1RegistryEntry",
     "LayerMlpO1RegistryError",
     "LayerMlpO1RegistryIntegrityError",
@@ -1136,4 +1220,5 @@ __all__ = [
     "publish_all_layer_mlp_o1",
     "publish_layer_mlp_o1_banks",
     "publish_layer_mlp_o1_registry",
+    "read_layer_mlp_o1_registry_manifest",
 ]
