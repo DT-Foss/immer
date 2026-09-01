@@ -93,6 +93,79 @@ def _head_values(
 
 
 class PackedDeltaHeadRouterTests(unittest.TestCase):
+    def test_stable_route_reuses_confirmed_coordinate_without_live_energy(self) -> None:
+        bank = _ExactSelectedBlockBank()
+        router = PackedDeltaHeadRouter(
+            bank,  # type: ignore[arg-type]
+            active_layers=(2,),
+            max_selected_heads=16,
+        )
+        state = router._states[2]
+        state.previous = tuple(range(47, 31, -1))
+        state.overlap_ema = 0.9
+        mixed = _head_values(batch=1, sequence=2)
+        state.route_probe = router._route_probe(
+            mixed[0, 0].reshape(48, 128)
+        )
+
+        with mock.patch.object(
+            router,
+            "_select",
+            side_effect=AssertionError("stable coordinate reran live selection"),
+        ):
+            router.project(
+                mixed,
+                bank.name,
+                layer=2,
+            )
+
+        metrics = router.metrics()
+        self.assertEqual(metrics["coordinate_reuse_rows"], 2)
+        self.assertEqual(metrics["energy_rows"], 0)
+        self.assertEqual(metrics["sinkhorn_projections"], 0)
+        self.assertEqual(metrics["transitions"], 2)
+        self.assertEqual(
+            bank.calls[-1][1][0].tolist(),
+            [
+                head * 4 + offset
+                for head in range(47, 31, -1)
+                for offset in range(4)
+            ],
+        )
+
+    def test_reuse_distance_breaks_stable_route_on_novel_head_energy(self) -> None:
+        bank = _ExactSelectedBlockBank()
+        router = PackedDeltaHeadRouter(
+            bank,  # type: ignore[arg-type]
+            active_layers=(2,),
+            max_selected_heads=16,
+        )
+        baseline = _head_values(batch=1, sequence=1)
+        state = router._states[2]
+        state.previous = tuple(range(47, 31, -1))
+        state.overlap_ema = 0.9
+        state.route_probe = router._route_probe(
+            baseline[0, 0].reshape(48, 128)
+        )
+        novel = baseline.reshape(1, 1, 48, 128).clone()
+        novel[:, :, 0] *= 10_000.0
+        novel = novel.reshape(1, 1, 48 * 128)
+
+        with mock.patch.object(
+            router,
+            "_select",
+            wraps=router._select,
+        ) as selected:
+            router.project(novel, bank.name, layer=2)
+
+        self.assertEqual(selected.call_count, 1)
+        metrics = router.metrics()
+        self.assertEqual(metrics["coordinate_probe_rows"], 1)
+        self.assertEqual(metrics["coordinate_novelty_rows"], 1)
+        self.assertEqual(metrics["coordinate_reuse_rows"], 0)
+        self.assertEqual(metrics["energy_rows"], 1)
+        self.assertEqual(bank.calls[-1][1][0, :4].tolist(), [0, 1, 2, 3])
+
     def test_selected_head_columns_match_the_exact_zero_omission(self) -> None:
         bank = _ExactSelectedBlockBank()
         router = PackedDeltaHeadRouter(
@@ -203,6 +276,54 @@ class PackedDeltaHeadRouterTests(unittest.TestCase):
             self.assertEqual(metrics["transitions"], 1)
             self.assertEqual(metrics["width_32"], 2)
             self.assertEqual(metrics["width_24"], 0)
+
+    def test_v2_state_migrates_reuse_counters_without_losing_learning(self) -> None:
+        bank = _ExactSelectedBlockBank()
+        with tempfile.TemporaryDirectory() as temporary:
+            requested = Path(temporary) / "online-state.json"
+            router = PackedDeltaHeadRouter(
+                bank,  # type: ignore[arg-type]
+                active_layers=(2,),
+                state_path=requested,
+                max_selected_heads=32,
+            )
+            router.project(
+                _head_values(batch=1, sequence=2),
+                bank.name,
+                layer=2,
+            )
+            before = router.metrics()
+            path = router.state_path
+            assert path is not None
+            document = json.loads(path.read_bytes())
+            document["schema"] = "immer.qwen3.8-packed-delta-head-markov/v2"
+            for field in (
+                "coordinate_novelty_rows",
+                "coordinate_probe_rows",
+                "coordinate_reuse_rows",
+                "energy_rows",
+            ):
+                document["counters"].pop(field)
+            path.write_bytes(canonical_json_bytes(document))
+
+            restored = PackedDeltaHeadRouter(
+                bank,  # type: ignore[arg-type]
+                active_layers=(2,),
+                state_path=requested,
+                max_selected_heads=32,
+            )
+            metrics = restored.metrics()
+            self.assertEqual(metrics["calls"], before["calls"])
+            self.assertEqual(metrics["transitions"], before["transitions"])
+            self.assertEqual(metrics["coordinate_reuse_rows"], 0)
+            self.assertEqual(metrics["coordinate_novelty_rows"], 0)
+            self.assertEqual(metrics["coordinate_probe_rows"], 0)
+            self.assertEqual(metrics["energy_rows"], 0)
+            migrated = json.loads(path.read_bytes())
+            self.assertEqual(
+                migrated["schema"],
+                "immer.qwen3.8-packed-delta-head-markov/v3",
+            )
 
     def test_state_namespaces_cover_identity_and_do_not_collide_with_packed_mlp(
         self,

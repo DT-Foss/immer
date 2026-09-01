@@ -21,16 +21,22 @@ from ..ooe.math_core import sinkhorn_project
 from .q4 import Q4Bank, Q4_BLOCK_SIZE
 
 
-PACKED_DELTA_HEAD_ROUTER_SCHEMA = "immer.qwen3.8-packed-delta-head-router/v2"
-PACKED_DELTA_HEAD_STATE_SCHEMA = "immer.qwen3.8-packed-delta-head-markov/v2"
+PACKED_DELTA_HEAD_ROUTER_SCHEMA = "immer.qwen3.8-packed-delta-head-router/v3"
+PACKED_DELTA_HEAD_STATE_SCHEMA = "immer.qwen3.8-packed-delta-head-markov/v3"
+_PACKED_DELTA_HEAD_STATE_PREDECESSOR = (
+    "immer.qwen3.8-packed-delta-head-markov/v2"
+)
 
-_ROUTE_POLICY = "mean-square+sinkhorn-first-order/v1"
+_ROUTE_POLICY = "mean-square+sinkhorn-first-order+reuse-distance/v2"
 _STATE_MODE = "delta-head-out-proj"
 _TRANSITION_PRIOR = 1e-3
 _MARKOV_WEIGHT = 0.10
 _OVERLAP_DECAY = 0.80
 _COUNT_RENORMALIZE_AT = 1 << 52
 _SINKHORN_REFRESH_INTERVAL = 8
+_COORDINATE_REUSE_MIN_OVERLAP = 0.75
+_COORDINATE_PROBE_STRIDE = 1
+_COORDINATE_REUSE_MAX_DISTANCE = 0.05
 
 
 class PackedDeltaHeadRouterError(RuntimeError):
@@ -47,6 +53,7 @@ class _LayerState:
     previous: tuple[int, ...] = ()
     overlap_ema: float = 0.0
     transitions: int = 0
+    route_probe: np.ndarray | None = None
 
     def clone(self) -> _LayerState:
         return _LayerState(
@@ -54,6 +61,9 @@ class _LayerState:
             previous=self.previous,
             overlap_ema=self.overlap_ema,
             transitions=self.transitions,
+            route_probe=(
+                None if self.route_probe is None else self.route_probe.copy()
+            ),
         )
 
 
@@ -62,6 +72,7 @@ class _DeltaHeadTransaction:
     base: dict[int, _LayerState]
     working: dict[int, _LayerState]
     routes: dict[int, list[tuple[int, ...]]]
+    route_probes: dict[int, list[np.ndarray | None]]
 
 
 class PackedDeltaHeadRouter:
@@ -131,6 +142,10 @@ class PackedDeltaHeadRouter:
         }
         self._counters = {
             "calls": 0,
+            "coordinate_novelty_rows": 0,
+            "coordinate_probe_rows": 0,
+            "coordinate_reuse_rows": 0,
+            "energy_rows": 0,
             "full_equivalent_bytes": 0,
             "logical_bytes_saved": 0,
             "rows": 0,
@@ -215,6 +230,13 @@ class PackedDeltaHeadRouter:
             "transactional_prefix_commit": True,
             "request_session_reset": True,
             "coordinated_commit_rollback": True,
+            "coordinate_reuse_max_distance": (
+                _COORDINATE_REUSE_MAX_DISTANCE
+            ),
+            "coordinate_reuse_min_overlap": (
+                _COORDINATE_REUSE_MIN_OVERLAP
+            ),
+            "coordinate_reuse_probe_stride": _COORDINATE_PROBE_STRIDE,
         }
         if not transport_neutral:
             root = getattr(self.bank, "root", None)
@@ -355,7 +377,13 @@ class PackedDeltaHeadRouter:
         after = set(right)
         return len(before & after) / len(before | after)
 
-    def _observe(self, state: _LayerState, selected: tuple[int, ...]) -> None:
+    def _observe(
+        self,
+        state: _LayerState,
+        selected: tuple[int, ...],
+        *,
+        route_probe: np.ndarray | None = None,
+    ) -> None:
         previous = state.previous
         if previous:
             overlap = self._overlap(previous, selected)
@@ -371,6 +399,16 @@ class PackedDeltaHeadRouter:
             state.counts[np.ix_(previous, selected)] += 1
             state.transitions += 1
         state.previous = selected
+        if route_probe is not None:
+            state.route_probe = np.ascontiguousarray(
+                route_probe,
+                dtype=np.float64,
+            )
+
+    def _route_probe(self, row: torch.Tensor) -> np.ndarray:
+        sampled = row[:, ::_COORDINATE_PROBE_STRIDE].to(dtype=torch.float32)
+        energy = sampled.square().mean(dim=1).numpy().astype(np.float64)
+        return self._normalized_energy(energy)
 
     def _routes(
         self,
@@ -379,26 +417,72 @@ class PackedDeltaHeadRouter:
         layer: int,
         width: int,
         state: _LayerState,
-    ) -> tuple[tuple[tuple[int, ...], ...], int]:
-        rows = flat.detach().to(dtype=torch.float64).reshape(
+    ) -> tuple[
+        tuple[tuple[int, ...], ...],
+        tuple[np.ndarray | None, ...],
+        int,
+        int,
+        int,
+        int,
+    ]:
+        rows = flat.detach().reshape(
             flat.shape[0], self.value_heads, self.head_dim
         )
-        scale = rows.abs().amax(dim=(1, 2), keepdim=True)
-        scale = torch.where(scale > 0.0, scale, torch.ones_like(scale))
-        energies = (rows / scale).square().mean(dim=2).numpy()
         selected: list[tuple[int, ...]] = []
         sinkhorn_refreshes = 0
-        for energy in energies:
-            route, refreshed = self._select(
-                energy,
-                layer=layer,
-                width=width,
-                state=state,
+        coordinate_reuses = 0
+        coordinate_novelty_rows = 0
+        energy_rows = 0
+        route_probes: list[np.ndarray | None] = []
+        for row in rows:
+            probe = self._route_probe(row)
+            stable_coordinate = (
+                len(state.previous) == width
+                and state.overlap_ema >= _COORDINATE_REUSE_MIN_OVERLAP
+                and state.route_probe is not None
             )
-            sinkhorn_refreshes += int(refreshed)
-            self._observe(state, route)
+            distance = (
+                math.inf
+                if state.route_probe is None
+                else 0.5
+                * float(np.abs(probe - state.route_probe).sum(dtype=np.float64))
+            )
+            reusable = (
+                stable_coordinate
+                and distance <= _COORDINATE_REUSE_MAX_DISTANCE
+            )
+            if reusable:
+                route = state.previous
+                coordinate_reuses += 1
+                accepted_probe = None
+            else:
+                if stable_coordinate:
+                    coordinate_novelty_rows += 1
+                work = row.to(dtype=torch.float64)
+                scale = work.abs().amax()
+                if float(scale) <= 0.0:
+                    scale = torch.ones((), dtype=work.dtype, device=work.device)
+                energy = (work / scale).square().mean(dim=1).numpy()
+                route, refreshed = self._select(
+                    energy,
+                    layer=layer,
+                    width=width,
+                    state=state,
+                )
+                sinkhorn_refreshes += int(refreshed)
+                energy_rows += 1
+                accepted_probe = probe
+            self._observe(state, route, route_probe=accepted_probe)
             selected.append(route)
-        return tuple(selected), sinkhorn_refreshes
+            route_probes.append(accepted_probe)
+        return (
+            tuple(selected),
+            tuple(route_probes),
+            sinkhorn_refreshes,
+            coordinate_reuses,
+            coordinate_novelty_rows,
+            energy_rows,
+        )
 
     def _block_ids(self, routes: tuple[tuple[int, ...], ...]) -> torch.Tensor:
         return torch.tensor(
@@ -459,7 +543,14 @@ class PackedDeltaHeadRouter:
             )
             working = source_state.clone()
             width = self._choose_width(working)
-            routes, sinkhorn_refreshes = self._routes(
+            (
+                routes,
+                route_probes,
+                sinkhorn_refreshes,
+                coordinate_reuses,
+                coordinate_novelty_rows,
+                energy_rows,
+            ) = self._routes(
                 flat,
                 layer=layer,
                 width=width,
@@ -497,7 +588,14 @@ class PackedDeltaHeadRouter:
             else:
                 transaction.working[layer] = working
                 transaction.routes[layer].extend(routes)
+                transaction.route_probes[layer].extend(route_probes)
             self._counters["calls"] += 1
+            self._counters["coordinate_probe_rows"] += total_rows
+            self._counters["coordinate_reuse_rows"] += coordinate_reuses
+            self._counters["coordinate_novelty_rows"] += (
+                coordinate_novelty_rows
+            )
+            self._counters["energy_rows"] += energy_rows
             self._counters["rows"] += total_rows
             self._counters["full_equivalent_bytes"] += full_bytes
             self._counters["logical_bytes_saved"] += max(
@@ -566,6 +664,7 @@ class PackedDeltaHeadRouter:
                 base=base,
                 working={layer: state.clone() for layer, state in base.items()},
                 routes={layer: [] for layer in self.active_layers},
+                route_probes={layer: [] for layer in self.active_layers},
             )
             self._sinkhorn_cache.clear()
 
@@ -579,7 +678,10 @@ class PackedDeltaHeadRouter:
                     "no packed DeltaNet head transaction is active"
                 )
             row_counts = {len(rows) for rows in transaction.routes.values()}
-            if len(row_counts) != 1:
+            probe_counts = {
+                len(rows) for rows in transaction.route_probes.values()
+            }
+            if len(row_counts) != 1 or probe_counts != row_counts:
                 raise PackedDeltaHeadRouterError(
                     "packed DeltaNet transaction layer widths disagree"
                 )
@@ -595,8 +697,12 @@ class PackedDeltaHeadRouter:
             transition_delta = 0
             for layer in self.active_layers:
                 state = transaction.base[layer].clone()
-                for route in transaction.routes[layer][:width]:
-                    self._observe(state, route)
+                for route, route_probe in zip(
+                    transaction.routes[layer][:width],
+                    transaction.route_probes[layer][:width],
+                    strict=True,
+                ):
+                    self._observe(state, route, route_probe=route_probe)
                 committed[layer] = state
                 transition_delta += (
                     state.transitions - transaction.base[layer].transitions
@@ -662,6 +768,7 @@ class PackedDeltaHeadRouter:
             for state in self._states.values():
                 state.previous = ()
                 state.overlap_ema = 0.0
+                state.route_probe = None
             self._sinkhorn_cache.clear()
 
     def _state_document(self) -> dict[str, object]:
@@ -704,7 +811,11 @@ class PackedDeltaHeadRouter:
             not isinstance(document, dict)
             or set(document)
             != {"counters", "identity", "layers", "schema", "width_counts"}
-            or document.get("schema") != PACKED_DELTA_HEAD_STATE_SCHEMA
+            or document.get("schema")
+            not in {
+                PACKED_DELTA_HEAD_STATE_SCHEMA,
+                _PACKED_DELTA_HEAD_STATE_PREDECESSOR,
+            }
             or document.get("identity") != self._identity
             or canonical_json_bytes(document) != raw
         ):
@@ -766,9 +877,18 @@ class PackedDeltaHeadRouter:
             )
 
         counters = document["counters"]
+        predecessor = document["schema"] == _PACKED_DELTA_HEAD_STATE_PREDECESSOR
+        expected_counter_keys = set(self._counters)
+        if predecessor:
+            expected_counter_keys -= {
+                "coordinate_novelty_rows",
+                "coordinate_probe_rows",
+                "coordinate_reuse_rows",
+                "energy_rows",
+            }
         if (
             not isinstance(counters, dict)
-            or set(counters) != set(self._counters)
+            or set(counters) != expected_counter_keys
             or any(
                 isinstance(value, bool)
                 or not isinstance(value, int)
@@ -800,7 +920,11 @@ class PackedDeltaHeadRouter:
                 "packed DeltaNet transition totals disagree"
             )
         self._states = restored
-        self._counters = {key: int(value) for key, value in counters.items()}
+        self._counters = {
+            key: int(counters.get(key, 0)) for key in self._counters
+        }
+        if predecessor:
+            self._dirty = True
         self._width_counts = {
             width: int(width_counts[str(width)]) for width in self.width_actions
         }
