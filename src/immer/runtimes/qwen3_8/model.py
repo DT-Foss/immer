@@ -18,9 +18,16 @@ import os
 import time
 from typing import Any
 import warnings
+import weakref
 
 import torch
 
+from .attention_output_crystal import (
+    AttentionOutputCrystalBank,
+    AttentionOutputCrystalHit,
+    AttentionOutputCrystalTransaction,
+    canonical_attention_state_sha256,
+)
 from .config import Qwen38Config
 from .kernels import (
     AttentionState,
@@ -257,6 +264,9 @@ class _PendingStatefulBlock:
     runtime_identity: str
     mlp_page_transaction_owner: Any | None
     delta_head_transaction_owner: Any | None
+    attention_output_crystal_transaction_owner: (
+        AttentionOutputCrystalTransaction | None
+    )
 
 
 class StreamedQwen38:
@@ -297,6 +307,7 @@ class StreamedQwen38:
         mlp_sparse_executor: Any | None = None,
         mlp_page_router: Any | None = None,
         delta_head_router: Any | None = None,
+        attention_output_crystal_bank: AttentionOutputCrystalBank | None = None,
         native_deltanet_recurrence: bool = False,
         native_deltanet_fusion: bool = False,
         packed_continuation_gemm: bool = False,
@@ -523,6 +534,21 @@ class StreamedQwen38:
         self.mlp_sparse_executor = mlp_sparse_executor
         self.mlp_page_router = mlp_page_router
         self.delta_head_router = delta_head_router
+        self.attention_output_crystal_bank: AttentionOutputCrystalBank | None = None
+        self.attention_output_crystal_enabled = False
+        self._active_attention_output_crystal_transaction: (
+            AttentionOutputCrystalTransaction | None
+        ) = None
+        self._attention_output_crystal_failures = 0
+        self._attention_state_digest_cache: dict[
+            tuple[object, ...],
+            tuple[
+                weakref.ReferenceType[torch.Tensor],
+                weakref.ReferenceType[torch.Tensor],
+                weakref.ReferenceType[torch.Tensor] | None,
+                str,
+            ],
+        ] = {}
         self.native_deltanet_recurrence = native_deltanet_recurrence
         self.native_deltanet_fusion = native_deltanet_fusion
         self.packed_continuation_gemm = packed_continuation_gemm
@@ -539,6 +565,8 @@ class StreamedQwen38:
         self._state_poisoned = False
         self._graft_history: torch.Tensor | None = None
         self._pending_block_stage: _PendingStatefulBlock | None = None
+        if attention_output_crystal_bank is not None:
+            self.attach_attention_output_crystal_bank(attention_output_crystal_bank)
 
     @property
     def next_position(self) -> int:
@@ -551,6 +579,263 @@ class StreamedQwen38:
     @property
     def state_poisoned(self) -> bool:
         return self._state_poisoned
+
+    @property
+    def attention_output_crystal_failures(self) -> int:
+        """Return passive bank failures that never changed target execution."""
+
+        return self._attention_output_crystal_failures
+
+    def attention_output_crystal_runtime_math_sha256(self) -> str:
+        """Derive the exact transition identity from the live target itself."""
+
+        return self._snapshot_digest(
+            {
+                "runtime": self._snapshot_identity(transport_neutral=True),
+                "schema": "immer.qwen3.8-attention-output-runtime-math/v2",
+                "transition": (
+                    "exact-bf16-attention-input+prior-kv-crsa-to-"
+                    "post-o-proj+appended-kv-crsa/v1"
+                ),
+            }
+        )
+
+    def attach_attention_output_crystal_bank(
+        self,
+        bank: AttentionOutputCrystalBank | None,
+    ) -> None:
+        """Attach or detach the exact attention transition bank while idle."""
+
+        if bank is not None and not isinstance(bank, AttentionOutputCrystalBank):
+            raise TypeError(
+                "attention_output_crystal_bank must be an "
+                "AttentionOutputCrystalBank or None"
+            )
+        if bank is not None and self.pager.compute_dtype != torch.bfloat16:
+            raise ValueError(
+                "attention-output Crystals require exact BF16 target execution"
+            )
+        if (
+            bank is not None
+            and bank.identity.runtime_math_sha256
+            != self.attention_output_crystal_runtime_math_sha256()
+        ):
+            raise Qwen38RuntimeError(
+                "attention-output Crystal runtime identity does not match the target"
+            )
+        if (
+            self._pending_block_stage is not None
+            or self._active_attention_output_crystal_transaction is not None
+        ):
+            raise Qwen38RuntimeError(
+                "attention-output Crystal attachment cannot change during a stage"
+            )
+        self.attention_output_crystal_bank = bank
+        self.attention_output_crystal_enabled = bank is not None
+        self._attention_state_digest_cache.clear()
+
+    def set_attention_output_crystal_enabled(self, enabled: bool) -> None:
+        """Select exact replay for the next idle request without detaching state."""
+
+        if not isinstance(enabled, bool):
+            raise TypeError("attention-output Crystal activation must be boolean")
+        if enabled and self.attention_output_crystal_bank is None:
+            raise Qwen38RuntimeError(
+                "attention-output Crystal activation requires an attached bank"
+            )
+        if (
+            self._pending_block_stage is not None
+            or self._active_attention_output_crystal_transaction is not None
+        ):
+            raise Qwen38RuntimeError(
+                "attention-output Crystal activation cannot change during a stage"
+            )
+        self.attention_output_crystal_enabled = enabled
+
+    @staticmethod
+    def _attention_tensor_cache_stamp(tensor: torch.Tensor) -> tuple[object, ...]:
+        return (
+            id(tensor),
+            int(getattr(tensor, "_version", 0)),
+            tuple(tensor.shape),
+            str(tensor.dtype),
+            str(tensor.device),
+        )
+
+    def _attention_state_sha256(
+        self,
+        layer: int,
+        state: AttentionState | None,
+    ) -> str:
+        """Hash exact KV/CRSA state with a safe request-local tensor memo."""
+
+        if state is None:
+            return canonical_attention_state_sha256(None)
+        usage = state.crsa_log_usage
+        stamp = (
+            layer,
+            *self._attention_tensor_cache_stamp(state.key),
+            *self._attention_tensor_cache_stamp(state.value),
+            None if usage is None else self._attention_tensor_cache_stamp(usage),
+        )
+        cached = self._attention_state_digest_cache.get(stamp)
+        if cached is not None:
+            key_ref, value_ref, usage_ref, digest = cached
+            if (
+                key_ref() is state.key
+                and value_ref() is state.value
+                and (
+                    (usage is None and usage_ref is None)
+                    or (
+                        usage is not None
+                        and usage_ref is not None
+                        and usage_ref() is usage
+                    )
+                )
+            ):
+                return digest
+        digest = canonical_attention_state_sha256(state)
+        if len(self._attention_state_digest_cache) >= 8192:
+            self._attention_state_digest_cache.clear()
+        self._attention_state_digest_cache[stamp] = (
+            weakref.ref(state.key),
+            weakref.ref(state.value),
+            None if usage is None else weakref.ref(usage),
+            digest,
+        )
+        return digest
+
+    def _full_attention_logical_projection_bytes(self) -> int:
+        """Return logical BF16 Q/K/V/o weight bytes read once per layer wave."""
+
+        query_width = self.config.n_heads * self.config.head_dim
+        kv_width = self.config.n_kv_heads * self.config.head_dim
+        weights = self.config.dim * (3 * query_width + 2 * kv_width)
+        return weights * torch.bfloat16.itemsize
+
+    def _replay_attention_output_crystal_hit(
+        self,
+        hit: AttentionOutputCrystalHit,
+        *,
+        layer: int,
+        absolute_position: int,
+        state: AttentionState | None,
+    ) -> tuple[torch.Tensor, AttentionState, NativeHeadCrsaEvidence | None]:
+        """Validate and apply one exact post-``o_proj`` state transition."""
+
+        if hit.layer_index != layer or hit.absolute_position != absolute_position:
+            raise Qwen38RuntimeError(
+                "attention-output Crystal hit disagrees with its layer position"
+            )
+        expected_output = (1, 1, self.config.dim)
+        expected_append = (
+            1,
+            self.config.n_kv_heads,
+            1,
+            self.config.head_dim,
+        )
+        tensors = (hit.post_o_proj, hit.appended_rope_key, hit.appended_value)
+        if (
+            tuple(hit.post_o_proj.shape) != expected_output
+            or tuple(hit.appended_rope_key.shape) != expected_append
+            or tuple(hit.appended_value.shape) != expected_append
+            or any(
+                tensor.dtype != self.pager.compute_dtype
+                or not self._on_pager_device(tensor)
+                or not bool(torch.isfinite(tensor).all().item())
+                for tensor in tensors
+            )
+        ):
+            raise Qwen38RuntimeError(
+                "attention-output Crystal tensor contract is invalid"
+            )
+        if state is None:
+            if absolute_position != 0:
+                raise Qwen38RuntimeError(
+                    "attention-output Crystal prior state is missing"
+                )
+            key = hit.appended_rope_key
+            value = hit.appended_value
+        else:
+            expected_prior = (
+                1,
+                self.config.n_kv_heads,
+                absolute_position,
+                self.config.head_dim,
+            )
+            if (
+                tuple(state.key.shape) != expected_prior
+                or tuple(state.value.shape) != expected_prior
+            ):
+                raise Qwen38RuntimeError(
+                    "attention-output Crystal prior KV cursor is invalid"
+                )
+            key = torch.cat((state.key, hit.appended_rope_key), dim=2).contiguous()
+            value = torch.cat((state.value, hit.appended_value), dim=2).contiguous()
+
+        intervention = (
+            self.native_head_crsa
+            if self.native_head_crsa is not None
+            and layer == self.native_head_crsa.layer
+            else None
+        )
+        usage = hit.next_crsa_usage
+        expects_usage = intervention is not None and intervention.active
+        if expects_usage != (usage is not None):
+            raise Qwen38RuntimeError(
+                "attention-output Crystal CRSA usage contract is invalid"
+            )
+        if usage is not None:
+            if (
+                tuple(usage.shape) != (1, 4, absolute_position + 1)
+                or usage.dtype != self._native_head_crsa_usage_dtype()
+                or not self._on_pager_device(usage)
+                or bool((torch.isnan(usage) | torch.isposinf(usage)).any().item())
+            ):
+                raise Qwen38RuntimeError(
+                    "attention-output Crystal CRSA state is invalid"
+                )
+        evidence = self._native_head_crsa_evidence_from_record(hit.crsa_evidence)
+        if (intervention is None) != (evidence is None):
+            raise Qwen38RuntimeError(
+                "attention-output Crystal native evidence contract is invalid"
+            )
+        return (
+            hit.post_o_proj,
+            AttentionState(key=key, value=value, crsa_log_usage=usage),
+            evidence,
+        )
+
+    @staticmethod
+    def _native_head_crsa_evidence_from_record(
+        value: object | None,
+    ) -> NativeHeadCrsaEvidence | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            try:
+                value = dict(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise Qwen38RuntimeError(
+                    "cached native Head-CRSA evidence is invalid"
+                ) from exc
+        record = dict(value)
+        for name in (
+            "selected_query_heads",
+            "selected_kv_heads",
+            "alpha_per_head",
+            "argmax_changed_queries_per_head",
+            "mean_l1_probability_delta_per_head",
+            "free_heads",
+        ):
+            if isinstance(record.get(name), list):
+                record[name] = tuple(record[name])
+        try:
+            return NativeHeadCrsaEvidence(**record)
+        except (TypeError, ValueError) as exc:
+            raise Qwen38RuntimeError(
+                "cached native Head-CRSA evidence is invalid"
+            ) from exc
 
     @staticmethod
     def _continuation_bytes(
@@ -1938,42 +2223,130 @@ class StreamedQwen38:
         AttentionState,
         _LayerPrefixTrace,
     ]:
-        """Run exact one-token attention recurrence with weight-once projections."""
+        """Run or exactly replay one-token attention transitions layer-major."""
 
         base = f"model.language_model.layers.{layer}.self_attn"
-        projected_query_gate, projected_key, projected_value = (
-            self._linear_group_token_rows(
-                hidden,
-                (f"{base}.q_proj", f"{base}.k_proj", f"{base}.v_proj"),
-            )
-        )
-        q_norm_weight = self._control(f"{base}.q_norm.weight")
-        k_norm_weight = self._control(f"{base}.k_norm.weight")
         intervention = (
             self.native_head_crsa
             if self.native_head_crsa is not None
             and layer == self.native_head_crsa.layer
             else None
         )
+        bank = (
+            self.attention_output_crystal_bank
+            if self.attention_output_crystal_enabled
+            else None
+        )
+        transaction = self._active_attention_output_crystal_transaction
+        if (bank is None) != (transaction is None):
+            raise Qwen38RuntimeError(
+                "attention-output Crystal transaction attachment is inconsistent"
+            )
+
+        projected_rows: list[torch.Tensor] = []
         mixed_rows: list[torch.Tensor] = []
         prefix_usage: list[torch.Tensor | None] = []
         next_state = state
-        try:
+        leading_hits: list[AttentionOutputCrystalHit] = []
+        # Operator capture is a cartography request.  A replay would need to
+        # reproduce its full probability operator block, so preserve that
+        # observer by taking the exact compute path while still harvesting a
+        # reusable output cell.
+        if bank is not None and native_prefix_sinkhorn_operator_observer is None:
             for offset, row in enumerate(hidden):
+                absolute_position = start_pos + offset
+                key = bank.make_key(
+                    layer,
+                    absolute_position,
+                    row,
+                    self._attention_state_sha256(layer, next_state),
+                )
+                hit = bank.peek(key, device=row.device)
+                if hit is None:
+                    break
+                output, next_state, evidence = (
+                    self._replay_attention_output_crystal_hit(
+                        hit,
+                        layer=layer,
+                        absolute_position=absolute_position,
+                        state=next_state,
+                    )
+                )
+                if evidence is not None:
+                    native_head_crsa_observer(evidence)
+                leading_hits.append(hit)
+                projected_rows.append(output)
+                prefix_usage.append(next_state.crsa_log_usage)
+
+        leading_count = len(leading_hits)
+        if transaction is not None:
+            for hit in leading_hits:
+                transaction.stage_hit(hit.absolute_position, hit)
+        if leading_count == len(hidden):
+            assert transaction is not None
+            transaction.stage_savings(
+                start_pos,
+                skipped_projection_calls=4,
+                logical_projection_bytes_saved=(
+                    self._full_attention_logical_projection_bytes()
+                ),
+            )
+            if not isinstance(next_state, AttentionState):
+                raise Qwen38RuntimeError(
+                    "attention-output Crystal replay returned no state"
+                )
+            return (
+                tuple(projected_rows),
+                next_state,
+                _LayerPrefixTrace(attention_log_usage=tuple(prefix_usage)),
+            )
+
+        suffix = hidden[leading_count:]
+        projected_query_gate, projected_key, projected_value = (
+            self._linear_group_token_rows(
+                suffix,
+                (f"{base}.q_proj", f"{base}.k_proj", f"{base}.v_proj"),
+            )
+        )
+        q_norm_weight = self._control(f"{base}.q_norm.weight")
+        k_norm_weight = self._control(f"{base}.k_norm.weight")
+        staged_captures: list[
+            tuple[Any, AttentionState, NativeHeadCrsaEvidence | None]
+        ] = []
+        try:
+            for suffix_offset, row in enumerate(suffix):
+                offset = leading_count + suffix_offset
+                absolute_position = start_pos + offset
+                crystal_key = (
+                    None
+                    if bank is None
+                    else bank.make_key(
+                        layer,
+                        absolute_position,
+                        row,
+                        self._attention_state_sha256(layer, next_state),
+                    )
+                )
                 position = (
                     torch.arange(
-                        start_pos + offset,
-                        start_pos + offset + 1,
+                        absolute_position,
+                        absolute_position + 1,
                         device=row.device,
                         dtype=torch.long,
                     )
                     .unsqueeze(0)
                     .expand(row.shape[0], -1)
                 )
+                row_native_evidence: list[NativeHeadCrsaEvidence] = []
+
+                def observe_native(evidence: NativeHeadCrsaEvidence) -> None:
+                    row_native_evidence.append(evidence)
+                    native_head_crsa_observer(evidence)
+
                 mixed, next_state = full_attention_core(
-                    projected_query_gate[offset],
-                    projected_key[offset],
-                    projected_value[offset],
+                    projected_query_gate[suffix_offset],
+                    projected_key[suffix_offset],
+                    projected_value[suffix_offset],
                     q_norm_weight=q_norm_weight,
                     k_norm_weight=k_norm_weight,
                     num_attention_heads=self.config.n_heads,
@@ -1984,7 +2357,7 @@ class StreamedQwen38:
                     attention_mask=None,
                     native_head_crsa=intervention,
                     native_head_crsa_observer=(
-                        native_head_crsa_observer if intervention is not None else None
+                        observe_native if intervention is not None else None
                     ),
                     native_prefix_sinkhorn_operator_observer=(
                         native_prefix_sinkhorn_operator_observer
@@ -1999,14 +2372,58 @@ class StreamedQwen38:
                 )
                 mixed_rows.append(mixed)
                 prefix_usage.append(next_state.crsa_log_usage)
+                if crystal_key is not None:
+                    if len(row_native_evidence) > 1:
+                        raise Qwen38RuntimeError(
+                            "one attention row emitted multiple native receipts"
+                        )
+                    staged_captures.append(
+                        (
+                            crystal_key,
+                            next_state,
+                            (
+                                None
+                                if not row_native_evidence
+                                else row_native_evidence[0]
+                            ),
+                        )
+                    )
         finally:
             del projected_query_gate, projected_key, projected_value
             del q_norm_weight, k_norm_weight
         if not isinstance(next_state, AttentionState):  # pragma: no cover - kernel.
             raise Qwen38RuntimeError("continuation full attention returned no state")
-        projected = self._linear_token_rows(tuple(mixed_rows), f"{base}.o_proj")
+        projected_suffix = self._linear_token_rows(
+            tuple(mixed_rows),
+            f"{base}.o_proj",
+        )
+        projected_rows.extend(projected_suffix)
+        if bank is not None:
+            assert transaction is not None
+            if len(staged_captures) != len(projected_suffix):
+                raise Qwen38RuntimeError(
+                    "attention-output Crystal capture width is inconsistent"
+                )
+            for (key, captured_state, evidence), output in zip(
+                staged_captures,
+                projected_suffix,
+                strict=True,
+            ):
+                staged = bank.stage(
+                    key,
+                    post_o_proj=output,
+                    appended_rope_key=captured_state.key[:, :, -1:].detach(),
+                    appended_value=captured_state.value[:, :, -1:].detach(),
+                    next_crsa_usage=captured_state.crsa_log_usage,
+                    crsa_evidence=evidence,
+                    logical_projection_bytes=(
+                        self._full_attention_logical_projection_bytes()
+                    ),
+                    skipped_projection_calls=4,
+                )
+                transaction.stage_capture(key.absolute_position, staged)
         return (
-            projected,
+            tuple(projected_rows),
             next_state,
             _LayerPrefixTrace(attention_log_usage=tuple(prefix_usage)),
         )
@@ -2596,9 +3013,55 @@ class StreamedQwen38:
                     if self.mlp_page_router is None
                     else id(self.mlp_page_router)
                 ),
+                "attention_output_crystal": (
+                    None
+                    if not self.attention_output_crystal_enabled
+                    or self.attention_output_crystal_bank is None
+                    else {
+                        "identity_sha256": (
+                            self.attention_output_crystal_bank.identity.identity_sha256
+                        ),
+                        "instance": id(self.attention_output_crystal_bank),
+                    }
+                ),
                 "native_head_crsa": native,
             }
         )
+
+    @staticmethod
+    def _rollback_attention_output_crystal_transaction(
+        owner: AttentionOutputCrystalTransaction | None,
+    ) -> None:
+        if owner is not None and not owner.closed:
+            owner.rollback()
+
+    def _commit_attention_output_crystal_transaction(
+        self,
+        owner: AttentionOutputCrystalTransaction | None,
+        *,
+        accepted_end_position: int,
+    ) -> None:
+        """Publish passive exact cells without jeopardizing a target commit."""
+
+        if owner is None:
+            return
+        try:
+            owner.commit(accepted_end_position=accepted_end_position)
+        except Exception as exc:
+            self._attention_output_crystal_failures += 1
+            try:
+                self._rollback_attention_output_crystal_transaction(owner)
+            except Exception:
+                pass
+            try:
+                warnings.warn(
+                    "attention-output Crystal publication failed after exact "
+                    f"target execution: {type(exc).__name__}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            except Exception:
+                pass
 
     def _emit_native_head_crsa_evidence(
         self, rows: Iterable[NativeHeadCrsaEvidence]
@@ -2846,6 +3309,17 @@ class StreamedQwen38:
             delta_owner.rollback_transaction()
         if delta_current is not None:
             delta_current.reset_session()
+        crystal_owner = (
+            None
+            if pending is None
+            else pending.attention_output_crystal_transaction_owner
+        )
+        active_crystal = self._active_attention_output_crystal_transaction
+        if active_crystal is not None and active_crystal is not crystal_owner:
+            self._rollback_attention_output_crystal_transaction(active_crystal)
+        self._rollback_attention_output_crystal_transaction(crystal_owner)
+        self._active_attention_output_crystal_transaction = None
+        self._attention_state_digest_cache.clear()
 
     def reset_state(self, *, release: bool = False) -> None:
         """Drop every committed KV/DeltaNet cache and clear the poison latch."""
@@ -3268,23 +3742,35 @@ class StreamedQwen38:
 
         page_router = self.mlp_page_router
         delta_router = self.delta_head_router
+        crystal_bank = (
+            self.attention_output_crystal_bank
+            if self.attention_output_crystal_enabled
+            else None
+        )
+        crystal_transaction: AttentionOutputCrystalTransaction | None = None
         previous_stage = self._pending_block_stage
         if previous_stage is not None:
             if previous_stage.mlp_page_transaction_owner is not None:
                 previous_stage.mlp_page_transaction_owner.rollback_transaction()
             if previous_stage.delta_head_transaction_owner is not None:
                 previous_stage.delta_head_transaction_owner.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(
+                previous_stage.attention_output_crystal_transaction_owner
+            )
         self._pending_block_stage = None
         try:
             if page_router is not None:
                 page_router.begin_transaction()
             if delta_router is not None:
                 delta_router.begin_transaction()
+            if crystal_bank is not None:
+                crystal_transaction = crystal_bank.begin_transaction()
         except Exception:
             if page_router is not None:
                 page_router.rollback_transaction()
             if delta_router is not None:
                 delta_router.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
             raise
         try:
             source = self.pager.source
@@ -3296,9 +3782,11 @@ class StreamedQwen38:
                 page_router.rollback_transaction()
             if delta_router is not None:
                 delta_router.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
             raise
         try:
             embedded = self.embed_batch(ids)
+            self._active_attention_output_crystal_transaction = crystal_transaction
             if ids.shape[1] == 2:
                 staged = self._stage_continuation_k2_pair(
                     embedded,
@@ -3333,9 +3821,11 @@ class StreamedQwen38:
                 page_router.rollback_transaction()
             if delta_router is not None:
                 delta_router.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
             self.pager.release()
             raise
         finally:
+            self._active_attention_output_crystal_transaction = None
             self.pager.release()
 
         try:
@@ -3384,6 +3874,7 @@ class StreamedQwen38:
                 runtime_identity=runtime_identity,
                 mlp_page_transaction_owner=page_router,
                 delta_head_transaction_owner=delta_router,
+                attention_output_crystal_transaction_owner=crystal_transaction,
             )
             return stage
         except Exception:
@@ -3392,6 +3883,7 @@ class StreamedQwen38:
                 page_router.rollback_transaction()
             if delta_router is not None:
                 delta_router.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
             raise
 
     def extend_continuation_block(
@@ -3415,6 +3907,9 @@ class StreamedQwen38:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         page_router = pending.mlp_page_transaction_owner
         delta_router = pending.delta_head_transaction_owner
+        crystal_transaction = (
+            pending.attention_output_crystal_transaction_owner
+        )
 
         # A matching handle is consumed exactly once.  No later validation or
         # compute failure may leave the old private transaction committable.
@@ -3476,6 +3971,7 @@ class StreamedQwen38:
             start_linears = self._metric(self.pager, "linear_calls")
             started = time.perf_counter()
             embedded = self.embed_batch(ids)
+            self._active_attention_output_crystal_transaction = crystal_transaction
             staged = self._stage_continuation_token_rows(
                 embedded,
                 staged_base,
@@ -3544,6 +4040,7 @@ class StreamedQwen38:
                 runtime_identity=runtime_identity,
                 mlp_page_transaction_owner=page_router,
                 delta_head_transaction_owner=delta_router,
+                attention_output_crystal_transaction_owner=crystal_transaction,
             )
             return next_stage
         except Exception:
@@ -3552,8 +4049,10 @@ class StreamedQwen38:
                 page_router.rollback_transaction()
             if delta_router is not None:
                 delta_router.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
             raise
         finally:
+            self._active_attention_output_crystal_transaction = None
             self.pager.release()
 
     def discard_continuation_block(self, stage: StatefulBlockStage) -> None:
@@ -3571,6 +4070,9 @@ class StreamedQwen38:
         delta_router = pending.delta_head_transaction_owner
         if delta_router is not None:
             delta_router.rollback_transaction()
+        self._rollback_attention_output_crystal_transaction(
+            pending.attention_output_crystal_transaction_owner
+        )
         self.pager.release()
 
     def _reconstruct_continuation_prefix_states(
@@ -3680,6 +4182,9 @@ class StreamedQwen38:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         page_router = pending.mlp_page_transaction_owner
         delta_router = pending.delta_head_transaction_owner
+        crystal_transaction = (
+            pending.attention_output_crystal_transaction_owner
+        )
 
         def rollback_coordinate_routes() -> None:
             self._pending_block_stage = None
@@ -3687,6 +4192,7 @@ class StreamedQwen38:
                 page_router.rollback_transaction()
             if delta_router is not None:
                 delta_router.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
 
         row = pending.evidence
         stage_width = row.end_pos - row.start_pos
@@ -3755,6 +4261,7 @@ class StreamedQwen38:
                 page_router.rollback_transaction()
             if delta_router is not None:
                 delta_router.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
             raise
         end_pos = row.start_pos + width
         hidden = pending_hidden[:, :width]
@@ -3764,6 +4271,7 @@ class StreamedQwen38:
         except Exception:
             if page_router is not None:
                 page_router.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
             raise
         try:
             if page_router is not None:
@@ -3771,9 +4279,14 @@ class StreamedQwen38:
         except Exception:
             if delta_router is not None:
                 delta_router.revert_committed_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
             raise
         if delta_router is not None:
             delta_router.finalize_transaction()
+        self._commit_attention_output_crystal_transaction(
+            crystal_transaction,
+            accepted_end_position=end_pos,
+        )
         self._layer_states = list(states)
         self._next_position = end_pos
         self._state_batch_size = 1
@@ -3820,6 +4333,9 @@ class StreamedQwen38:
             raise Qwen38RuntimeError("continuation block stage is stale or foreign")
         page_router = pending.mlp_page_transaction_owner
         delta_router = pending.delta_head_transaction_owner
+        crystal_transaction = (
+            pending.attention_output_crystal_transaction_owner
+        )
 
         def rollback_coordinate_routes() -> None:
             self._pending_block_stage = None
@@ -3827,6 +4343,7 @@ class StreamedQwen38:
                 page_router.rollback_transaction()
             if delta_router is not None:
                 delta_router.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
 
         row = pending.evidence
         if self._state_poisoned:
@@ -3886,6 +4403,7 @@ class StreamedQwen38:
         except Exception:
             if page_router is not None:
                 page_router.rollback_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
             raise
         try:
             if page_router is not None:
@@ -3893,9 +4411,14 @@ class StreamedQwen38:
         except Exception:
             if delta_router is not None:
                 delta_router.revert_committed_transaction()
+            self._rollback_attention_output_crystal_transaction(crystal_transaction)
             raise
         if delta_router is not None:
             delta_router.finalize_transaction()
+        self._commit_attention_output_crystal_transaction(
+            crystal_transaction,
+            accepted_end_position=row.end_pos,
+        )
         self._layer_states = committed_states
         self._next_position = row.end_pos
         self._state_batch_size = len(row.input_token_ids)
@@ -3994,6 +4517,9 @@ class StreamedQwen38:
                     pending.mlp_page_transaction_owner.rollback_transaction()
                 if pending.delta_head_transaction_owner is not None:
                     pending.delta_head_transaction_owner.rollback_transaction()
+                self._rollback_attention_output_crystal_transaction(
+                    pending.attention_output_crystal_transaction_owner
+                )
             self._pending_block_stage = None
             del pending
         staged: StatefulLayerRangeResult | None = None
@@ -4171,6 +4697,14 @@ class StreamedQwen38:
             raise ValueError("decode accepts exactly one token per batch row")
         if self._next_position == 0:
             raise ValueError("decode requires a completed prefill")
+        if (
+            ids.shape[0] == 1
+            and self.attention_output_crystal_enabled
+            and self.attention_output_crystal_bank is not None
+            and self.delta_probe is None
+        ):
+            stage = self.stage_continuation_block(ids, progress=progress)
+            return self.commit_continuation_block(stage)
         return self.hidden_stateful(
             ids, start_pos=self._next_position, progress=progress
         )

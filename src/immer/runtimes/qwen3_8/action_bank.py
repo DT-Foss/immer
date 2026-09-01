@@ -24,6 +24,7 @@ INFERENCE_ACTION_BANK_SCHEMA = "immer.qwen3.8-inference-action-bank/v1"
 INFERENCE_ACTION_DIRECTIVE_SCHEMA = "immer.qwen3.8-inference-action-directive/v2"
 MAX_ACTION_RECEIPT_BYTES = 32 * 1024
 ACTION_CATALOG = (
+    "attention_output_crystal",
     "compute_crystal",
     "continuation_battery",
     "dynamic_mlp_pages",
@@ -107,6 +108,7 @@ def executed_actions_from_result(
     conversation = execution.get("conversation")
     prefix_sinkhorn = execution.get("prefix_sinkhorn")
     delta_head_router = execution.get("delta_head_router")
+    attention_output_crystal = execution.get("attention_output_crystal")
     draft = execution.get("draft")
     battery_hit = (
         isinstance(anchor, Mapping) and anchor.get("status") == "hit"
@@ -130,6 +132,24 @@ def executed_actions_from_result(
             for field in ("calls", "rows", "logical_bytes_saved")
         ):
             actions = tuple(sorted({*actions, "mlp_head_coordinate"}))
+    if (
+        "qwen_target" in actions
+        and isinstance(attention_output_crystal, Mapping)
+        and attention_output_crystal.get("schema")
+        == "immer.qwen3.8-attention-output-crystal-evidence/v1"
+    ):
+        request = attention_output_crystal.get("request")
+        if isinstance(request, Mapping) and all(
+            isinstance(request.get(field), int)
+            and not isinstance(request.get(field), bool)
+            and request.get(field, 0) > 0
+            for field in (
+                "hits",
+                "skipped_projection_calls",
+                "logical_projection_bytes_saved",
+            )
+        ):
+            actions = tuple(sorted({*actions, "attention_output_crystal"}))
     if isinstance(draft, Mapping):
         crystal = draft.get("context_crystal")
         accepted = (
@@ -198,6 +218,12 @@ class InferenceActionReceipt:
         ):
             _uint(getattr(self, name), name)
         _nonnegative_float(self.request_wall_seconds, "request_wall_seconds")
+        if "attention_output_crystal" in self.actions and (
+            "qwen_target" not in self.actions or self.target_forwards <= 0
+        ):
+            raise ValueError(
+                "attention_output_crystal requires executed target attention"
+            )
 
     @classmethod
     def from_economics(
@@ -357,6 +383,13 @@ class InferenceActionDirective:
                 or any(action not in ACTION_CATALOG for action in actions)
             ):
                 raise ValueError(f"{name} must be sorted known action classes")
+            if (
+                "attention_output_crystal" in actions
+                and "qwen_target" not in actions
+            ):
+                raise ValueError(
+                    f"{name} attention_output_crystal requires qwen_target"
+                )
         if self.draft_enabled is not None and not isinstance(
             self.draft_enabled,
             bool,
@@ -702,16 +735,26 @@ class InferenceActionBank:
             if receipt.runtime_profile_sha256 == profile
             and receipt.status == "ok"
             and "qwen_target" in receipt.actions
-            and "target_verified_draft" in receipt.actions
-            and receipt.saved_qwen_forwards > 0
+            and (
+                "attention_output_crystal" in receipt.actions
+                or (
+                    "target_verified_draft" in receipt.actions
+                    and receipt.saved_qwen_forwards > 0
+                )
+            )
         ]
         transferable_runtime = [
             receipt
             for receipt in receipts
             if receipt.status == "ok"
             and "qwen_target" in receipt.actions
-            and "target_verified_draft" in receipt.actions
-            and receipt.saved_qwen_forwards > 0
+            and (
+                "attention_output_crystal" in receipt.actions
+                or (
+                    "target_verified_draft" in receipt.actions
+                    and receipt.saved_qwen_forwards > 0
+                )
+            )
         ]
         runtime = exact_runtime or transferable_runtime
         runtime.sort(
@@ -724,22 +767,32 @@ class InferenceActionBank:
         )
         if not exact and not parametric and not runtime:
             return None
-        runtime_actions = (
-            tuple(
+        runtime_action_set = (
+            {
                 action
                 for action in runtime[0].actions
                 if action
                 in {
+                    "attention_output_crystal",
                     "compute_crystal",
                     "continuation_battery",
                     "dynamic_mlp_pages",
                     "qwen_target",
                     "target_verified_draft",
                 }
-            )
+            }
             if runtime
-            else ("qwen_target",)
+            else {"qwen_target"}
         )
+        # Exact attention replay is output-preserving and bank identities reject
+        # stale cells.  Once it has saved physical work in this runtime, keep it
+        # additive even when a higher-ranked draft receipt supplied the rest of
+        # the vector.
+        if any("attention_output_crystal" in receipt.actions for receipt in runtime):
+            runtime_action_set.update(
+                {"attention_output_crystal", "qwen_target"}
+            )
+        runtime_actions = tuple(sorted(runtime_action_set))
         if exact:
             primary = exact[0].actions
         elif parametric:
@@ -765,7 +818,11 @@ class InferenceActionBank:
             runtime_profile_sha256=profile,
             primary_actions=primary,
             fallback_actions=fallback,
-            draft_enabled=True if runtime else None,
+            draft_enabled=(
+                True
+                if runtime and "target_verified_draft" in runtime_actions
+                else None
+            ),
             source_signature_sha256s=sources,
             support=len(sources_receipts),
             saved_qwen_forwards=sum(

@@ -11,6 +11,7 @@ import stat
 
 _QWEN_RUNTIME_FILES = (
     "__init__.py",
+    "attention_output_crystal.py",
     "config.py",
     "deltanet_native.c",
     "deltanet_native.py",

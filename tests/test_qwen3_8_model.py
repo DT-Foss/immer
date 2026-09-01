@@ -13,6 +13,10 @@ from safetensors.torch import save_file
 
 import immer.runtimes.qwen3_8.model as qwen_model_module
 from immer.knowledge.streamer import Streamer
+from immer.runtimes.qwen3_8.attention_output_crystal import (
+    AttentionOutputCrystalBank,
+    AttentionOutputCrystalIdentity,
+)
 from immer.runtimes.qwen3_8.config import Qwen38Config
 from immer.runtimes.qwen3_8.draft_verification import (
     DRAFT_VERIFICATION_SCHEMA,
@@ -1337,6 +1341,155 @@ class Qwen38ModelTests(unittest.TestCase):
         self.assertEqual(self.model.next_position, 4)
         with self.assertRaisesRegex(Qwen38RuntimeError, "stale or foreign"):
             self.model.discard_continuation_block(next_stage)
+
+    def test_attention_output_crystal_replays_exact_attention_before_weight_reads(
+        self,
+    ) -> None:
+        pager = Qwen38WeightPager(
+            self.source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=2 * 1024**2,
+        )
+        model = StreamedQwen38(
+            self.config,
+            pager,
+            max_batch_size=1,
+            max_seq_len=32,
+        )
+        mismatched = AttentionOutputCrystalBank(
+            self.root / "mismatched-attention-output-crystals.json",
+            AttentionOutputCrystalIdentity(runtime_math_sha256="f" * 64),
+            max_cells=8,
+        )
+        with self.assertRaisesRegex(Qwen38RuntimeError, "identity.*target"):
+            model.attach_attention_output_crystal_bank(mismatched)
+        bank = AttentionOutputCrystalBank(
+            self.root / "attention-output-crystals.json",
+            AttentionOutputCrystalIdentity(
+                runtime_math_sha256=(
+                    model.attention_output_crystal_runtime_math_sha256()
+                )
+            ),
+            max_cells=64,
+        )
+        model.attach_attention_output_crystal_bank(bank)
+        try:
+            model.prefill([[1, 4]])
+            first_before = pager.metrics()["linear_calls"]
+            first_stage = model.stage_continuation_block([[9, 7]])
+            first_calls = pager.metrics()["linear_calls"] - first_before
+            first_hidden, _ = model.commit_continuation_block(first_stage)
+            first_states = _clone_layer_states(model._layer_states)
+            charged = bank.metrics()
+            self.assertEqual(charged.accepted_captures, 2)
+            self.assertEqual(charged.hit_count, 0)
+
+            model.reset_state()
+            model.prefill([[1, 4]])
+            replay_before = pager.metrics()["linear_calls"]
+            replay_stage = model.stage_continuation_block([[9, 7]])
+            replay_calls = pager.metrics()["linear_calls"] - replay_before
+            replay_hidden, _ = model.commit_continuation_block(replay_stage)
+
+            torch.testing.assert_close(
+                replay_hidden,
+                first_hidden,
+                rtol=0.0,
+                atol=0.0,
+            )
+            _assert_layer_states_equal(self, model._layer_states, first_states)
+            self.assertLess(replay_calls, first_calls)
+            replayed = bank.metrics()
+            self.assertEqual(replayed.hit_count, 2)
+            self.assertEqual(replayed.skipped_projection_calls_saved, 4)
+            self.assertEqual(
+                replayed.logical_projection_bytes_saved,
+                model._full_attention_logical_projection_bytes(),
+            )
+
+            baseline_pager = Qwen38WeightPager(
+                self.source,
+                device="cpu",
+                compute_dtype="bfloat16",
+                max_resident_bytes=2 * 1024**2,
+            )
+            baseline = StreamedQwen38(
+                self.config,
+                baseline_pager,
+                max_batch_size=1,
+                max_seq_len=32,
+            )
+            try:
+                baseline.prefill([[1, 4]])
+                baseline_stage = baseline.stage_continuation_block([[9, 8]])
+                baseline_hidden, _ = baseline.commit_continuation_block(
+                    baseline_stage
+                )
+                baseline_states = _clone_layer_states(baseline._layer_states)
+            finally:
+                baseline.reset_state(release=True)
+                baseline_pager.close()
+
+            model.reset_state()
+            model.prefill([[1, 4]])
+            partial_hit_stage = model.stage_continuation_block([[9, 8]])
+            partial_hit_hidden, _ = model.commit_continuation_block(
+                partial_hit_stage
+            )
+            torch.testing.assert_close(
+                partial_hit_hidden,
+                baseline_hidden,
+                rtol=0.0,
+                atol=0.0,
+            )
+            _assert_layer_states_equal(self, model._layer_states, baseline_states)
+            after_partial_hit = bank.metrics()
+            self.assertEqual(after_partial_hit.hit_count, replayed.hit_count + 1)
+            self.assertEqual(
+                after_partial_hit.skipped_projection_calls_saved,
+                replayed.skipped_projection_calls_saved,
+            )
+
+            model.reset_state()
+            model.prefill([[1, 4]])
+            before_discard = bank.metrics()
+            discarded = model.stage_continuation_block([[9, 7]])
+            model.discard_continuation_block(discarded)
+            after_discard = bank.metrics()
+            self.assertEqual(after_discard.hit_count, before_discard.hit_count)
+            self.assertEqual(
+                after_discard.logical_projection_bytes_saved,
+                before_discard.logical_projection_bytes_saved,
+            )
+
+            model.reset_state()
+            model.prefill([[1, 4]])
+            partial = model.stage_continuation_block([[9, 7]])
+            partial_hidden, _ = model.commit_continuation_prefix(partial, 1)
+            self.assertEqual(tuple(partial_hidden.shape), (1, 1, self.config.dim))
+            after_partial = bank.metrics()
+            self.assertEqual(
+                after_partial.hit_count,
+                after_partial_hit.hit_count + 1,
+            )
+
+            model.reset_state()
+            model.prefill([[1, 4]])
+            direct_before = bank.metrics().hit_count
+            direct_hidden, direct_evidence = model.decode([[9]])
+            self.assertEqual(tuple(direct_hidden.shape), (1, 1, self.config.dim))
+            torch.testing.assert_close(
+                direct_hidden,
+                baseline_hidden[:, :1],
+                rtol=0.0,
+                atol=0.0,
+            )
+            self.assertEqual(direct_evidence.context_mode, "decode")
+            self.assertEqual(bank.metrics().hit_count, direct_before + 1)
+        finally:
+            model.reset_state(release=True)
+            pager.close()
 
     def test_bfloat16_continuation_block_matches_tokenwise_state_bit_exactly(
         self,
@@ -3293,6 +3446,7 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
         _assert_layer_states_equal(self, through_native.layer_states, full.layer_states)
         self.assertEqual(len(full.native_head_crsa_evidence), 1)
         self.assertEqual(below_native.native_head_crsa_evidence, ())
+
         self.assertEqual(
             through_native.native_head_crsa_evidence,
             full.native_head_crsa_evidence,
@@ -3323,6 +3477,66 @@ class Qwen38NativeHeadCrsaModelTests(unittest.TestCase):
             )
         self.assertEqual(self.model._metric(self.pager, "linear_calls"), linears_before)
         self.assertEqual(self.observed, [])
+
+    def test_attention_output_crystal_replays_prefix_sinkhorn_state_exactly(
+        self,
+    ) -> None:
+        pager = Qwen38WeightPager(
+            self.source,
+            device="cpu",
+            compute_dtype="bfloat16",
+            max_resident_bytes=2 * 1024**2,
+        )
+        observed = []
+        model = StreamedQwen38(
+            self.config,
+            pager,
+            native_head_crsa=self.intervention,
+            native_head_crsa_observer=observed.append,
+            max_batch_size=1,
+            max_seq_len=16,
+        )
+        bank = AttentionOutputCrystalBank(
+            self.root / "native-attention-output-crystals.json",
+            AttentionOutputCrystalIdentity(
+                runtime_math_sha256=(
+                    model.attention_output_crystal_runtime_math_sha256()
+                )
+            ),
+            max_cells=128,
+        )
+        model.attach_attention_output_crystal_bank(bank)
+        try:
+            model.prefill([[1, 4]])
+            observed.clear()
+            charged = model.stage_continuation_block([[9, 7]])
+            self.assertEqual(observed, [])
+            charged_hidden, _ = model.commit_continuation_block(charged)
+            charged_evidence = tuple(observed)
+            charged_states = _clone_layer_states(model._layer_states)
+            self.assertEqual(len(charged_evidence), 2)
+
+            model.reset_state()
+            model.prefill([[1, 4]])
+            observed.clear()
+            replay = model.stage_continuation_block([[9, 7]])
+            self.assertEqual(observed, [])
+            replay_hidden, _ = model.commit_continuation_block(replay)
+
+            torch.testing.assert_close(
+                replay_hidden,
+                charged_hidden,
+                rtol=0.0,
+                atol=0.0,
+            )
+            _assert_layer_states_equal(self, model._layer_states, charged_states)
+            self.assertEqual(tuple(observed), charged_evidence)
+            metrics = bank.metrics()
+            self.assertEqual(metrics.hit_count, 14)
+            self.assertEqual(metrics.skipped_projection_calls_saved, 28)
+        finally:
+            model.reset_state(release=True)
+            pager.close()
 
     def test_native_continuation_block_delays_evidence_until_commit(self) -> None:
         self.model.prefill([[1, 4]])

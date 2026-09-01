@@ -350,6 +350,10 @@ class Qwen38SnapshotTests(unittest.TestCase):
         runtime_paths = {
             row["path"] for row in runtime_source_manifest(include_transport=False)
         }
+        self.assertIn(
+            "immer/runtimes/qwen3_8/attention_output_crystal.py",
+            runtime_paths,
+        )
         self.assertIn("immer/runtimes/qwen3_8/native_crsa.py", runtime_paths)
         self.assertIn("immer/runtimes/qwen3_8/native_fork.py", runtime_paths)
 

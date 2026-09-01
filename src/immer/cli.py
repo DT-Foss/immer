@@ -133,6 +133,9 @@ _QWEN38_DEPLOYMENT_ANCHOR_CACHE = (
 _QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-contextual-continuation-v1.json"
 )
+_QWEN38_DEPLOYMENT_ATTENTION_OUTPUT_CRYSTAL_STATE = (
+    _QWEN38_DEPLOYMENT_STATE / "qwen-attention-output-crystal-v1.json"
+)
 _QWEN38_MARKOV_DRAFT_ABI = "immer.qwen3.8-markov-draft-provider/v48"
 _QWEN38_HYBRID_DRAFT_ABI = "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
 _QWEN38_MTP_DRAFT_ABI = "immer.qwen3.5-mtp-draft-provider/v6"
@@ -312,6 +315,7 @@ def _qwen38_service_profile(
     mlp_page_state_path: Path | None,
     draft_window_state_path: Path | None,
     runtime_code_revision: str,
+    attention_output_crystal_state_path: Path | None = None,
 ) -> str:
     """Bind socket clients to the exact output-affecting runtime configuration."""
 
@@ -342,6 +346,7 @@ def _qwen38_service_profile(
         "mlp_page_width",
         "no_inference_economics",
         "no_context_crystal",
+        "no_attention_output_crystal",
         "prefix_sinkhorn",
         "q4_threads",
         "qwen38_anchor_cache",
@@ -365,6 +370,9 @@ def _qwen38_service_profile(
         return value
 
     profile = {
+        "attention_output_crystal": (
+            attention_output_crystal_state_path is not None
+        ),
         "arguments": {
             name: normalized(getattr(args, name, None)) for name in argument_names
         },
@@ -517,6 +525,16 @@ def _qwen38_growing_warm_profile(
     profile = {
         "abi_sha256": _QWEN38_GROWING_WARM_ABI_SHA256,
         "anchor_cache": args.qwen38_anchor_cache is not None,
+        "attention_output_crystal": (
+            None
+            if getattr(args, "attention_output_crystal_state", None) is None
+            else {
+                "evidence_schema": (
+                    "immer.qwen3.8-attention-output-crystal-evidence/v1"
+                ),
+                "output": "exact-full-attention-token-transition/v1",
+            }
+        ),
         "compute_dtype": args.compute_dtype,
         "device": "cpu" if args.device == "auto" else args.device,
         "draft_mode": draft_mode,
@@ -1608,6 +1626,42 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 "hybrid drafting"
             )
         args.context_crystal_state = context_crystal_state_path
+        disable_attention_output_crystal = bool(
+            getattr(args, "no_attention_output_crystal", False)
+        )
+        if disable_attention_output_crystal and getattr(
+            args,
+            "attention_output_crystal_state",
+            None,
+        ) is not None:
+            raise ValueError(
+                "--attention-output-crystal-state and "
+                "--no-attention-output-crystal are mutually exclusive"
+            )
+        attention_output_crystal_state_path = (
+            None
+            if disable_attention_output_crystal
+            else _chat_path(
+                getattr(args, "attention_output_crystal_state", None),
+                "IMMER_QWEN38_ATTENTION_OUTPUT_CRYSTAL_STATE",
+            )
+        )
+        if (
+            not disable_attention_output_crystal
+            and attention_output_crystal_state_path is None
+            and bundle_path == _QWEN38_DEPLOYMENT_ROOT
+            and q4_root is not None
+        ):
+            attention_output_crystal_state_path = (
+                _QWEN38_DEPLOYMENT_ATTENTION_OUTPUT_CRYSTAL_STATE
+            )
+        if attention_output_crystal_state_path is not None and q4_root is None:
+            raise ValueError(
+                "attention-output Crystals require local Q4 execution"
+            )
+        args.attention_output_crystal_state = (
+            attention_output_crystal_state_path
+        )
         disable_draft_window = bool(
             getattr(args, "no_draft_window_controller", False)
         )
@@ -1682,6 +1736,9 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
             markov_atlas_path=markov_atlas_path,
             markov_o1_retention_path=markov_o1_retention_path,
             mlp_page_state_path=mlp_page_state_path,
+            attention_output_crystal_state_path=(
+                attention_output_crystal_state_path
+            ),
             draft_window_state_path=draft_window_state_path,
             runtime_code_revision=runtime_code_revision,
         )
@@ -2135,6 +2192,11 @@ def _chat_qwen38(args: argparse.Namespace) -> int:
                 None
                 if context_crystal_state_path is None
                 else str(context_crystal_state_path)
+            ),
+            attention_output_crystal_state_path=(
+                None
+                if attention_output_crystal_state_path is None
+                else str(attention_output_crystal_state_path)
             ),
             mtp_draft_state_path=mtp_draft_state,
             draft_window_state_path=(
@@ -3217,6 +3279,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-context-crystal",
         action="store_true",
         help="disable the deployed target-hidden continuation Crystal bank",
+    )
+    chat.add_argument(
+        "--attention-output-crystal-state",
+        help=(
+            "persistent exact full-attention outputs that skip repeated "
+            "Q/K/V/O projections"
+        ),
+    )
+    chat.add_argument(
+        "--no-attention-output-crystal",
+        action="store_true",
+        help="disable the deployed exact attention-output Crystal bank",
     )
     chat.add_argument(
         "--mtp-draft-state",

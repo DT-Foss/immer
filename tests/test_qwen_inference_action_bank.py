@@ -277,6 +277,137 @@ class InferenceActionReceiptTests(unittest.TestCase):
             executed_actions_from_result(result, economics),
         )
 
+    def test_exact_attention_output_crystal_records_physical_replay(self) -> None:
+        economics = _economics(
+            "attention-output-crystal",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "receipt": {
+                    "qwen": {
+                        "attention_output_crystal": {
+                            "schema": (
+                                "immer.qwen3.8-attention-output-crystal-evidence/v1"
+                            ),
+                            "request": {
+                                "hits": 2,
+                                "logical_projection_bytes_saved": 8_192,
+                                "skipped_projection_calls": 8,
+                            },
+                        }
+                    }
+                }
+            },
+        )
+
+        actions = executed_actions_from_result(result, economics)
+
+        self.assertEqual(actions, ("attention_output_crystal", "qwen_target"))
+        receipt = InferenceActionReceipt.from_economics(
+            economics,
+            executed_actions=actions,
+        )
+        self.assertEqual(receipt.actions, actions)
+        self.assertEqual(receipt.saved_qwen_forwards, 0)
+
+    def test_attention_output_crystal_requires_exact_positive_physical_work(
+        self,
+    ) -> None:
+        economics = _economics(
+            "attention-output-crystal-invalid",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        invalid_values = (
+            ("hits", 0),
+            ("hits", True),
+            ("skipped_projection_calls", 0),
+            ("logical_projection_bytes_saved", 0),
+        )
+        for field, invalid in invalid_values:
+            with self.subTest(field=field, invalid=invalid):
+                request = {
+                    "hits": 2,
+                    "logical_projection_bytes_saved": 8_192,
+                    "skipped_projection_calls": 8,
+                }
+                request[field] = invalid
+                result = Result(
+                    ExecutionStatus.OK,
+                    "qwen3.8.causal-chat",
+                    output="answer",
+                    evidence={
+                        "attention_output_crystal": {
+                            "schema": (
+                                "immer.qwen3.8-attention-output-crystal-evidence/v1"
+                            ),
+                            "request": request,
+                        }
+                    },
+                )
+                self.assertNotIn(
+                    "attention_output_crystal",
+                    executed_actions_from_result(result, economics),
+                )
+
+        near_evidence = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "attention_output_crystal": {
+                    "schema": "immer.qwen3.8-attention-output-crystal-near/v1",
+                    "request": {
+                        "hits": 2,
+                        "logical_projection_bytes_saved": 8_192,
+                        "skipped_projection_calls": 8,
+                    },
+                }
+            },
+        )
+        self.assertNotIn(
+            "attention_output_crystal",
+            executed_actions_from_result(near_evidence, economics),
+        )
+
+        zero_target = _economics(
+            "attention-output-crystal-zero-target",
+            draft=False,
+            pages=False,
+            target=0,
+            saved=0,
+        )
+        self.assertNotIn(
+            "attention_output_crystal",
+            executed_actions_from_result(
+                Result(
+                    ExecutionStatus.OK,
+                    "qwen3.8.causal-chat",
+                    output="answer",
+                    evidence={
+                        "attention_output_crystal": {
+                            "schema": (
+                                "immer.qwen3.8-attention-output-crystal-evidence/v1"
+                            ),
+                            "request": {
+                                "hits": 2,
+                                "logical_projection_bytes_saved": 8_192,
+                                "skipped_projection_calls": 8,
+                            },
+                        }
+                    },
+                ),
+                zero_target,
+            ),
+        )
+
 
 class InferenceActionBankTests(unittest.TestCase):
     def test_observe_restart_duplicate_and_ranking(self) -> None:
@@ -427,6 +558,95 @@ class InferenceActionBankTests(unittest.TestCase):
                     saved_qwen_forwards=changes.get("saved_qwen_forwards", 1),
                     draft_window_ceiling=16,
                 )
+
+    def test_attention_output_crystal_recommends_without_draft_savings(self) -> None:
+        economics = _economics(
+            "attention-runtime",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        result = Result(
+            ExecutionStatus.OK,
+            "qwen3.8.causal-chat",
+            output="answer",
+            evidence={
+                "attention_output_crystal": {
+                    "schema": (
+                        "immer.qwen3.8-attention-output-crystal-evidence/v1"
+                    ),
+                    "request": {
+                        "hits": 1,
+                        "logical_projection_bytes_saved": 4_096,
+                        "skipped_projection_calls": 4,
+                    },
+                }
+            },
+        )
+        actions = executed_actions_from_result(result, economics)
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            observation = bank.observe(economics, executed_actions=actions)
+            directive = bank.recommend(
+                question_sha256=_sha("new attention question"),
+                runtime_profile_sha256=_sha("other profile"),
+            )
+
+        self.assertEqual(
+            observation.snapshot["action_catalog"][0],
+            {"action": "attention_output_crystal", "observed_requests": 1},
+        )
+        assert directive is not None
+        self.assertEqual(
+            directive.primary_actions,
+            ("attention_output_crystal", "qwen_target"),
+        )
+        self.assertEqual(directive.fallback_actions, directive.primary_actions)
+        self.assertIsNone(directive.draft_enabled)
+        self.assertEqual(directive.saved_qwen_forwards, 0)
+        self.assertIsNone(directive.draft_window_ceiling)
+        self.assertEqual(
+            InferenceActionDirective.from_document(directive.to_document()),
+            directive,
+        )
+
+        with self.assertRaises(ValueError):
+            InferenceActionDirective(
+                question_sha256=_sha("question"),
+                runtime_profile_sha256=_sha("profile"),
+                primary_actions=("attention_output_crystal",),
+                fallback_actions=("qwen_target",),
+                draft_enabled=False,
+                source_signature_sha256s=("3" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+            )
+
+    def test_attention_replay_stays_additive_to_higher_ranked_drafting(self) -> None:
+        attention = _economics(
+            "attention-additive",
+            draft=False,
+            pages=False,
+            saved=0,
+        )
+        attention_actions = (
+            "attention_output_crystal",
+            "qwen_target",
+        )
+        draft = _economics("higher-ranked-draft", saved=5)
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            bank.observe(attention, executed_actions=attention_actions)
+            bank.observe(draft)
+            directive = bank.recommend(
+                question_sha256=_sha("additive question"),
+                runtime_profile_sha256=_sha("other profile"),
+            )
+
+        assert directive is not None
+        self.assertIn("attention_output_crystal", directive.primary_actions)
+        self.assertIn("target_verified_draft", directive.primary_actions)
+        self.assertTrue(directive.draft_enabled)
 
     def test_reconcile_recovers_a_missed_derived_event_and_tamper_is_hard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -27,6 +27,11 @@ from ..o1_state.markov_retention import (
 from ...contracts import ExecutionStatus, Request, Result
 from ..deepseek_v4.causal_weights import CausalWeightMount, LogicalModelIdentity
 from .action_bank import InferenceActionBankError, InferenceActionDirective
+from .attention_output_crystal import (
+    ATTENTION_OUTPUT_CRYSTAL_EVIDENCE_SCHEMA,
+    AttentionOutputCrystalBank,
+    AttentionOutputCrystalIdentity,
+)
 from .bundle import verify_qwen38_causal_mount
 from .config import (
     OFFICIAL_REPO_ID,
@@ -813,6 +818,16 @@ class _OwnedRuntime:
             self.model.reset_state(release=True)
         except Exception as exc:  # release the remaining owners regardless
             failures.append(exc)
+        detach_attention_crystal = getattr(
+            self.model,
+            "attach_attention_output_crystal_bank",
+            None,
+        )
+        if callable(detach_attention_crystal):
+            try:
+                detach_attention_crystal(None)
+            except Exception as exc:
+                failures.append(exc)
         self.model.mlp_sparse_executor = None
         self.model.mlp_page_router = None
         self.model.delta_head_router = None
@@ -1289,6 +1304,7 @@ class Qwen38CausalChat:
         markov_atlas_path: str | Path | None = None,
         markov_o1_retention_path: str | Path | None = None,
         contextual_continuation_state_path: str | Path | None = None,
+        attention_output_crystal_state_path: str | Path | None = None,
         mtp_draft_state_path: str | Path | None = None,
         draft_window_state_path: str | Path | None = None,
         fast_mlp_root: str | Path | None = None,
@@ -1455,6 +1471,13 @@ class Qwen38CausalChat:
             raise TypeError(
                 "contextual_continuation_state_path must be a local path or None"
             )
+        if attention_output_crystal_state_path is not None and not isinstance(
+            attention_output_crystal_state_path,
+            (str, Path),
+        ):
+            raise TypeError(
+                "attention_output_crystal_state_path must be a local path or None"
+            )
         if mtp_draft_state_path is not None and not isinstance(
             mtp_draft_state_path, (str, Path)
         ):
@@ -1517,6 +1540,15 @@ class Qwen38CausalChat:
             )
         if contextual_continuation_state_path is not None and q4_root is None:
             raise ValueError("contextual continuation Crystals require Q4 execution")
+        if attention_output_crystal_state_path is not None and q4_root is None:
+            raise ValueError("attention-output Crystals require Q4 execution")
+        if (
+            attention_output_crystal_state_path is not None
+            and compute_dtype not in {"auto", "bfloat16"}
+        ):
+            raise ValueError(
+                "attention-output Crystals require bfloat16 compute_dtype"
+            )
         if draft_mode not in {"hybrid", "mtp"} and mtp_draft_state_path is not None:
             raise ValueError("mtp_draft_state_path requires MTP or hybrid draft mode")
         if draft_mode == "mtp" and mtp_draft_state_path is None:
@@ -1687,6 +1719,11 @@ class Qwen38CausalChat:
             if contextual_continuation_state_path is None
             else Path(contextual_continuation_state_path).expanduser().absolute()
         )
+        self._attention_output_crystal_state_path = (
+            None
+            if attention_output_crystal_state_path is None
+            else Path(attention_output_crystal_state_path).expanduser().absolute()
+        )
         self._mtp_draft_state_path = (
             None
             if mtp_draft_state_path is None
@@ -1746,6 +1783,7 @@ class Qwen38CausalChat:
         self._last_fast_mlp_evidence: dict[str, Any] | None = None
         self._last_delta_head_evidence: dict[str, Any] | None = None
         self._last_exact_head_evidence: dict[str, Any] | None = None
+        self._last_attention_output_crystal_evidence: dict[str, int] | None = None
         self._draft_window_selection: DraftWindowSelection | None = None
         self._action_bank_draft_window_ceiling: int | None = None
         self._draft_window_policy_metrics: dict[str, Any] | None = None
@@ -1757,6 +1795,7 @@ class Qwen38CausalChat:
         self._markov_atlas: MarkovTokenAtlas | None = None
         self._markov_o1_retention: O1MarkovRetention | None = None
         self._contextual_continuation_bank: ContextualContinuationBank | None = None
+        self._attention_output_crystal_bank: AttentionOutputCrystalBank | None = None
         self._conversation_session_id: str | None = None
         self._conversation_prefix_token_ids: tuple[int, ...] = ()
         self._conversation_mtp_carry: Qwen35MtpCarry | None = None
@@ -2087,6 +2126,18 @@ class Qwen38CausalChat:
                 "configuration": asdict(self._native_head_crsa),
                 "schema": self._native_head_crsa.evidence_schema,
             }
+        if self._attention_output_crystal_state_path is not None:
+            bank = self._attention_output_crystal_bank
+            policy["attention_output_crystal"] = {
+                "enabled": True,
+                "evidence_schema": ATTENTION_OUTPUT_CRYSTAL_EVIDENCE_SCHEMA,
+                "identity": (
+                    None if bank is None else bank.identity.to_record()
+                ),
+                "identity_sha256": (
+                    None if bank is None else bank.identity.identity_sha256
+                ),
+            }
         if self._q4_root is not None:
             policy["q4"] = {"enabled": True, "threads": self._q4_threads}
             runtime = self._runtime
@@ -2324,6 +2375,7 @@ class Qwen38CausalChat:
             self._result_cell_code_revision is None
             or self._q4_root is None
             or self._delta_head_state_path is not None
+            or self._native_head_crsa is not None
         ):
             return None
         from .cartography_probe import prompt_token_sha256
@@ -2603,6 +2655,7 @@ class Qwen38CausalChat:
         self._last_fast_mlp_evidence = None
         self._last_delta_head_evidence = None
         self._last_exact_head_evidence = None
+        self._last_attention_output_crystal_evidence = None
         fast_mount = getattr(runtime, "fast_mlp_mount", None)
         fast_before = None if fast_mount is None else fast_mount.metrics()
         delta_router = getattr(runtime, "delta_head_router", None)
@@ -3297,6 +3350,69 @@ class Qwen38CausalChat:
         self._last_delta_head_evidence = request
         return request
 
+    def _attention_output_crystal_metrics(self) -> dict[str, int] | None:
+        bank = self._attention_output_crystal_bank
+        if bank is None:
+            return None
+        metrics = bank.metrics()
+        to_dict = getattr(metrics, "to_dict", None)
+        if not callable(to_dict):
+            raise Qwen38ChatError(
+                "attention-output Crystal metrics lack to_dict()"
+            )
+        record = to_dict()
+        if not isinstance(record, Mapping):
+            raise Qwen38ChatError(
+                "attention-output Crystal metrics are not a mapping"
+            )
+        identity_sha256 = record.get("identity_sha256")
+        if identity_sha256 != bank.identity.identity_sha256:
+            raise Qwen38ChatError(
+                "attention-output Crystal metrics changed runtime identity"
+            )
+        counters: dict[str, int] = {}
+        for field in (
+            "hit_count",
+            "skipped_projection_calls_saved",
+            "logical_projection_bytes_saved",
+        ):
+            value = record.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise Qwen38ChatError(
+                    f"attention-output Crystal {field} is invalid"
+                )
+            counters[field] = value
+        return counters
+
+    def _record_attention_output_crystal_request(
+        self,
+        before: Mapping[str, int] | None,
+        after: Mapping[str, int] | None,
+    ) -> dict[str, int] | None:
+        if before is None or after is None:
+            return None
+        fields = {
+            "hits": "hit_count",
+            "skipped_projection_calls": "skipped_projection_calls_saved",
+            "logical_projection_bytes_saved": (
+                "logical_projection_bytes_saved"
+            ),
+        }
+        request = {
+            output: int(after[source]) - int(before[source])
+            for output, source in fields.items()
+        }
+        if any(value < 0 for value in request.values()):
+            raise Qwen38ChatError(
+                "attention-output Crystal request counters moved backwards"
+            )
+        self._last_attention_output_crystal_evidence = request
+        return request
+
     def _base_evidence(self) -> dict[str, Any]:
         evidence: dict[str, Any] = {
             "execution": "local-authenticated-causal-bundle/v1",
@@ -3359,6 +3475,13 @@ class Qwen38CausalChat:
             evidence["contextual_continuation"] = (
                 self._contextual_continuation_bank.metrics().to_dict()
             )
+        if self._attention_output_crystal_bank is not None:
+            identity = self._attention_output_crystal_bank.identity
+            evidence["attention_output_crystal"] = {
+                "identity": identity.to_record(),
+                "identity_sha256": identity.identity_sha256,
+                "schema": ATTENTION_OUTPUT_CRYSTAL_EVIDENCE_SCHEMA,
+            }
         return evidence
 
     def _load_locked(self) -> Any:
@@ -3483,6 +3606,46 @@ class Qwen38CausalChat:
                     state_path,
                     contextual_identity,
                 )
+            attention_output_crystal_bank = None
+            if self._attention_output_crystal_state_path is not None:
+                runtime_math_identity = getattr(
+                    model,
+                    "attention_output_crystal_runtime_math_sha256",
+                    None,
+                )
+                if not callable(runtime_math_identity):
+                    raise TypeError(
+                        "runtime model lacks attention-output Crystal identity"
+                    )
+                runtime_math_sha256 = runtime_math_identity()
+                if not _is_sha256(runtime_math_sha256):
+                    raise Qwen38ChatError(
+                        "runtime model returned an invalid attention-output "
+                        "Crystal identity"
+                    )
+                crystal_identity = AttentionOutputCrystalIdentity(
+                    runtime_math_sha256=runtime_math_sha256
+                )
+                configured = self._attention_output_crystal_state_path
+                suffix = configured.suffix or ".json"
+                state_path = configured.with_name(
+                    f"{configured.stem}.attention-output-"
+                    f"{crystal_identity.identity_sha256[:16]}{suffix}"
+                )
+                attention_output_crystal_bank = AttentionOutputCrystalBank(
+                    state_path,
+                    crystal_identity,
+                )
+                attach_bank = getattr(
+                    model,
+                    "attach_attention_output_crystal_bank",
+                    None,
+                )
+                if not callable(attach_bank):
+                    raise TypeError(
+                        "runtime model must attach attention-output Crystal banks"
+                    )
+                attach_bank(attention_output_crystal_bank)
             model_context = _positive_int(
                 getattr(model, "max_seq_len", None), "runtime model max_seq_len"
             )
@@ -3518,6 +3681,7 @@ class Qwen38CausalChat:
         self._markov_atlas = markov_atlas
         self._markov_o1_retention = markov_o1_retention
         self._contextual_continuation_bank = contextual_continuation_bank
+        self._attention_output_crystal_bank = attention_output_crystal_bank
         return runtime
 
     def _template_anchor_prefix(
@@ -3630,6 +3794,26 @@ class Qwen38CausalChat:
         )
         if any(token_id >= vocab_size for token_id in prompt_ids):
             raise _RequestRejected("prompt token is outside the checkpoint vocabulary")
+
+        attention_output_crystal_applied = False
+        attention_output_crystal_directive_selected = False
+        if self._attention_output_crystal_bank is not None:
+            attention_output_crystal_applied = True
+            attention_output_crystal_directive_selected = (
+                action_directive is not None
+                and "attention_output_crystal"
+                in action_directive.primary_actions
+            )
+            set_attention_output_crystal_enabled = getattr(
+                runtime.model,
+                "set_attention_output_crystal_enabled",
+                None,
+            )
+            if not callable(set_attention_output_crystal_enabled):
+                raise Qwen38ChatError(
+                    "runtime model cannot select attention-output Crystal execution"
+                )
+            set_attention_output_crystal_enabled(True)
 
         reuse_status = "disabled" if session_id is None else "cold"
         reused_prefix_tokens = 0
@@ -3890,6 +4074,9 @@ class Qwen38CausalChat:
             if isinstance(sequence, int) and not isinstance(sequence, bool):
                 retention_before_sequence = sequence
         physical_read_before = _linux_process_read_bytes()
+        attention_output_crystal_before = (
+            self._attention_output_crystal_metrics()
+        )
         request_started = time.perf_counter()
         raw_generated, raw_evidence = self._generate_locked(
             runtime,
@@ -3897,6 +4084,10 @@ class Qwen38CausalChat:
             generation_options,
         )
         request_seconds = time.perf_counter() - request_started
+        self._record_attention_output_crystal_request(
+            attention_output_crystal_before,
+            self._attention_output_crystal_metrics(),
+        )
         q4_after = _runtime_q4_metrics(runtime)
         mlp_page_persistence_error = None
         if mlp_page_router is not None:
@@ -4095,6 +4286,12 @@ class Qwen38CausalChat:
         if action_directive is not None:
             evidence["inference_action_directive"] = {
                 "applied": {
+                    "attention_output_crystal": (
+                        attention_output_crystal_applied
+                    ),
+                    "attention_output_crystal_directive_selected": (
+                        attention_output_crystal_directive_selected
+                    ),
                     "draft_enabled": self._last_draft_evidence is not None,
                     "draft_window_ceiling": (
                         None
@@ -4120,6 +4317,13 @@ class Qwen38CausalChat:
             evidence["exact_head"] = {
                 **dict(evidence["exact_head"]),
                 "request": dict(self._last_exact_head_evidence),
+            }
+        if self._last_attention_output_crystal_evidence is not None:
+            evidence["attention_output_crystal"] = {
+                **dict(evidence["attention_output_crystal"]),
+                "request": dict(
+                    self._last_attention_output_crystal_evidence
+                ),
             }
         settle_page_reward = getattr(
             mlp_page_router,
@@ -4682,6 +4886,7 @@ class Qwen38CausalChat:
             self._markov_atlas = None
             self._markov_o1_retention = None
             self._contextual_continuation_bank = None
+            self._attention_output_crystal_bank = None
             self._clear_conversation_binding()
             self._closed = True
             if runtime is not None:

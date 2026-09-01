@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
@@ -48,6 +48,10 @@ from immer.runtimes.qwen3_8.hybrid_draft import (
 from immer.runtimes.qwen3_8.action_bank import (
     InferenceActionBank,
     InferenceActionDirective,
+)
+from immer.runtimes.qwen3_8.attention_output_crystal import (
+    ATTENTION_OUTPUT_CRYSTAL_EVIDENCE_SCHEMA,
+    AttentionOutputCrystalIdentity,
 )
 from immer.runtimes.qwen3_8.inference_economics import (
     InferenceEconomicsLedger,
@@ -524,6 +528,188 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIn(".context-", state_path.name)
         self.assertEqual(state_path.suffix, ".json")
         self.assertIs(chat._contextual_continuation_bank.identity, identity)
+        chat.close()
+
+    def test_attention_output_crystal_mounts_identity_suffixed_and_attaches(
+        self,
+    ) -> None:
+        runtime = _Runtime()
+        runtime.model.attach_attention_output_crystal_bank = Mock()
+        runtime.model.attention_output_crystal_runtime_math_sha256 = Mock(
+            return_value="e" * 64
+        )
+        identity = AttentionOutputCrystalIdentity("e" * 64)
+        opened = SimpleNamespace(
+            identity=identity,
+            metrics=Mock(),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            configured = Path(temporary) / "attention.json"
+            chat = _chat(
+                runtime,
+                q4_root="/q4",
+                attention_output_crystal_state_path=configured,
+            )
+            with patch(
+                "immer.runtimes.qwen3_8.adapter.AttentionOutputCrystalBank",
+                return_value=opened,
+            ) as constructor:
+                chat._load_locked()
+
+        state_path, mounted_identity = constructor.call_args.args
+        self.assertEqual(mounted_identity, identity)
+        self.assertIn(".attention-output-", state_path.name)
+        self.assertIn(identity.identity_sha256[:16], state_path.name)
+        self.assertEqual(state_path.suffix, ".json")
+        runtime.model.attention_output_crystal_runtime_math_sha256.assert_called_once_with()
+        runtime.model.attach_attention_output_crystal_bank.assert_called_once_with(
+            opened
+        )
+        self.assertIs(chat._attention_output_crystal_bank, opened)
+        chat.close()
+
+    def test_attention_output_crystal_evidence_is_request_local_delta(self) -> None:
+        runtime = _Runtime()
+        runtime.model.set_attention_output_crystal_enabled = Mock()
+        chat = _chat(runtime)
+        chat._load_locked()
+        identity = AttentionOutputCrystalIdentity("e" * 64)
+
+        def metrics(values):
+            return SimpleNamespace(
+                to_dict=lambda: {
+                    "hit_count": values[0],
+                    "identity_sha256": identity.identity_sha256,
+                    "logical_projection_bytes_saved": values[2],
+                    "skipped_projection_calls_saved": values[1],
+                }
+            )
+
+        bank = SimpleNamespace(
+            identity=identity,
+            metrics=Mock(
+                side_effect=(
+                    metrics((7, 28, 8192)),
+                    metrics((9, 36, 12_288)),
+                )
+            ),
+        )
+        chat._attention_output_crystal_state_path = Path("/state/attention.json")
+        chat._attention_output_crystal_bank = bank
+
+        result = chat.handle(Request("chat", "hello"))
+
+        self.assertTrue(result.ok)
+        evidence = result.evidence["attention_output_crystal"]
+        self.assertEqual(evidence["schema"], ATTENTION_OUTPUT_CRYSTAL_EVIDENCE_SCHEMA)
+        self.assertEqual(evidence["identity"], identity.to_record())
+        self.assertEqual(evidence["identity_sha256"], identity.identity_sha256)
+        self.assertEqual(
+            evidence["request"],
+            {
+                "hits": 2,
+                "logical_projection_bytes_saved": 4096,
+                "skipped_projection_calls": 8,
+            },
+        )
+        self.assertNotIn("hello", json.dumps(evidence, sort_keys=True))
+        runtime.model.set_attention_output_crystal_enabled.assert_called_once_with(
+            True
+        )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter._digest",
+            side_effect=lambda value: value,
+        ):
+            policy = chat._result_cell_generation_policy_sha256()
+        self.assertEqual(
+            policy["attention_output_crystal"]["identity_sha256"],
+            identity.identity_sha256,
+        )
+        chat.close()
+
+    def test_action_directive_keeps_configured_attention_crystal_discovery(
+        self,
+    ) -> None:
+        runtime = _Runtime()
+        runtime.model.set_attention_output_crystal_enabled = Mock()
+        chat = _chat(runtime)
+        chat._load_locked()
+        identity = AttentionOutputCrystalIdentity("e" * 64)
+        stable_metrics = SimpleNamespace(
+            to_dict=lambda: {
+                "hit_count": 0,
+                "identity_sha256": identity.identity_sha256,
+                "logical_projection_bytes_saved": 0,
+                "skipped_projection_calls_saved": 0,
+            }
+        )
+        chat._attention_output_crystal_state_path = Path("/state/attention.json")
+        chat._attention_output_crystal_bank = SimpleNamespace(
+            identity=identity,
+            metrics=Mock(return_value=stable_metrics),
+        )
+
+        def directive(actions):
+            return InferenceActionDirective(
+                question_sha256=hashlib.sha256(b"hello").hexdigest(),
+                runtime_profile_sha256="2" * 64,
+                primary_actions=actions,
+                fallback_actions=actions,
+                draft_enabled=False,
+                source_signature_sha256s=("3" * 64,),
+                support=1,
+                saved_qwen_forwards=0,
+            )
+
+        disabled = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {
+                    QWEN38_INFERENCE_ACTION_METADATA: directive(
+                        ("qwen_target",)
+                    ).to_document()
+                },
+            )
+        )
+        enabled = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {
+                    QWEN38_INFERENCE_ACTION_METADATA: directive(
+                        ("attention_output_crystal", "qwen_target")
+                    ).to_document()
+                },
+            )
+        )
+
+        self.assertTrue(disabled.ok, disabled.reason)
+        self.assertTrue(enabled.ok, enabled.reason)
+        self.assertTrue(
+            disabled.evidence["inference_action_directive"]["applied"][
+                "attention_output_crystal"
+            ]
+        )
+        self.assertTrue(
+            enabled.evidence["inference_action_directive"]["applied"][
+                "attention_output_crystal"
+            ]
+        )
+        self.assertFalse(
+            disabled.evidence["inference_action_directive"]["applied"][
+                "attention_output_crystal_directive_selected"
+            ]
+        )
+        self.assertTrue(
+            enabled.evidence["inference_action_directive"]["applied"][
+                "attention_output_crystal_directive_selected"
+            ]
+        )
+        self.assertEqual(
+            runtime.model.set_attention_output_crystal_enabled.call_args_list,
+            [call(True), call(True)],
+        )
         chat.close()
 
     def test_draft_window_identity_binds_page_route_width_and_joint_policy(
@@ -1946,7 +2132,12 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn("draft", result.evidence)
         self.assertEqual(
             result.evidence["inference_action_directive"]["applied"],
-            {"draft_enabled": False, "draft_window_ceiling": None},
+            {
+                "attention_output_crystal": False,
+                "attention_output_crystal_directive_selected": False,
+                "draft_enabled": False,
+                "draft_window_ceiling": None,
+            },
         )
         self.assertEqual(
             result.evidence["inference_action_directive"]["directive"],
@@ -3338,6 +3529,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
                 **common,
                 mlp_page_state_path=root / "pages-a.json",
             )
+            args.attention_output_crystal_state = root / "attention.json"
+            crystal_routed = _qwen38_growing_warm_profile(
+                **common,
+                mlp_page_state_path=root / "pages-a.json",
+            )
+            args.attention_output_crystal_state = root / "attention-b.json"
+            same_crystal_other_file = _qwen38_growing_warm_profile(
+                **common,
+                mlp_page_state_path=root / "pages-a.json",
+            )
+            args.attention_output_crystal_state = None
             same_policy_other_file = _qwen38_growing_warm_profile(
                 **common,
                 mlp_page_state_path=root / "pages-b.json",
@@ -3384,6 +3586,8 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         self.assertIsNotNone(routed)
         self.assertNotEqual(disabled, routed)
+        self.assertNotEqual(routed, crystal_routed)
+        self.assertEqual(crystal_routed, same_crystal_other_file)
         self.assertEqual(routed, same_policy_other_file)
         self.assertNotEqual(routed, changed_width)
         self.assertNotEqual(routed, changed_policy)
@@ -3527,11 +3731,17 @@ class Qwen38CausalChatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             deployed = Path(temporary) / "deployed"
             (deployed / "causal" / "q4-base-v2").mkdir(parents=True)
+            attention_state = Path(temporary) / "attention-output.json"
             with (
                 patch.dict("os.environ", {}, clear=True),
                 patch(
                     "immer.cli._QWEN38_DEPLOYMENT_ROOT",
                     deployed,
+                ),
+                patch(
+                    "immer.cli."
+                    "_QWEN38_DEPLOYMENT_ATTENTION_OUTPUT_CRYSTAL_STATE",
+                    attention_state,
                 ),
                 patch(
                     "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
@@ -3559,6 +3769,10 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIsNone(options["mlp_page_state_path"])
         self.assertIsNone(options["draft_mode"])
         self.assertIsNone(options["markov_draft_state_path"])
+        self.assertEqual(
+            options["attention_output_crystal_state_path"],
+            str(attention_state),
+        )
 
     def test_cli_deployment_mounts_existing_continuation_battery(self) -> None:
         qwen = _chat(_Runtime())
@@ -3735,6 +3949,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
                         "--raw-qwen",
                         "--no-mlp-page-route",
                         "--no-context-crystal",
+                        "--no-attention-output-crystal",
                     ]
                 )
 
@@ -3743,6 +3958,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["q4_root"], str(q4))
         self.assertIsNone(options["mlp_page_state_path"])
         self.assertIsNone(options["contextual_continuation_state_path"])
+        self.assertIsNone(options["attention_output_crystal_state_path"])
 
     def test_cli_deployment_keeps_markov_as_an_explicit_opt_out(self) -> None:
         qwen = _chat(_Runtime())
@@ -4587,6 +4803,60 @@ class Qwen38CausalChatTests(unittest.TestCase):
             options["delta_head_state_path"],
             "/state/qwen-delta-head.json",
         )
+
+    def test_cli_wires_and_can_explicitly_disable_attention_output_crystals(
+        self,
+    ) -> None:
+        qwen = _chat(_Runtime())
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38CausalChat",
+            return_value=qwen,
+        ) as constructor:
+            with redirect_stdout(io.StringIO()):
+                code = main(
+                    [
+                        "chat",
+                        "hello",
+                        "--qwen38-causal-bundle",
+                        "/models/qwen.causal",
+                        "--qwen38-tokenizer",
+                        "/models/tokenizer.json",
+                        "--qwen38-q4",
+                        "/models/qwen-q4",
+                        "--attention-output-crystal-state",
+                        "/state/attention-output.json",
+                        "--raw-qwen",
+                        "--no-markov-draft",
+                    ]
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            constructor.call_args.kwargs[
+                "attention_output_crystal_state_path"
+            ],
+            "/state/attention-output.json",
+        )
+
+        with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            conflict = main(
+                [
+                    "chat",
+                    "hello",
+                    "--qwen38-causal-bundle",
+                    "/models/qwen.causal",
+                    "--qwen38-tokenizer",
+                    "/models/tokenizer.json",
+                    "--qwen38-q4",
+                    "/models/qwen-q4",
+                    "--attention-output-crystal-state",
+                    "/state/attention-output.json",
+                    "--no-attention-output-crystal",
+                    "--raw-qwen",
+                    "--no-markov-draft",
+                ]
+            )
+        self.assertEqual(conflict, 2)
 
     def test_cli_wires_delta_heads_without_legacy_fast_mlp(self) -> None:
         qwen = _chat(_Runtime())
