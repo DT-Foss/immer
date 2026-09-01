@@ -331,6 +331,7 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
                 "forward_passes",
                 "generated_tokens",
                 "linear_calls",
+                "output_tokens_per_second",
                 "prompt_tokens",
                 "seconds",
                 "source_body_bytes",
@@ -506,8 +507,13 @@ def _qwen_summary(result: Result) -> dict[str, Any]:
             key: runtime_metrics[key]
             for key in (
                 "generation_wall_seconds",
+                "major_page_faults",
+                "minor_page_faults",
                 "physical_read_bytes",
+                "process_current_rss_bytes",
                 "process_peak_rss_bytes",
+                "system_cpu_seconds",
+                "user_cpu_seconds",
             )
             if key in runtime_metrics
         }

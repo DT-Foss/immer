@@ -237,6 +237,7 @@ class QwenFertigChatTests(unittest.TestCase):
                 "generation": {
                     **dict(base.evidence["generation"]),
                     "linear_calls": 90,
+                    "output_tokens_per_second": 1.2,
                     "seconds": 2.5,
                     "source_body_bytes": 300,
                     "time_to_first_token_seconds": 1.25,
@@ -326,8 +327,13 @@ class QwenFertigChatTests(unittest.TestCase):
                 },
                 "runtime_metrics": {
                     "generation_wall_seconds": 2.75,
+                    "major_page_faults": 3,
+                    "minor_page_faults": 456,
                     "physical_read_bytes": 123,
+                    "process_current_rss_bytes": 768,
                     "process_peak_rss_bytes": 1024,
+                    "system_cpu_seconds": 0.75,
+                    "user_cpu_seconds": 2.25,
                 },
                 "runtime_reward": {
                     "accepted_draft_tokens": 5,
@@ -371,8 +377,20 @@ class QwenFertigChatTests(unittest.TestCase):
         qwen_receipt = _receipt(result)["qwen"]
         self.assertEqual(qwen_receipt["generation"]["seconds"], 2.5)
         self.assertEqual(
+            qwen_receipt["generation"]["output_tokens_per_second"],
+            1.2,
+        )
+        self.assertEqual(
             qwen_receipt["runtime_metrics"]["process_peak_rss_bytes"],
             1024,
+        )
+        self.assertEqual(
+            qwen_receipt["runtime_metrics"]["minor_page_faults"],
+            456,
+        )
+        self.assertEqual(
+            qwen_receipt["runtime_metrics"]["system_cpu_seconds"],
+            0.75,
         )
         self.assertEqual(
             qwen_receipt["q4"]["request"]["page_mlp_weight_bytes"],
