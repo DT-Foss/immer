@@ -1923,7 +1923,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
             self.assertNotIn(current, compatible)
             chat.close()
 
-    def test_hybrid_wave_gate_migrates_v29_window_economics(self) -> None:
+    def test_hybrid_wave_gate_preserves_v29_window_economics_abi(self) -> None:
         runtime = _Runtime()
         chat = _chat(
             runtime,
@@ -1943,8 +1943,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
 
         compatible = chat._draft_window_compatible_previous_identities()
 
-        self.assertNotEqual(previous, current)
-        self.assertIn(previous, compatible)
+        self.assertEqual(previous, current)
         self.assertNotIn(current, compatible)
         chat.close()
 

@@ -189,6 +189,9 @@ LAYER_MLP_O1_POOL_COLLECTION_EVIDENCE_SCHEMA = (
     "immer.qwen3.8-layer-mlp-o1-collection-evidence/v2"
 )
 QWEN38_COMPONENT_TIMING_REQUEST_SCHEMA = "immer.qwen3.8-component-timing-request/v1"
+_DRAFT_WINDOW_HYBRID_ECONOMICS_ABI = (
+    "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
+)
 _QWEN38_COMPONENT_TIMING_BOUNDARIES = {
     "full_attention_core": "StreamedQwen38._full_attention",
     "deltanet_core": "StreamedQwen38._linear_attention",
@@ -3563,7 +3566,7 @@ class Qwen38CausalChat:
         if markov_provider_abi is None:
             markov_provider_abi = MARKOV_DRAFT_PROVIDER_ABI
         if hybrid_provider_abi is None:
-            hybrid_provider_abi = QWEN38_MARKOV_MTP_HYBRID_PROVIDER_SCHEMA
+            hybrid_provider_abi = _DRAFT_WINDOW_HYBRID_ECONOMICS_ABI
         if self._draft_mode == "markov":
             provider: dict[str, Any] = {
                 "abi": markov_provider_abi,
@@ -3739,14 +3742,6 @@ class Qwen38CausalChat:
             return ()
         identities: set[str] = set()
         if self._draft_mode in {"hybrid", "markov"}:
-            if self._draft_mode == "hybrid":
-                identities.add(
-                    self._draft_window_runtime_identity(
-                        hybrid_provider_abi=(
-                            "immer.qwen3.8-markov-mtp-hybrid-provider/v29"
-                        ),
-                    )
-                )
             if self._layer_contextual_continuation_state_path is not None:
                 identities.add(
                     self._draft_window_runtime_identity(
