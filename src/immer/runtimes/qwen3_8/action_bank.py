@@ -21,7 +21,7 @@ from .inference_economics import InferenceEconomicsReceipt
 
 INFERENCE_ACTION_RECEIPT_SCHEMA = "immer.qwen3.8-inference-action-receipt/v1"
 INFERENCE_ACTION_BANK_SCHEMA = "immer.qwen3.8-inference-action-bank/v1"
-INFERENCE_ACTION_DIRECTIVE_SCHEMA = "immer.qwen3.8-inference-action-directive/v1"
+INFERENCE_ACTION_DIRECTIVE_SCHEMA = "immer.qwen3.8-inference-action-directive/v2"
 MAX_ACTION_RECEIPT_BYTES = 32 * 1024
 ACTION_CATALOG = (
     "compute_crystal",
@@ -340,6 +340,7 @@ class InferenceActionDirective:
     source_signature_sha256s: tuple[str, ...]
     support: int
     saved_qwen_forwards: int
+    draft_window_ceiling: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("question_sha256", "runtime_profile_sha256"):
@@ -361,6 +362,12 @@ class InferenceActionDirective:
             bool,
         ):
             raise TypeError("draft_enabled must be boolean or null")
+        if self.draft_window_ceiling is not None and (
+            isinstance(self.draft_window_ceiling, bool)
+            or not isinstance(self.draft_window_ceiling, int)
+            or self.draft_window_ceiling not in {4, 8, 16}
+        ):
+            raise ValueError("draft_window_ceiling must be K4, K8, K16, or null")
         if (
             tuple(sorted(set(self.source_signature_sha256s)))
             != self.source_signature_sha256s
@@ -373,6 +380,15 @@ class InferenceActionDirective:
         if self.support <= 0 or isinstance(self.support, bool):
             raise ValueError("directive support must be positive")
         _uint(self.saved_qwen_forwards, "saved_qwen_forwards")
+        if self.draft_window_ceiling is not None and (
+            self.draft_enabled is not True
+            or self.saved_qwen_forwards <= 0
+            or "compute_crystal"
+            not in {*self.primary_actions, *self.fallback_actions}
+        ):
+            raise ValueError(
+                "draft_window_ceiling requires a positive compute_crystal action"
+            )
 
     @property
     def sha256(self) -> str:
@@ -381,6 +397,7 @@ class InferenceActionDirective:
     def body(self) -> dict[str, object]:
         return {
             "draft_enabled": self.draft_enabled,
+            "draft_window_ceiling": self.draft_window_ceiling,
             "fallback_actions": list(self.fallback_actions),
             "primary_actions": list(self.primary_actions),
             "question_sha256": self.question_sha256,
@@ -753,6 +770,9 @@ class InferenceActionBank:
             support=len(sources_receipts),
             saved_qwen_forwards=sum(
                 receipt.saved_qwen_forwards for receipt in sources_receipts
+            ),
+            draft_window_ceiling=(
+                16 if "compute_crystal" in runtime_actions else None
             ),
         )
 

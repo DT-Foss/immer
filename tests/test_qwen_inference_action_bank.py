@@ -353,6 +353,7 @@ class InferenceActionBankTests(unittest.TestCase):
             ("dynamic_mlp_pages", "qwen_target", "target_verified_draft"),
         )
         self.assertTrue(directive.draft_enabled)
+        self.assertIsNone(directive.draft_window_ceiling)
         self.assertEqual(directive.support, 3)
         self.assertEqual(directive.saved_qwen_forwards, 7)
         self.assertEqual(
@@ -373,6 +374,59 @@ class InferenceActionBankTests(unittest.TestCase):
             directive.fallback_actions,
         )
         self.assertTrue(transferred_directive.draft_enabled)
+
+    def test_positive_compute_crystal_authorizes_k16_target_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            bank = InferenceActionBank(Path(temporary) / "actions")
+            bank.observe(
+                _economics("crystal", target=29, saved=11),
+                executed_actions=(
+                    "compute_crystal",
+                    "continuation_battery",
+                    "dynamic_mlp_pages",
+                    "qwen_target",
+                    "target_verified_draft",
+                ),
+            )
+
+            directive = bank.recommend(
+                question_sha256=_sha("new question"),
+                runtime_profile_sha256=_sha("other profile"),
+            )
+
+        assert directive is not None
+        self.assertEqual(directive.draft_window_ceiling, 16)
+        self.assertIn("compute_crystal", directive.primary_actions)
+        self.assertIn("compute_crystal", directive.fallback_actions)
+        self.assertEqual(
+            InferenceActionDirective.from_document(directive.to_document()),
+            directive,
+        )
+
+        for changes in (
+            {"draft_enabled": False},
+            {"saved_qwen_forwards": 0},
+            {
+                "primary_actions": ("qwen_target",),
+                "fallback_actions": ("qwen_target",),
+            },
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                InferenceActionDirective(
+                    question_sha256=_sha("question"),
+                    runtime_profile_sha256=_sha("profile"),
+                    primary_actions=changes.get(
+                        "primary_actions", ("compute_crystal", "qwen_target")
+                    ),
+                    fallback_actions=changes.get(
+                        "fallback_actions", ("compute_crystal", "qwen_target")
+                    ),
+                    draft_enabled=changes.get("draft_enabled", True),
+                    source_signature_sha256s=("3" * 64,),
+                    support=1,
+                    saved_qwen_forwards=changes.get("saved_qwen_forwards", 1),
+                    draft_window_ceiling=16,
+                )
 
     def test_reconcile_recovers_a_missed_derived_event_and_tamper_is_hard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

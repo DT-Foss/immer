@@ -16,6 +16,8 @@ import zlib
 
 from immer.cli import main
 from immer.contracts import ExecutionStatus, Request
+from immer.runtimes.qwen3_8.action_bank import InferenceActionDirective
+from immer.runtimes.qwen3_8.adapter import QWEN38_INFERENCE_ACTION_METADATA
 from immer.runtimes.qwen3_8.draft_window import (
     DRAFT_WINDOW_ACTIONS,
     DRAFT_WINDOW_FEEDBACK_SCHEMA,
@@ -790,6 +792,77 @@ class DraftWindowAdapterTests(unittest.TestCase):
         self.assertEqual(nested[0]["accepted_draft_tokens"], 3)
         self.assertEqual(nested[0]["proposed_draft_tokens"], 3)
         self.assertEqual(result.evidence["draft"]["window_size"], 8)
+        chat.close()
+
+    def test_compute_crystal_directive_replaces_k8_request_cap_with_k16(self) -> None:
+        runtime = _Runtime()
+        chat = self._adaptive_chat(runtime)
+        directive = InferenceActionDirective(
+            question_sha256=hashlib.sha256(b"hello").hexdigest(),
+            runtime_profile_sha256="2" * 64,
+            primary_actions=(
+                "compute_crystal",
+                "qwen_target",
+                "target_verified_draft",
+            ),
+            fallback_actions=(
+                "compute_crystal",
+                "qwen_target",
+                "target_verified_draft",
+            ),
+            draft_enabled=True,
+            source_signature_sha256s=("3" * 64,),
+            support=1,
+            saved_qwen_forwards=11,
+            draft_window_ceiling=16,
+        )
+        decoder = SimpleNamespace(
+            generate_rolling=lambda *args, **kwargs: _rolling_result(window=16)
+        )
+
+        with patch(
+            "immer.runtimes.qwen3_8.adapter.Qwen38K4SpeculativeDecoder",
+            return_value=decoder,
+        ) as constructor:
+            result = chat.handle(
+                Request(
+                    "chat",
+                    "hello",
+                    {
+                        QWEN38_INFERENCE_ACTION_METADATA: (
+                            directive.to_document()
+                        )
+                    },
+                )
+            )
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(constructor.call_args.kwargs["window_size"], 16)
+        self.assertNotIn("draft_window", result.evidence)
+        self.assertEqual(
+            result.evidence["draft"]["action_bank_window_ceiling"],
+            16,
+        )
+        self.assertTrue(
+            result.evidence["draft"]["controller_window_overridden"]
+        )
+        self.assertEqual(
+            result.evidence["inference_action_directive"]["applied"][
+                "draft_window_ceiling"
+            ],
+            16,
+        )
+        with patch(
+            "immer.runtimes.qwen3_8.adapter._digest",
+            side_effect=lambda value: value,
+        ):
+            policy = chat._result_cell_generation_policy_sha256()
+        self.assertEqual(policy["draft_window"], 16)
+        self.assertEqual(
+            policy["draft_window_controller"]["action_bank_ceiling"],
+            16,
+        )
+        self.assertNotIn("selection", policy["draft_window_controller"])
         chat.close()
 
     def test_adapter_migrates_the_known_v6_page_runtime_identity(self) -> None:

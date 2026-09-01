@@ -1946,12 +1946,39 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertNotIn("draft", result.evidence)
         self.assertEqual(
             result.evidence["inference_action_directive"]["applied"],
-            {"draft_enabled": False},
+            {"draft_enabled": False, "draft_window_ceiling": None},
         )
         self.assertEqual(
             result.evidence["inference_action_directive"]["directive"],
             directive.to_document(),
         )
+        chat.close()
+
+    def test_crystal_ceiling_never_leaks_into_direct_target_kwargs(self) -> None:
+        runtime = _Runtime()
+        chat = _chat(runtime)
+        directive = InferenceActionDirective(
+            question_sha256=hashlib.sha256(b"hello").hexdigest(),
+            runtime_profile_sha256="2" * 64,
+            primary_actions=("compute_crystal", "qwen_target"),
+            fallback_actions=("compute_crystal", "qwen_target"),
+            draft_enabled=True,
+            source_signature_sha256s=("3" * 64,),
+            support=1,
+            saved_qwen_forwards=11,
+            draft_window_ceiling=16,
+        )
+
+        result = chat.handle(
+            Request(
+                "chat",
+                "hello",
+                {QWEN38_INFERENCE_ACTION_METADATA: directive.to_document()},
+            )
+        )
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertNotIn("draft_window_ceiling", runtime.model.calls[0][1])
         chat.close()
 
     def test_fast_mlp_identity_and_request_traffic_reach_general_chat(self) -> None:

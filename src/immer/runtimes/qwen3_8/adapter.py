@@ -1747,6 +1747,7 @@ class Qwen38CausalChat:
         self._last_delta_head_evidence: dict[str, Any] | None = None
         self._last_exact_head_evidence: dict[str, Any] | None = None
         self._draft_window_selection: DraftWindowSelection | None = None
+        self._action_bank_draft_window_ceiling: int | None = None
         self._draft_window_policy_metrics: dict[str, Any] | None = None
         self._pending_draft_window_feedback: dict[str, Any] | None = None
         self._pending_page_runtime_reward: dict[str, Any] | None = None
@@ -1804,7 +1805,9 @@ class Qwen38CausalChat:
             policy["draft_mode"] = self._draft_mode
             selection = self._draft_window_selection
             policy["draft_window"] = (
-                selection.proposed_window
+                self._action_bank_draft_window_ceiling
+                if self._action_bank_draft_window_ceiling is not None
+                else selection.proposed_window
                 if selection is not None
                 else min(self._draft_window, self._max_new_tokens)
                 if short_fixed_eligible
@@ -1849,6 +1852,10 @@ class Qwen38CausalChat:
                     "short_window_fallback": short_fixed_eligible,
                     "updates_require_target_receipt": True,
                 }
+                if self._action_bank_draft_window_ceiling is not None:
+                    controller_policy["action_bank_ceiling"] = (
+                        self._action_bank_draft_window_ceiling
+                    )
                 if selection is not None:
                     controller_policy["selection"] = selection.to_dict()
                 policy["draft_window_controller"] = controller_policy
@@ -2602,7 +2609,49 @@ class Qwen38CausalChat:
         delta_before = None if delta_router is None else delta_router.metrics()
         exact_head = getattr(runtime, "exact_head_index", None)
         exact_before = None if exact_head is None else exact_head.metrics()
+        configured_draft_mode = self._draft_mode
+        effective_draft_mode = self._draft_mode_for_request(generation_options)
         adaptive_selection = self._draft_window_selection
+        directive_ceiling = generation_options.get("draft_window_ceiling")
+        if directive_ceiling is not None and (
+            isinstance(directive_ceiling, bool)
+            or not isinstance(directive_ceiling, int)
+            or directive_ceiling not in DRAFT_WINDOW_ACTIONS
+        ):
+            raise Qwen38ChatError("action directive draft ceiling is invalid")
+        eligible_directive_windows = (
+            ()
+            if directive_ceiling is None
+            else tuple(
+                window
+                for window in DRAFT_WINDOW_ACTIONS
+                if window <= directive_ceiling
+                and window <= self._draft_window
+                and window <= self._max_new_tokens
+            )
+        )
+        effective_directive_ceiling = (
+            None
+            if not eligible_directive_windows
+            else max(eligible_directive_windows)
+        )
+        controller_window_overridden = bool(
+            effective_draft_mode is not None
+            and effective_directive_ceiling is not None
+            and (
+                adaptive_selection is None
+                or effective_directive_ceiling
+                != adaptive_selection.proposed_window
+            )
+        )
+        if controller_window_overridden:
+            adaptive_selection = None
+            self._draft_window_selection = None
+        self._action_bank_draft_window_ceiling = (
+            effective_directive_ceiling
+            if effective_draft_mode is not None
+            else None
+        )
         retention = self._markov_o1_retention
 
         def score_episode(token_ids: tuple[int, ...]) -> float:
@@ -2613,11 +2662,10 @@ class Qwen38CausalChat:
                 raise Qwen38ChatError("O1 retention episode did not decode to text")
             return retention.score(token_ids, decoded)
 
-        configured_draft_mode = self._draft_mode
-        effective_draft_mode = self._draft_mode_for_request(generation_options)
         draft_enabled = effective_draft_mode is not None and (
             (self._draft_window_controller is None and self._max_new_tokens >= 2)
             or adaptive_selection is not None
+            or effective_directive_ceiling is not None
             or (
                 self._draft_window_controller is not None
                 and 2 <= self._max_new_tokens < min(DRAFT_WINDOW_ACTIONS)
@@ -2626,6 +2674,7 @@ class Qwen38CausalChat:
         if not draft_enabled:
             direct_progress = self._direct_generation_progress(runtime)
             direct_options = dict(generation_options)
+            direct_options.pop("draft_window_ceiling", None)
             if direct_progress is not None:
                 direct_options["progress"] = direct_progress
             generated, evidence = runtime.model.generate_greedy(
@@ -2645,8 +2694,13 @@ class Qwen38CausalChat:
             return generated, evidence
         eos = tuple(generation_options["eos_token_ids"])
         draft_window = (
-            adaptive_selection.proposed_window
+            max(
+                adaptive_selection.proposed_window,
+                effective_directive_ceiling or 0,
+            )
             if adaptive_selection is not None
+            else effective_directive_ceiling
+            if effective_directive_ceiling is not None
             else min(self._draft_window, self._max_new_tokens)
         )
         rolling_started = time.perf_counter()
@@ -2955,6 +3009,13 @@ class Qwen38CausalChat:
             if adaptive_selection is not None:
                 self._last_draft_evidence["window_selection"] = (
                     adaptive_selection.to_dict()
+                )
+            if effective_directive_ceiling is not None:
+                self._last_draft_evidence["action_bank_window_ceiling"] = (
+                    effective_directive_ceiling
+                )
+                self._last_draft_evidence["controller_window_overridden"] = (
+                    controller_window_overridden
                 )
             provider_record = getattr(provider_metrics, "to_dict", None)
             if callable(provider_record):
@@ -3706,6 +3767,13 @@ class Qwen38CausalChat:
         }
         if action_directive is not None and action_directive.draft_enabled is not None:
             generation_options["draft_enabled"] = action_directive.draft_enabled
+        if (
+            action_directive is not None
+            and action_directive.draft_window_ceiling is not None
+        ):
+            generation_options["draft_window_ceiling"] = (
+                action_directive.draft_window_ceiling
+            )
         if reused_prefix_tokens:
             generation_options["restored_prefix_length"] = reused_prefix_tokens
         elif self._anchor_cache is not None:
@@ -4028,6 +4096,13 @@ class Qwen38CausalChat:
             evidence["inference_action_directive"] = {
                 "applied": {
                     "draft_enabled": self._last_draft_evidence is not None,
+                    "draft_window_ceiling": (
+                        None
+                        if self._last_draft_evidence is None
+                        else self._last_draft_evidence.get(
+                            "action_bank_window_ceiling"
+                        )
+                    ),
                 },
                 "directive": action_directive.to_document(),
             }
@@ -4421,6 +4496,7 @@ class Qwen38CausalChat:
 
         with self._lock:
             self._draft_window_selection = None
+            self._action_bank_draft_window_ceiling = None
             self._draft_window_policy_metrics = None
             self._pending_draft_window_feedback = None
             self._page_reward_retry_failed = False
