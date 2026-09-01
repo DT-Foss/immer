@@ -1867,6 +1867,31 @@ class Qwen38CausalChatTests(unittest.TestCase):
             self.assertNotIn("crystal_proposed_tokens", request["bank_work"])
             chat.close()
 
+    def test_layer_contextual_addition_migrates_the_previous_window_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            chat = _chat(
+                _Runtime(model=_LayerContextualModel()),
+                draft_mode="markov",
+                q4_root="/q4",
+                layer_contextual_continuation_state_path=(
+                    Path(temporary) / "layer.json"
+                ),
+            )
+            chat._load_locked()
+            chat._draft_window_controller = Mock()
+            previous = chat._draft_window_runtime_identity(
+                layer_contextual_continuation_enabled=False,
+            )
+            current = chat._draft_window_runtime_identity()
+
+            compatible = chat._draft_window_compatible_previous_identities()
+
+            self.assertIn(previous, compatible)
+            self.assertNotIn(current, compatible)
+            chat.close()
+
     def test_draft_window_migrates_from_authenticated_previous_context_bank(
         self,
     ) -> None:

@@ -3537,6 +3537,7 @@ class Qwen38CausalChat:
         hybrid_provider_abi: str | None = None,
         contextual_continuation_enabled: bool | None = None,
         contextual_continuation_identity_sha256: str | None = None,
+        layer_contextual_continuation_enabled: bool | None = None,
     ) -> str:
         bundle = self._bundle_receipt
         tokenizer_sha256 = self._tokenizer_sha256
@@ -3662,10 +3663,16 @@ class Qwen38CausalChat:
                 "key_abi": "known-token+normalized-rademacher-q8-256/v1",
                 "maximum_tail_tokens": 15,
             }
-        if (
-            self._draft_mode in {"hybrid", "markov"}
-            and self._layer_contextual_continuation_state_path is not None
-        ):
+        layer_context_enabled = (
+            self._layer_contextual_continuation_state_path is not None
+            if layer_contextual_continuation_enabled is None
+            else layer_contextual_continuation_enabled
+        )
+        if not isinstance(layer_context_enabled, bool):
+            raise TypeError(
+                "layer_contextual_continuation_enabled must be boolean or None"
+            )
+        if self._draft_mode in {"hybrid", "markov"} and layer_context_enabled:
             layer_bank = self._layer_contextual_continuation_bank
             provider["layer_contextual_continuation_crystal"] = {
                 "identity_sha256": (
@@ -3717,6 +3724,12 @@ class Qwen38CausalChat:
             return ()
         identities: set[str] = set()
         if self._draft_mode in {"hybrid", "markov"}:
+            if self._layer_contextual_continuation_state_path is not None:
+                identities.add(
+                    self._draft_window_runtime_identity(
+                        layer_contextual_continuation_enabled=False,
+                    )
+                )
             previous_page_identities = (
                 (
                     (MLP_PAGE_MARKOV_SCHEMA, MLP_PAGE_MARKOV_POLICY),
