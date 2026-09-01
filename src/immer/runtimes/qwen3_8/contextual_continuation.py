@@ -37,12 +37,8 @@ CONTEXTUAL_CONTINUATION_IDENTITY_SCHEMA = (
 CONTEXTUAL_CONTINUATION_KEY_SCHEMA = "immer.qwen3.8-contextual-q8-key/v1"
 CONTEXTUAL_CONTINUATION_CELL_SCHEMA = "immer.qwen3.8-contextual-cell/v1"
 CONTEXTUAL_CONTINUATION_STATE_SCHEMA = "immer.qwen3.8-contextual-bank-state/v1"
-CONTEXTUAL_CONTINUATION_ENVELOPE_SCHEMA = (
-    "immer.qwen3.8-contextual-bank-envelope/v1"
-)
-CONTEXTUAL_PROJECTION_ABI = (
-    "immer.qwen3.8/rademacher-shake256-lsb-f64-l2-q8-256/v1"
-)
+CONTEXTUAL_CONTINUATION_ENVELOPE_SCHEMA = "immer.qwen3.8-contextual-bank-envelope/v1"
+CONTEXTUAL_PROJECTION_ABI = "immer.qwen3.8/rademacher-shake256-lsb-f64-l2-q8-256/v1"
 
 CONTEXTUAL_KEY_DIMENSIONS = 256
 MAX_CONTINUATION_TOKENS = 15
@@ -92,11 +88,7 @@ def _sha256_document(value: Any) -> str:
 
 
 def _is_sha256(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and not (set(value) - _HEX)
-    )
+    return isinstance(value, str) and len(value) == 64 and not (set(value) - _HEX)
 
 
 def _digest(value: object, field: str) -> str:
@@ -132,9 +124,7 @@ def _token(value: object, field: str) -> int:
 
 
 def _tail(value: object) -> tuple[int, ...]:
-    if isinstance(value, (str, bytes, bytearray)) or not isinstance(
-        value, Sequence
-    ):
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         raise TypeError("target_tail must be a sequence of token IDs")
     result = tuple(value)
     if not 1 <= len(result) <= MAX_CONTINUATION_TOKENS:
@@ -147,19 +137,13 @@ def _tail(value: object) -> tuple[int, ...]:
 
 
 def _q8_vector(value: object) -> tuple[int, ...]:
-    if isinstance(value, (str, bytes, bytearray)) or not isinstance(
-        value, Sequence
-    ):
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
         raise TypeError("Q8 key must be an integer sequence")
     result = tuple(value)
     if len(result) != CONTEXTUAL_KEY_DIMENSIONS:
-        raise ValueError(
-            f"Q8 key must have {CONTEXTUAL_KEY_DIMENSIONS} dimensions"
-        )
+        raise ValueError(f"Q8 key must have {CONTEXTUAL_KEY_DIMENSIONS} dimensions")
     if any(
-        isinstance(item, bool)
-        or not isinstance(item, int)
-        or not -127 <= item <= 127
+        isinstance(item, bool) or not isinstance(item, int) or not -127 <= item <= 127
         for item in result
     ):
         raise ValueError("Q8 key contains a value outside [-127, 127]")
@@ -176,9 +160,7 @@ def _json_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ContextualContinuationIntegrityError(
-                f"duplicate JSON key: {key!r}"
-            )
+            raise ContextualContinuationIntegrityError(f"duplicate JSON key: {key!r}")
         result[key] = value
     return result
 
@@ -198,9 +180,7 @@ def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
 
 
 def _stable_regular_bytes(path: Path) -> tuple[bytes, tuple[int, int, int, int, int]]:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-        os, "O_NOFOLLOW", 0
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError:
@@ -318,9 +298,8 @@ def _exclusive_state_lock(path: Path) -> Iterator[None]:
             yield
             parent_after = os.lstat(parent)
             linked_after = os.lstat(lock_path)
-            if (
-                not _same_inode(opened, linked_after)
-                or not _same_inode(parent_before, parent_after)
+            if not _same_inode(opened, linked_after) or not _same_inode(
+                parent_before, parent_after
             ):
                 raise ContextualContinuationIntegrityError(
                     "contextual continuation lock changed during transaction"
@@ -387,8 +366,8 @@ def _atomic_write(path: Path, data: bytes) -> tuple[int, int, int, int, int]:
                 "contextual continuation destination changed type"
             )
         os.replace(temporary, path)
-        directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
-            os, "O_DIRECTORY", 0
+        directory_flags = (
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
         )
         directory = os.open(parent, directory_flags)
         try:
@@ -972,8 +951,7 @@ def _normalised_q8(
         raise TypeError("hidden must be a torch.Tensor")
     if tuple(hidden.shape) != (1, 1, identity.hidden_width):
         raise ValueError(
-            "hidden must have exact shape "
-            f"[1, 1, {identity.hidden_width}]"
+            f"hidden must have exact shape [1, 1, {identity.hidden_width}]"
         )
     if not hidden.dtype.is_floating_point:
         raise TypeError("hidden must have a floating-point dtype")
@@ -1016,6 +994,19 @@ def _cell_for_capture(
 
 class ContextualContinuationBank:
     """Bounded persistent nearest-neighbour bank for confirmed continuations."""
+
+    @classmethod
+    def read_identity(
+        cls,
+        state_path: str | os.PathLike[str],
+    ) -> ContextualContinuationIdentity:
+        """Authenticate one persisted bank and return only its immutable identity."""
+
+        path = Path(state_path)
+        if not path.name:
+            raise ValueError("state_path must name a file")
+        raw, _signature = _stable_regular_bytes(path)
+        return _ContextualState.from_bytes(raw).identity
 
     def __init__(
         self,
@@ -1168,9 +1159,10 @@ class ContextualContinuationBank:
             raise ContextualContinuationIdentityError(
                 "query key belongs to a different runtime identity"
             )
-        if known_token is not None and _token(
-            known_token, "known_token"
-        ) != key.known_token:
+        if (
+            known_token is not None
+            and _token(known_token, "known_token") != key.known_token
+        ):
             raise ValueError("known_token disagrees with the bound query key")
         _uint(limit, field="limit", positive=True, maximum=256)
 
@@ -1182,15 +1174,11 @@ class ContextualContinuationBank:
 
         cells, matrix, norms = indexed
         query = torch.tensor(key.q8, dtype=torch.float32, device="cpu")
-        cosines = torch.mv(matrix, query).div_(
-            norms * math.sqrt(key.norm_sq)
-        ).tolist()
+        cosines = torch.mv(matrix, query).div_(norms * math.sqrt(key.norm_sq)).tolist()
         grouped: dict[tuple[int, ...], list[tuple[_ContextualCell, float]]] = {}
         for cell, cosine in zip(cells, cosines):
             bounded_cosine = max(-1.0, min(1.0, float(cosine)))
-            grouped.setdefault(cell.target_tail, []).append(
-                (cell, bounded_cosine)
-            )
+            grouped.setdefault(cell.target_tail, []).append((cell, bounded_cosine))
 
         ranked: list[
             tuple[
@@ -1279,12 +1267,8 @@ class ContextualContinuationBank:
         feedback = tuple(feedback)
         if any(not isinstance(item, ContextualCapture) for item in captures):
             raise TypeError("captures contains a non-ContextualCapture value")
-        if any(
-            not isinstance(item, ContextualCandidateFeedback) for item in feedback
-        ):
-            raise TypeError(
-                "feedback contains a non-ContextualCandidateFeedback value"
-            )
+        if any(not isinstance(item, ContextualCandidateFeedback) for item in feedback):
+            raise TypeError("feedback contains a non-ContextualCandidateFeedback value")
         if not captures and not feedback:
             return self.metrics()
         for capture in captures:
@@ -1306,9 +1290,7 @@ class ContextualContinuationBank:
                         "feedback references an unknown contextual cell"
                     )
                 if observation.verified_tokens > len(cell.target_tail):
-                    raise ValueError(
-                        "verified_tokens exceeds the contextual cell tail"
-                    )
+                    raise ValueError("verified_tokens exceeds the contextual cell tail")
                 verified = list(cell.position_verified)
                 hits = list(cell.position_hits)
                 for index in range(observation.verified_tokens):
@@ -1363,7 +1345,9 @@ class ContextualContinuationBank:
                 capture_count=_bounded_add(state.capture_count, len(captures)),
                 feedback_count=_bounded_add(state.feedback_count, len(feedback)),
                 evictions=_bounded_add(state.evictions, evicted),
-                cells=tuple(sorted(cells.values(), key=lambda cell: cell.content_sha256)),
+                cells=tuple(
+                    sorted(cells.values(), key=lambda cell: cell.content_sha256)
+                ),
             )
             encoded = next_state.to_bytes()
             signature = _atomic_write(self.state_path, encoded)
@@ -1401,9 +1385,7 @@ class ContextualContinuationBank:
             feedback_count=state.feedback_count,
             evictions=state.evictions,
             support=sum(cell.support for cell in cells),
-            verified_positions=sum(
-                sum(cell.position_verified) for cell in cells
-            ),
+            verified_positions=sum(sum(cell.position_verified) for cell in cells),
             hit_positions=sum(sum(cell.position_hits) for cell in cells),
         )
 

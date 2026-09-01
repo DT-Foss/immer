@@ -45,6 +45,10 @@ from immer.runtimes.qwen3_8.adapter import (
     Qwen38ChatError,
 )
 from immer.runtimes.qwen3_8.cartography_probe import prompt_token_sha256
+from immer.runtimes.qwen3_8.contextual_continuation import (
+    ContextualContinuationBank,
+    ContextualContinuationIdentity,
+)
 from immer.runtimes.qwen3_8.encoding import IM_END_TOKEN_ID, Qwen38Tokenizer
 from immer.runtimes.qwen3_8.markov_atlas import MarkovTokenAtlas
 from immer.runtimes.qwen3_8.hybrid_draft import (
@@ -640,6 +644,131 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertIn(".context-", state_path.name)
         self.assertEqual(state_path.suffix, ".json")
         self.assertIs(chat._contextual_continuation_bank.identity, identity)
+        chat.close()
+
+    def test_draft_window_migrates_from_authenticated_previous_context_bank(
+        self,
+    ) -> None:
+        def contextual_runtime() -> _Runtime:
+            runtime = _Runtime()
+            runtime.model.config.dim = 8
+            runtime.q4_bank = SimpleNamespace(
+                identity={"manifest_sha256": "f" * 64},
+            )
+            runtime.mlp_page_router = None
+            runtime.delta_head_receipt = None
+            return runtime
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            configured = root / "context.json"
+            probe = _chat(
+                contextual_runtime(),
+                draft_mode="markov",
+                q4_root="/q4",
+                contextual_continuation_state_path=configured,
+            )
+            with patch(
+                "immer.runtimes.qwen3_8.adapter.asdict",
+                return_value={"dim": 8, "vocab_size": 300_000},
+            ):
+                probe._load_locked()
+            assert probe._contextual_continuation_bank is not None
+            current_template = probe._contextual_continuation_bank.identity
+            old_identity = ContextualContinuationIdentity(
+                runtime_sha256="1" * 64,
+                model_sha256=current_template.model_sha256,
+                q4_sha256=current_template.q4_sha256,
+                tokenizer_sha256=current_template.tokenizer_sha256,
+                hidden_width=current_template.hidden_width,
+            )
+            probe.close()
+            old_path = root / (
+                f"context.context-{old_identity.identity_sha256[:16]}.json"
+            )
+            old_bank = ContextualContinuationBank(old_path, old_identity)
+            old_bank.settle(
+                captures=(
+                    old_bank.make_capture(
+                        torch.ones((1, 1, 8), dtype=torch.float32),
+                        7,
+                        0,
+                        (8,),
+                    ),
+                )
+            )
+            foreign_identity = ContextualContinuationIdentity(
+                runtime_sha256="4" * 64,
+                model_sha256="5" * 64,
+                q4_sha256=current_template.q4_sha256,
+                tokenizer_sha256=current_template.tokenizer_sha256,
+                hidden_width=current_template.hidden_width,
+            )
+            foreign_path = root / (
+                f"context.context-{foreign_identity.identity_sha256[:16]}.json"
+            )
+            foreign_bank = ContextualContinuationBank(
+                foreign_path,
+                foreign_identity,
+            )
+            foreign_bank.settle(
+                captures=(
+                    foreign_bank.make_capture(
+                        torch.ones((1, 1, 8), dtype=torch.float32),
+                        7,
+                        0,
+                        (9,),
+                    ),
+                )
+            )
+            (root / "context.context-ffffffffffffffff.json").write_bytes(b"broken")
+            draft_state = root / "draft-window.bin"
+            previous = _chat(
+                _Runtime(),
+                draft_mode="markov",
+                q4_root="/q4",
+                contextual_continuation_state_path=configured,
+            )
+            previous._bundle_receipt = _BUNDLE_RECEIPT
+            previous._tokenizer_sha256 = _DIGEST
+            previous._contextual_continuation_bank = SimpleNamespace(
+                identity=old_identity
+            )
+            previous_policy = previous._draft_window_runtime_identity()
+            previous.close()
+
+            chat = _chat(
+                contextual_runtime(),
+                draft_mode="markov",
+                q4_root="/q4",
+                contextual_continuation_state_path=configured,
+                draft_window_state_path=draft_state,
+            )
+            assert chat._draft_window_controller is not None
+            chat._draft_window_controller.bind_policy_identity(previous_policy)
+            with patch(
+                "immer.runtimes.qwen3_8.adapter.asdict",
+                return_value={"dim": 8, "vocab_size": 300_000},
+            ):
+                chat._load_locked()
+            current_policy = chat._draft_window_runtime_identity()
+            compatible = chat._draft_window_compatible_previous_identities()
+            migrated = chat._draft_window_controller.bind_policy_identity(
+                current_policy,
+                compatible_previous=compatible,
+            )
+
+        self.assertNotEqual(previous_policy, current_policy)
+        self.assertIn(previous_policy, compatible)
+        self.assertIn(
+            old_identity.identity_sha256,
+            chat._compatible_contextual_continuation_identity_sha256s,
+        )
+        self.assertNotIn(
+            foreign_identity.identity_sha256,
+            chat._compatible_contextual_continuation_identity_sha256s,
+        )
+        self.assertEqual(migrated.policy_identity_sha256, current_policy)
         chat.close()
 
     def test_attention_output_crystal_mounts_identity_suffixed_and_attaches(

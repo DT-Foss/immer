@@ -36,10 +36,7 @@ def _identity(*, runtime: str = "runtime", width: int = 12):
 
 
 def _hidden(width: int, offset: float = 0.0) -> torch.Tensor:
-    return (
-        torch.arange(1, width + 1, dtype=torch.float32).reshape(1, 1, width)
-        + offset
-    )
+    return torch.arange(1, width + 1, dtype=torch.float32).reshape(1, 1, width) + offset
 
 
 class ContextualContinuationBankTests(unittest.TestCase):
@@ -95,6 +92,10 @@ class ContextualContinuationBankTests(unittest.TestCase):
         self.assertNotIn(b"1234", encoded)
         self.assertNotIn(hidden.numpy().tobytes(), encoded)
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            ContextualContinuationBank.read_identity(self.path),
+            self.identity,
+        )
 
     def test_feedback_updates_exact_per_position_counters_atomically(self) -> None:
         bank = ContextualContinuationBank(self.path, self.identity, max_cells=8)
@@ -120,9 +121,7 @@ class ContextualContinuationBankTests(unittest.TestCase):
 
     def test_query_collapses_equal_tails_before_runner_up_and_margin(self) -> None:
         bank = ContextualContinuationBank(self.path, self.identity, max_cells=8)
-        exact = bank.make_capture(
-            _hidden(self.identity.hidden_width), 9, 0, (100, 101)
-        )
+        exact = bank.make_capture(_hidden(self.identity.hidden_width), 9, 0, (100, 101))
         duplicate = bank.make_capture(
             -_hidden(self.identity.hidden_width), 9, 1, (100, 101)
         )
@@ -153,18 +152,12 @@ class ContextualContinuationBankTests(unittest.TestCase):
 
     def test_equal_tail_feedback_stays_with_the_nearest_hidden_cell(self) -> None:
         bank = ContextualContinuationBank(self.path, self.identity, max_cells=8)
-        near = bank.make_capture(
-            _hidden(self.identity.hidden_width), 9, 0, (100, 101)
-        )
-        far = bank.make_capture(
-            -_hidden(self.identity.hidden_width), 9, 1, (100, 101)
-        )
+        near = bank.make_capture(_hidden(self.identity.hidden_width), 9, 0, (100, 101))
+        far = bank.make_capture(-_hidden(self.identity.hidden_width), 9, 1, (100, 101))
         bank.settle(captures=(near, far))
         far_candidate = bank.query_key(far.key)[0]
         bank.settle(
-            feedback=(
-                ContextualCandidateFeedback(far_candidate.cell_sha256, 0, 2),
-            )
+            feedback=(ContextualCandidateFeedback(far_candidate.cell_sha256, 0, 2),)
         )
 
         near_candidate = bank.query_key(near.key)[0]
@@ -182,12 +175,12 @@ class ContextualContinuationBankTests(unittest.TestCase):
         second = bank.make_capture(_hidden(12, 10.0), 1, 1, (20,))
         bank.settle(captures=(first, second))
         first_candidate = next(
-            item for item in bank.query_key(first.key) if item.target_tail == first.target_tail
+            item
+            for item in bank.query_key(first.key)
+            if item.target_tail == first.target_tail
         )
         bank.settle(
-            feedback=(
-                ContextualCandidateFeedback(first_candidate.cell_sha256, 3, 3),
-            )
+            feedback=(ContextualCandidateFeedback(first_candidate.cell_sha256, 3, 3),)
         )
         third = bank.make_capture(_hidden(12, -20.0), 1, 2, (30, 31))
         metrics = bank.settle(captures=(third,))
@@ -220,15 +213,15 @@ class ContextualContinuationBankTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=4) as executor:
             list(executor.map(commit, range(8)))
 
-        restored = ContextualContinuationBank(
-            self.path, self.identity, max_cells=32
-        )
+        restored = ContextualContinuationBank(self.path, self.identity, max_cells=32)
         metrics = restored.metrics()
         self.assertEqual(metrics.cell_count, 8)
         self.assertEqual(metrics.capture_count, 8)
         self.assertEqual(metrics.settlements, 8)
 
-    def test_identity_capacity_hash_canonical_and_symlink_checks_fail_closed(self) -> None:
+    def test_identity_capacity_hash_canonical_and_symlink_checks_fail_closed(
+        self,
+    ) -> None:
         bank = ContextualContinuationBank(self.path, self.identity, max_cells=8)
         capture = bank.make_capture(_hidden(12), 1, 0, (2, 3))
         bank.settle(captures=(capture,))
@@ -259,9 +252,7 @@ class ContextualContinuationBankTests(unittest.TestCase):
 
     def test_noncanonical_and_duplicate_json_are_rejected(self) -> None:
         bank = ContextualContinuationBank(self.path, self.identity, max_cells=8)
-        bank.settle(
-            captures=(bank.make_capture(_hidden(12), 1, 0, (2,)),)
-        )
+        bank.settle(captures=(bank.make_capture(_hidden(12), 1, 0, (2,)),))
         document = json.loads(self.path.read_bytes())
         self.path.write_bytes(json.dumps(document, indent=2, sort_keys=True).encode())
         with self.assertRaisesRegex(
@@ -288,9 +279,7 @@ class ContextualContinuationBankTests(unittest.TestCase):
                 "immer.runtimes.qwen3_8.contextual_continuation._atomic_write",
                 side_effect=ContextualContinuationIntegrityError("disk failed"),
             ),
-            self.assertRaisesRegex(
-                ContextualContinuationIntegrityError, "disk failed"
-            ),
+            self.assertRaisesRegex(ContextualContinuationIntegrityError, "disk failed"),
         ):
             bank.settle(captures=(second,))
 
@@ -312,9 +301,7 @@ class ContextualContinuationBankTests(unittest.TestCase):
         with self.assertRaisesRegex(
             ContextualContinuationIntegrityError, "unknown contextual cell"
         ):
-            bank.settle(
-                feedback=(ContextualCandidateFeedback("a" * 64, 0, 1),)
-            )
+            bank.settle(feedback=(ContextualCandidateFeedback("a" * 64, 0, 1),))
         self.assertFalse(self.path.exists())
 
 
