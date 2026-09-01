@@ -10,7 +10,6 @@ reads packed mmap pages directly.
 from __future__ import annotations
 
 import ctypes
-from collections import OrderedDict
 import hashlib
 import json
 import math
@@ -828,8 +827,16 @@ class Q4BankMetrics:
     resident_evictions: int = 0
     resident_eviction_bytes: int = 0
     resident_row_discard_skips: int = 0
-    resident_prefetch_admissions: int = 0
     resident_peak_payload_bytes: int = 0
+    resident_page_hits: int = 0
+    resident_page_misses: int = 0
+    resident_page_admissions: int = 0
+    resident_page_bypasses: int = 0
+    resident_unprotected_discard_calls: int = 0
+    resident_unprotected_discard_pages: int = 0
+    resident_unprotected_discard_bytes: int = 0
+    resident_protection_drop_calls: int = 0
+    resident_protection_drop_pages: int = 0
 
 
 class Q4Bank:
@@ -866,10 +873,24 @@ class Q4Bank:
         self.native = _native_library()
         self._mapped: dict[str, _MappedTensor] = {}
         self._mapped_once: set[str] = set()
-        self._touched: set[str] = set()
-        self._prefetch_leases: dict[str, int] = {}
+        self._touched: dict[str, list[tuple[int, int]]] = {}
+        self._prefetch_leases: dict[
+            str,
+            tuple[int, tuple[tuple[int, int], ...]],
+        ] = {}
         self._release_clock = 0
-        self._resident_lru: OrderedDict[str, None] = OrderedDict()
+        self._page_size = int(getattr(mmap, "PAGESIZE", 4096))
+        self._resident_budget_pages = resident_budget_bytes // self._page_size
+        self._protected_pages: dict[str, list[tuple[int, int]]] = {}
+        head = self.entries.get("lm_head.weight")
+        head_pages = (
+            0
+            if head is None
+            else (head.payload_bytes + self._page_size - 1) // self._page_size
+        )
+        self._head_reserved_pages = (
+            head_pages if head_pages <= self._resident_budget_pages else 0
+        )
         self._resident_payload_bytes = 0
         self._stats = Q4BankMetrics()
         self._lock = threading.RLock()
@@ -937,11 +958,237 @@ class Q4Bank:
     def has(self, name: str) -> bool:
         return name in self.entries
 
-    def _resident_admits(self, entry: Q4TensorEntry) -> bool:
+    @staticmethod
+    def _merge_page_runs(
+        runs: Sequence[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        merged: list[tuple[int, int]] = []
+        for start, stop in sorted(runs):
+            if start >= stop:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
+            else:
+                merged.append((start, stop))
+        return merged
+
+    @staticmethod
+    def _page_count(runs: Sequence[tuple[int, int]]) -> int:
+        return sum(stop - start for start, stop in runs)
+
+    @classmethod
+    def _subtract_page_runs(
+        cls,
+        runs: Sequence[tuple[int, int]],
+        excluded: Sequence[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        result: list[tuple[int, int]] = []
+        exclusions = cls._merge_page_runs(excluded)
+        for start, stop in cls._merge_page_runs(runs):
+            cursor = start
+            for left, right in exclusions:
+                if right <= cursor:
+                    continue
+                if left >= stop:
+                    break
+                if cursor < left:
+                    result.append((cursor, min(left, stop)))
+                cursor = max(cursor, right)
+                if cursor >= stop:
+                    break
+            if cursor < stop:
+                result.append((cursor, stop))
+        return result
+
+    @staticmethod
+    def _take_page_runs(
+        runs: Sequence[tuple[int, int]],
+        pages: int,
+    ) -> list[tuple[int, int]]:
+        selected: list[tuple[int, int]] = []
+        remaining = pages
+        for start, stop in runs:
+            if remaining <= 0:
+                break
+            take = min(stop - start, remaining)
+            if take:
+                selected.append((start, start + take))
+                remaining -= take
+        return selected
+
+    def _full_page_run(self, entry: Q4TensorEntry) -> list[tuple[int, int]]:
+        pages = (entry.payload_bytes + self._page_size - 1) // self._page_size
+        return [(0, pages)]
+
+    def _byte_page_run(
+        self,
+        entry: Q4TensorEntry,
+        *,
+        offset: int,
+        length: int,
+    ) -> tuple[int, int]:
+        stop = min(entry.payload_bytes, offset + length)
         return (
-            self.resident_budget_bytes > 0
-            and entry.payload_bytes <= self.resident_budget_bytes
+            offset // self._page_size,
+            (stop + self._page_size - 1) // self._page_size,
         )
+
+    def _row_page_runs(
+        self,
+        entry: Q4TensorEntry,
+        row_ids: Sequence[int],
+    ) -> list[tuple[int, int]]:
+        return self._merge_page_runs(
+            [
+                self._byte_page_run(
+                    entry,
+                    offset=row * entry.row_bytes,
+                    length=entry.row_bytes,
+                )
+                for row in row_ids
+            ]
+        )
+
+    def _add_touched(
+        self,
+        name: str,
+        runs: Sequence[tuple[int, int]],
+    ) -> None:
+        if self.resident_budget_bytes == 0:
+            runs = self._full_page_run(self.entries[name])
+        self._touched[name] = self._merge_page_runs(
+            (*self._touched.get(name, ()), *runs)
+        )
+
+    def _consume_prefetch(self, name: str) -> None:
+        lease = self._prefetch_leases.pop(name, None)
+        if lease is None:
+            return
+        _expiry, runs = lease
+        self._stats.page_mlp_prefetch_consumed_leases += 1
+        self._add_touched(name, runs)
+
+    def _protected_page_count(self) -> int:
+        return sum(self._page_count(runs) for runs in self._protected_pages.values())
+
+    def _drop_protection(self, name: str) -> None:
+        dropped = self._protected_pages.pop(name, None)
+        if not dropped:
+            return
+        pages = self._page_count(dropped)
+        self._resident_payload_bytes -= pages * self._page_size
+        self._stats.resident_protection_drop_calls += 1
+        self._stats.resident_protection_drop_pages += pages
+
+    def _demand_pages(
+        self,
+        name: str,
+        runs: Sequence[tuple[int, int]],
+        *,
+        admit: bool = True,
+    ) -> None:
+        entry = self.entries[name]
+        requested = self._merge_page_runs(runs)
+        self._consume_prefetch(name)
+        self._add_touched(name, requested)
+        if self.resident_budget_bytes == 0:
+            return
+        protected = self._protected_pages.get(name, [])
+        missing = self._subtract_page_runs(requested, protected)
+        missing_pages = self._page_count(missing)
+        hit_pages = self._page_count(requested) - missing_pages
+        self._stats.resident_page_hits += hit_pages
+        self._stats.resident_page_misses += missing_pages
+        # Retain the original evidence keys, now measured in exact OS pages.
+        self._stats.resident_hits += hit_pages
+        self._stats.resident_misses += missing_pages
+        if not missing_pages:
+            return
+
+        is_head = name == "lm_head.weight"
+        full_head = is_head and requested == self._full_page_run(entry)
+        if not admit or (is_head and self._head_reserved_pages == 0):
+            admitted: list[tuple[int, int]] = []
+        else:
+            protected_total = self._protected_page_count()
+            if is_head:
+                available = self._resident_budget_pages - protected_total
+            else:
+                protected_head = self._page_count(
+                    self._protected_pages.get("lm_head.weight", ())
+                )
+                head_reserve_remaining = max(
+                    0,
+                    self._head_reserved_pages - protected_head,
+                )
+                available = (
+                    self._resident_budget_pages
+                    - protected_total
+                    - head_reserve_remaining
+                )
+            available = max(0, available)
+            if full_head and available < missing_pages:
+                admitted = []
+            else:
+                admitted = self._take_page_runs(missing, available)
+        admitted_pages = self._page_count(admitted)
+        bypassed_pages = missing_pages - admitted_pages
+        self._stats.resident_page_admissions += admitted_pages
+        self._stats.resident_page_bypasses += bypassed_pages
+        if admitted_pages:
+            self._protected_pages[name] = self._merge_page_runs((*protected, *admitted))
+            self._resident_payload_bytes += admitted_pages * self._page_size
+            self._stats.resident_peak_payload_bytes = max(
+                self._stats.resident_peak_payload_bytes,
+                self._resident_payload_bytes,
+            )
+
+    def _is_fully_protected(self, name: str) -> bool:
+        entry = self.entries[name]
+        return not self._subtract_page_runs(
+            self._full_page_run(entry),
+            self._protected_pages.get(name, ()),
+        )
+
+    def _run_payload_bytes(
+        self,
+        entry: Q4TensorEntry,
+        run: tuple[int, int],
+    ) -> int:
+        start, stop = run
+        return max(
+            0,
+            min(entry.payload_bytes, stop * self._page_size) - start * self._page_size,
+        )
+
+    def _discard_page_runs(
+        self,
+        name: str,
+        runs: Sequence[tuple[int, int]],
+    ) -> bool:
+        mapped = self._mapped.get(name)
+        if mapped is None:
+            return True
+        entry = self.entries[name]
+        for run in self._merge_page_runs(runs):
+            length = self._run_payload_bytes(entry, run)
+            if length <= 0:
+                continue
+            offset = run[0] * self._page_size
+            if not mapped.discard(offset=offset, length=length):
+                self._mapped.pop(name).close()
+                self._drop_protection(name)
+                self._stats.mapping_discard_fallback_closes += 1
+                self._stats.mapping_discard_calls += 1
+                self._stats.mapping_discard_bytes += length
+                return False
+            pages = run[1] - run[0]
+            self._stats.mapping_discard_calls += 1
+            self._stats.mapping_discard_bytes += length
+            self._stats.resident_unprotected_discard_calls += 1
+            self._stats.resident_unprotected_discard_pages += pages
+            self._stats.resident_unprotected_discard_bytes += length
+        return True
 
     def _mapping(
         self,
@@ -966,21 +1213,7 @@ class Q4Bank:
             else:
                 self._mapped_once.add(name)
         if touch:
-            if self._prefetch_leases.pop(name, None) is not None:
-                self._stats.page_mlp_prefetch_consumed_leases += 1
-            self._touched.add(name)
-            if self._resident_admits(entry):
-                if name in self._resident_lru:
-                    self._stats.resident_hits += 1
-                    self._resident_lru.move_to_end(name)
-                else:
-                    self._stats.resident_misses += 1
-                    self._resident_lru[name] = None
-                    self._resident_payload_bytes += entry.payload_bytes
-                    self._stats.resident_peak_payload_bytes = max(
-                        self._stats.resident_peak_payload_bytes,
-                        self._resident_payload_bytes,
-                    )
+            self._demand_pages(name, self._full_page_run(entry))
         return entry, mapped
 
     def discard_rows(self, name: str, start_row: int, row_count: int) -> None:
@@ -1005,11 +1238,25 @@ class Q4Bank:
                 raise ValueError("Q4 discard row interval is invalid")
             if mapped is None:
                 return
-            if name in self._resident_lru:
-                self._stats.resident_row_discard_skips += 1
-                return
             offset = start_row * entry.row_bytes
             length = row_count * entry.row_bytes
+            if self.resident_budget_bytes > 0:
+                requested = [self._byte_page_run(entry, offset=offset, length=length)]
+                protected = self._protected_pages.get(name, ())
+                unprotected = self._subtract_page_runs(requested, protected)
+                self._stats.resident_row_discard_skips += self._page_count(
+                    requested
+                ) - self._page_count(unprotected)
+                remaining = self._subtract_page_runs(
+                    self._touched.get(name, ()),
+                    requested,
+                )
+                if remaining:
+                    self._touched[name] = remaining
+                else:
+                    self._touched.pop(name, None)
+                self._discard_page_runs(name, unprotected)
+                return
             if mapped.discard(offset=offset, length=length):
                 self._stats.mapping_discard_calls += 1
                 self._stats.mapping_discard_bytes += length
@@ -1169,12 +1416,15 @@ class Q4Bank:
             )
 
             accepted = True
-            leased_names = set()
+            leased_runs: dict[str, list[tuple[int, int]]] = {}
             for name, mapped, offset, length in requests:
                 if mapped.prefetch(offset=offset, length=length):
                     self._stats.page_mlp_prefetch_advice_calls += 1
                     self._stats.page_mlp_prefetch_bytes += length
-                    leased_names.add(name)
+                    entry = self.entries[name]
+                    leased_runs.setdefault(name, []).append(
+                        self._byte_page_run(entry, offset=offset, length=length)
+                    )
                 else:
                     accepted = False
                     self._stats.page_mlp_prefetch_failures += 1
@@ -1183,26 +1433,21 @@ class Q4Bank:
             # before layer zero of the next token. Two boundaries retain both
             # cases while stale or abandoned advice still expires promptly.
             expiry = self._release_clock + 2
-            for name in sorted(leased_names):
-                self._prefetch_leases[name] = expiry
-                entry = self.entries[name]
-                if self._resident_admits(entry):
-                    if name in self._resident_lru:
-                        self._resident_lru.move_to_end(name)
-                    else:
-                        self._resident_lru[name] = None
-                        self._resident_payload_bytes += entry.payload_bytes
-                        self._stats.resident_prefetch_admissions += 1
-                        self._stats.resident_peak_payload_bytes = max(
-                            self._stats.resident_peak_payload_bytes,
-                            self._resident_payload_bytes,
-                        )
+            for name in sorted(leased_runs):
+                previous = self._prefetch_leases.get(name)
+                combined = list(leased_runs[name])
+                if previous is not None:
+                    combined.extend(previous[1])
+                self._prefetch_leases[name] = (
+                    expiry,
+                    tuple(self._merge_page_runs(combined)),
+                )
             if accepted:
                 self._stats.page_mlp_prefetch_pages += len(pages)
             return accepted
 
     def release_touched(self, *, force_prefetch: bool = False) -> None:
-        """Remove residency accumulated since the previous execution boundary."""
+        """Discard only unprotected demand pages at an execution boundary."""
 
         with self._lock:
             if self._closed:
@@ -1216,75 +1461,41 @@ class Q4Bank:
             else:
                 stale = {
                     name
-                    for name, expiry in self._prefetch_leases.items()
+                    for name, (expiry, _runs) in self._prefetch_leases.items()
                     if expiry < self._release_clock
                 }
                 self._stats.page_mlp_prefetch_expired_leases += len(stale)
             for name in stale:
-                self._prefetch_leases.pop(name, None)
-            active_prefetch = set(self._prefetch_leases)
-            if self.resident_budget_bytes > 0:
-                untracked = ((self._touched - active_prefetch) | stale) - set(
-                    self._resident_lru
-                )
-                for name in sorted(untracked):
-                    mapped = self._mapped.get(name)
-                    if mapped is None:
-                        continue
-                    entry = self.entries[name]
-                    if mapped.discard():
-                        self._stats.mapping_discard_calls += 1
-                        self._stats.mapping_discard_bytes += entry.payload_bytes
-                    else:
-                        self._mapped.pop(name).close()
-                        self._stats.mapping_discard_fallback_closes += 1
-                        self._stats.mapping_discard_calls += 1
-                        self._stats.mapping_discard_bytes += entry.payload_bytes
-                self._touched.clear()
-                while self._resident_payload_bytes > self.resident_budget_bytes:
-                    victim = next(
-                        (
-                            name
-                            for name in self._resident_lru
-                            if name not in active_prefetch
-                        ),
-                        None,
-                    )
-                    if victim is None:
-                        break
-                    self._resident_lru.pop(victim, None)
-                    entry = self.entries[victim]
-                    self._resident_payload_bytes -= entry.payload_bytes
-                    mapped = self._mapped.get(victim)
-                    if mapped is not None:
-                        if mapped.discard():
-                            self._stats.mapping_discard_calls += 1
-                            self._stats.mapping_discard_bytes += entry.payload_bytes
-                        else:
-                            self._mapped.pop(victim).close()
-                            self._stats.mapping_discard_fallback_closes += 1
-                            self._stats.mapping_discard_calls += 1
-                            self._stats.mapping_discard_bytes += entry.payload_bytes
-                    self._stats.resident_evictions += 1
-                    self._stats.resident_eviction_bytes += entry.payload_bytes
-                return
-            names = tuple((self._touched - active_prefetch) | stale)
-            self._touched.clear()
-            for name in names:
+                lease = self._prefetch_leases.pop(name, None)
+                if lease is not None:
+                    self._add_touched(name, lease[1])
+            touched = self._touched
+            self._touched = {}
+            for name in sorted(touched):
                 mapped = self._mapped.get(name)
                 if mapped is None:
                     continue
                 entry = self.entries[name]
-                if mapped.discard():
+                active = self._prefetch_leases.get(name)
+                if self.resident_budget_bytes == 0:
+                    if active is not None:
+                        continue
+                    if mapped.discard():
+                        self._stats.mapping_discard_calls += 1
+                        self._stats.mapping_discard_bytes += entry.payload_bytes
+                        continue
+                    # Platforms without MADV_DONTNEED still get the same
+                    # bounded residency by unmapping. The next access reopens.
+                    self._mapped.pop(name).close()
+                    self._stats.mapping_discard_fallback_closes += 1
                     self._stats.mapping_discard_calls += 1
                     self._stats.mapping_discard_bytes += entry.payload_bytes
                     continue
-                # Platforms without MADV_DONTNEED still get the same bounded
-                # residency by unmapping. The next exact access reopens bytes.
-                self._mapped.pop(name).close()
-                self._stats.mapping_discard_fallback_closes += 1
-                self._stats.mapping_discard_calls += 1
-                self._stats.mapping_discard_bytes += entry.payload_bytes
+                protected = self._protected_pages.get(name, ())
+                unprotected = self._subtract_page_runs(touched[name], protected)
+                if active is not None:
+                    unprotected = self._subtract_page_runs(unprotected, active[1])
+                self._discard_page_runs(name, unprotected)
 
     def linear(self, values: Any, name: str, *, output_dtype: Any | None = None) -> Any:
         import torch
@@ -1341,7 +1552,7 @@ class Q4Bank:
         import torch
 
         with self._lock:
-            entry, mapped = self._mapping(name)
+            entry, mapped = self._mapping(name, touch=False)
             if not isinstance(values, torch.Tensor):
                 values = torch.as_tensor(values)
             if (
@@ -1373,6 +1584,8 @@ class Q4Bank:
             discarded_bytes = ctypes.c_int64()
             discard_calls = ctypes.c_int64()
             native_block_rows = min(entry.shape[0], max(block_rows, 8192))
+            self._demand_pages(name, self._full_page_run(entry))
+            full_head_protected = self._is_fully_protected(name)
             code = self.native.library.immer_q4_topk_bf16_f32(
                 self.native._pointer(compute),
                 input_rows,
@@ -1386,7 +1599,7 @@ class Q4Bank:
                 self.native._pointer(top_ids),
                 ctypes.byref(discarded_bytes),
                 ctypes.byref(discard_calls),
-                int(not self._resident_admits(entry)),
+                int(not full_head_protected),
                 self.threads,
             )
             if code == 2:
@@ -1504,7 +1717,7 @@ class Q4Bank:
         with self._lock:
             if len(names) != 3 or len(set(names)) != 3:
                 raise ValueError("Q4 full MLP requires Gate, Up, and Down names")
-            gate, up, down = (self._mapping(name) for name in names)
+            gate, up, down = (self._mapping(name, touch=False) for name in names)
             gate_entry, gate_map = gate
             up_entry, up_map = up
             down_entry, down_map = down
@@ -1539,6 +1752,18 @@ class Q4Bank:
             )
             output = torch.empty((input_rows, down_entry.shape[0]), dtype=torch.float32)
             page_topk = 0 if activation_page_topk is None else activation_page_topk
+            for name, entry in zip(
+                names,
+                (gate_entry, up_entry, down_entry),
+                strict=True,
+            ):
+                self._demand_pages(
+                    name,
+                    self._full_page_run(entry),
+                    # A routing-feedback trace reads all pages once but must
+                    # not poison the recurrent sticky set before decode.
+                    admit=page_topk == 0,
+                )
             if page_topk:
                 page_ids = torch.empty((input_rows, page_topk), dtype=torch.int64)
                 page_scores = torch.empty((input_rows, page_topk), dtype=torch.float64)
@@ -1625,7 +1850,7 @@ class Q4Bank:
         with self._lock:
             if len(names) != 3 or len(set(names)) != 3:
                 raise ValueError("Q4 page MLP requires Gate, Up, and Down names")
-            gate, up, down = (self._mapping(name) for name in names)
+            gate, up, down = (self._mapping(name, touch=False) for name in names)
             gate_entry, gate_map = gate
             up_entry, up_map = up
             down_entry, down_map = down
@@ -1678,6 +1903,25 @@ class Q4Bank:
                 if bool(torch.any(ordered[:, 1:] == ordered[:, :-1])):
                     raise ValueError("Q4 page MLP page IDs must be unique per row")
             compute_pages = ordered.contiguous()
+            unique_page_ids = tuple(int(page) for page in torch.unique(compute_pages))
+            for name, entry in zip(
+                names[:2],
+                (gate_entry, up_entry),
+                strict=True,
+            ):
+                page_runs = [
+                    self._byte_page_run(
+                        entry,
+                        offset=page * 64 * entry.row_bytes,
+                        length=(min(64, entry.shape[0] - page * 64) * entry.row_bytes),
+                    )
+                    for page in unique_page_ids
+                ]
+                self._demand_pages(name, page_runs)
+            # The native Down kernel may visit every packed output row even
+            # for a small coordinate set; full protection is conservative and
+            # exact for the canonical width-192 decode route.
+            self._demand_pages(names[2], self._full_page_run(down_entry))
             compute = (
                 values.detach()
                 .to(dtype=torch.float32)
@@ -1770,7 +2014,7 @@ class Q4Bank:
         import torch
 
         with self._lock:
-            entry, mapped = self._mapping(name)
+            entry, mapped = self._mapping(name, touch=False)
             if not row_ids or any(
                 isinstance(row, bool)
                 or not isinstance(row, int)
@@ -1784,6 +2028,7 @@ class Q4Bank:
                 raise Q4BankError(f"Q4 input width disagrees with {name!r}")
             if values.device.type != "cpu":
                 raise Q4BankError("Q4 execution is currently CPU-only")
+            self._demand_pages(name, self._row_page_runs(entry, row_ids))
             leading = tuple(values.shape[:-1])
             input_rows = values.numel() // values.shape[-1]
             compute = (
@@ -1836,7 +2081,7 @@ class Q4Bank:
         with self._lock:
             if len(names) != 2 or names[0] == names[1]:
                 raise ValueError("Q4 selected-row pair requires two distinct matrices")
-            resolved = tuple(self._mapping(name) for name in names)
+            resolved = tuple(self._mapping(name, touch=False) for name in names)
             entries = tuple(row[0] for row in resolved)
             mapped = tuple(row[1] for row in resolved)
             if entries[0].shape[1] != entries[1].shape[1]:
@@ -1856,6 +2101,8 @@ class Q4Bank:
                 raise Q4BankError("Q4 selected-row pair input width differs")
             if values.device.type != "cpu":
                 raise Q4BankError("Q4 execution is currently CPU-only")
+            for name, entry in zip(names, entries, strict=True):
+                self._demand_pages(name, self._row_page_runs(entry, row_ids))
             leading = tuple(values.shape[:-1])
             input_rows = values.numel() // input_columns
             compute = (
@@ -2408,8 +2655,16 @@ class Q4Bank:
         import torch
 
         with self._lock:
-            entry, mapped = self._mapping(name)
+            entry, mapped = self._mapping(name, touch=False)
             unique_ids = tuple(dict.fromkeys(row_ids))
+            if any(
+                isinstance(row, bool)
+                or not isinstance(row, int)
+                or not 0 <= row < entry.shape[0]
+                for row in unique_ids
+            ):
+                raise ValueError("Q4 decoded row IDs are invalid")
+            self._demand_pages(name, self._row_page_runs(entry, unique_ids))
             ids = torch.tensor(unique_ids, dtype=torch.int64)
             output = torch.empty((len(unique_ids), entry.shape[1]), dtype=torch.float32)
             if unique_ids:
@@ -2502,6 +2757,31 @@ class Q4Bank:
 
     def metrics(self) -> dict[str, Any]:
         with self._lock:
+            protected_pages = self._protected_page_count()
+            head_protected_pages = self._page_count(
+                self._protected_pages.get("lm_head.weight", ())
+            )
+            prefetch_pages = sum(
+                self._page_count(runs)
+                for _expiry, runs in self._prefetch_leases.values()
+            )
+            warm_names = set(self._protected_pages) | set(self._prefetch_leases)
+            accounted_warm_pages = sum(
+                self._page_count(
+                    self._merge_page_runs(
+                        (
+                            *self._protected_pages.get(name, ()),
+                            *(
+                                self._prefetch_leases[name][1]
+                                if name in self._prefetch_leases
+                                else ()
+                            ),
+                        )
+                    )
+                )
+                for name in warm_names
+            )
+            accounted_warm_bytes = accounted_warm_pages * self._page_size
             return {
                 **asdict(self._stats),
                 **self.identity,
@@ -2513,9 +2793,29 @@ class Q4Bank:
                 "resident_payload_bytes": self._resident_payload_bytes,
                 "resident_budget_overage_bytes": max(
                     0,
-                    self._resident_payload_bytes - self.resident_budget_bytes,
+                    accounted_warm_bytes - self.resident_budget_bytes,
                 ),
-                "resident_tensors": len(self._resident_lru),
+                "resident_tensors": len(self._protected_pages),
+                "resident_protected_pages": protected_pages,
+                "resident_protected_bytes": self._resident_payload_bytes,
+                "resident_protected_tensors": len(self._protected_pages),
+                "resident_head_reserved_pages": self._head_reserved_pages,
+                "resident_head_reserved_bytes": (
+                    self._head_reserved_pages * self._page_size
+                ),
+                "resident_head_reserve_remaining_pages": max(
+                    0,
+                    self._head_reserved_pages - head_protected_pages,
+                ),
+                "resident_head_fully_protected": (
+                    "lm_head.weight" in self.entries
+                    and self._is_fully_protected("lm_head.weight")
+                ),
+                "resident_page_size": self._page_size,
+                "resident_prefetch_active_pages": prefetch_pages,
+                "resident_prefetch_active_bytes": prefetch_pages * self._page_size,
+                "resident_accounted_warm_pages": accounted_warm_pages,
+                "resident_accounted_warm_bytes": accounted_warm_bytes,
                 "threads": self.threads,
                 "native_library": str(self.native.path),
                 "native_build_seconds": self.native.build_seconds,
@@ -2531,7 +2831,7 @@ class Q4Bank:
             self._mapped.clear()
             self._touched.clear()
             self._prefetch_leases.clear()
-            self._resident_lru.clear()
+            self._protected_pages.clear()
             self._resident_payload_bytes = 0
             self._closed = True
 

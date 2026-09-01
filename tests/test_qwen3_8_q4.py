@@ -909,7 +909,7 @@ class Q4BankTests(unittest.TestCase):
             finally:
                 bank.close()
 
-    def test_resident_prefetch_holds_active_leases_then_evicts_to_budget(self) -> None:
+    def test_prefetch_never_admits_then_demand_protects_exact_pages(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "q4-resident-prefetch"
             generator = torch.Generator().manual_seed(9227)
@@ -929,7 +929,7 @@ class Q4BankTests(unittest.TestCase):
                 row_chunk=64,
                 threads=2,
             ).build()
-            tensor_payload_bytes = 1024 * 36
+            page_size = int(getattr(mmap, "PAGESIZE", 4096))
             bank = Q4Bank.load(
                 root,
                 bundle_receipt=_BUNDLE,
@@ -937,7 +937,7 @@ class Q4BankTests(unittest.TestCase):
                 revision=_SOURCE["revision"],
                 inventory_fingerprint=_SOURCE["inventory_fingerprint"],
                 threads=2,
-                resident_budget_bytes=2 * tensor_payload_bytes,
+                resident_budget_bytes=32 * page_size,
             )
             try:
                 with (
@@ -952,32 +952,79 @@ class Q4BankTests(unittest.TestCase):
                     ),
                 ):
                     self.assertTrue(bank.prefetch_mlp_pages(0, (0, 2)))
-                admitted = bank.metrics()
-                self.assertEqual(admitted["resident_prefetch_admissions"], 3)
-                self.assertEqual(admitted["resident_tensors"], 3)
+                prefetched = bank.metrics()
+                self.assertEqual(prefetched["resident_page_admissions"], 0)
+                self.assertEqual(prefetched["resident_protected_pages"], 0)
+                self.assertEqual(prefetched["page_mlp_prefetch_active_leases"], 3)
+                self.assertGreater(prefetched["resident_prefetch_active_pages"], 0)
                 self.assertEqual(
-                    admitted["resident_payload_bytes"], 3 * tensor_payload_bytes
-                )
-                self.assertEqual(
-                    admitted["resident_budget_overage_bytes"], tensor_payload_bytes
+                    prefetched["resident_accounted_warm_pages"],
+                    prefetched["resident_prefetch_active_pages"],
                 )
 
+                values = torch.randn((1, 64), generator=generator).to(torch.bfloat16)
+                output = bank.mlp_selected_pages(
+                    values,
+                    names,
+                    torch.tensor(((0, 2),), dtype=torch.int64),
+                    output_dtype=torch.bfloat16,
+                )
+                self.assertEqual(tuple(output.shape), (1, 64))
+                demanded = bank.metrics()
+                gate_row_bytes = bank.entries[names[0]].row_bytes
+                gate_os_pages = {
+                    byte // page_size
+                    for page in (0, 2)
+                    for byte in range(
+                        page * 64 * gate_row_bytes,
+                        (page + 1) * 64 * gate_row_bytes,
+                    )
+                }
+                down_pages = (
+                    bank.entries[names[2]].payload_bytes + page_size - 1
+                ) // page_size
+                protected_pages = 2 * len(gate_os_pages) + down_pages
+                self.assertEqual(demanded["resident_protected_pages"], protected_pages)
+                self.assertEqual(demanded["resident_page_admissions"], protected_pages)
+                self.assertEqual(
+                    demanded["resident_payload_bytes"],
+                    protected_pages * page_size,
+                )
+                self.assertEqual(demanded["page_mlp_prefetch_consumed_leases"], 3)
+                self.assertEqual(demanded["page_mlp_prefetch_active_leases"], 0)
+                self.assertEqual(demanded["resident_prefetch_active_pages"], 0)
+                self.assertEqual(
+                    demanded["resident_accounted_warm_pages"],
+                    protected_pages,
+                )
+                bank.release_touched()
+                self.assertEqual(
+                    bank.metrics()["resident_protected_pages"], protected_pages
+                )
+
+                before_expiry = bank.metrics()
+                with (
+                    mock.patch(
+                        "immer.runtimes.qwen3_8.q4._MappedTensor.prefetch_supported",
+                        return_value=True,
+                    ),
+                    mock.patch(
+                        "immer.runtimes.qwen3_8.q4._MappedTensor.prefetch",
+                        autospec=True,
+                        return_value=True,
+                    ),
+                ):
+                    self.assertTrue(bank.prefetch_mlp_pages(0, (8,)))
                 bank.release_touched()
                 bank.release_touched()
-                self.assertEqual(bank.metrics()["page_mlp_prefetch_active_leases"], 3)
                 bank.release_touched()
                 expired = bank.metrics()
-                self.assertEqual(expired["page_mlp_prefetch_expired_leases"], 3)
                 self.assertEqual(expired["page_mlp_prefetch_active_leases"], 0)
-                self.assertEqual(expired["resident_evictions"], 1)
-                self.assertEqual(expired["resident_tensors"], 2)
-                self.assertEqual(
-                    expired["resident_payload_bytes"], 2 * tensor_payload_bytes
-                )
-                self.assertEqual(expired["resident_budget_overage_bytes"], 0)
-                self.assertEqual(
-                    tuple(bank._resident_lru),
-                    tuple(sorted(names))[1:],
+                self.assertEqual(expired["page_mlp_prefetch_expired_leases"], 3)
+                self.assertEqual(expired["resident_protected_pages"], protected_pages)
+                self.assertGreater(
+                    expired["resident_unprotected_discard_pages"],
+                    before_expiry["resident_unprotected_discard_pages"],
                 )
             finally:
                 bank.close()
@@ -1090,6 +1137,11 @@ class Q4BankTests(unittest.TestCase):
                 self.assertGreater(metrics["native_topk_discard_bytes"], 0)
             finally:
                 bank.close()
+            page_size = int(getattr(mmap, "PAGESIZE", 4096))
+            head_payload_bytes = 9001 * 68
+            head_resident_bytes = (
+                (head_payload_bytes + page_size - 1) // page_size * page_size
+            )
             resident = Q4Bank.load(
                 root,
                 bundle_receipt=_BUNDLE,
@@ -1097,7 +1149,7 @@ class Q4BankTests(unittest.TestCase):
                 revision=_SOURCE["revision"],
                 inventory_fingerprint=_SOURCE["inventory_fingerprint"],
                 threads=2,
-                resident_budget_bytes=9001 * 68,
+                resident_budget_bytes=head_resident_bytes,
             )
             try:
                 resident_values, resident_ids = resident.topk(
@@ -1120,7 +1172,12 @@ class Q4BankTests(unittest.TestCase):
                 self.assertEqual(resident_metrics["mapping_discard_calls"], 0)
                 self.assertEqual(
                     resident_metrics["resident_payload_bytes"],
-                    9001 * 68,
+                    head_resident_bytes,
+                )
+                self.assertTrue(resident_metrics["resident_head_fully_protected"])
+                self.assertEqual(
+                    resident_metrics["resident_head_reserved_bytes"],
+                    head_resident_bytes,
                 )
             finally:
                 resident.close()
@@ -1131,7 +1188,7 @@ class Q4BankTests(unittest.TestCase):
                 revision=_SOURCE["revision"],
                 inventory_fingerprint=_SOURCE["inventory_fingerprint"],
                 threads=2,
-                resident_budget_bytes=9001 * 68 - 1,
+                resident_budget_bytes=head_resident_bytes - 1,
             )
             try:
                 undersized_values, undersized_ids = undersized.topk(
@@ -1451,6 +1508,7 @@ class Q4BankTests(unittest.TestCase):
                 revision=_SOURCE["revision"],
                 inventory_fingerprint=_SOURCE["inventory_fingerprint"],
                 threads=2,
+                resident_budget_bytes=32 * int(getattr(mmap, "PAGESIZE", 4096)),
             )
             try:
                 values = torch.ones((1, 64), dtype=torch.bfloat16)
@@ -1465,6 +1523,10 @@ class Q4BankTests(unittest.TestCase):
                 self.assertEqual(tuple(page_total_scores.shape), (1,))
                 self.assertEqual(page_total_scores.tolist(), [0.0])
                 self.assertEqual(int(torch.count_nonzero(output)), 0)
+                resident = bank.metrics()
+                self.assertEqual(resident["resident_page_admissions"], 0)
+                self.assertEqual(resident["resident_protected_pages"], 0)
+                self.assertGreater(resident["resident_page_bypasses"], 0)
                 for invalid in (True, 0, -1, 3):
                     with self.subTest(invalid=invalid):
                         with self.assertRaises(ValueError):
@@ -2412,13 +2474,81 @@ class Q4BankTests(unittest.TestCase):
             finally:
                 low_pager.close()
 
-    def test_resident_budget_uses_tensor_lru_without_changing_outputs(self) -> None:
+    def test_sparse_rows_charge_only_their_os_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "q4-resident-rows"
+            generator = torch.Generator().manual_seed(6379)
+            name = "model.language_model.layers.0.self_attn.k_proj.weight"
+            tensor = torch.randn((2048, 64), generator=generator)
+            Q4BankBuilder(
+                root,
+                pager=_Pager({name: tensor}),
+                bundle_receipt=_BUNDLE,
+                row_chunk=64,
+                threads=2,
+            ).build()
+            page_size = int(getattr(mmap, "PAGESIZE", 4096))
+            bank = Q4Bank.load(
+                root,
+                bundle_receipt=_BUNDLE,
+                repo_id=_SOURCE["repo_id"],
+                revision=_SOURCE["revision"],
+                inventory_fingerprint=_SOURCE["inventory_fingerprint"],
+                threads=2,
+                resident_budget_bytes=2 * page_size,
+            )
+            try:
+                hidden = torch.randn((1, 64), generator=generator).to(torch.bfloat16)
+                rows = (0, 1, 500)
+                first = bank.rows(
+                    name,
+                    rows,
+                    dtype=torch.bfloat16,
+                )
+                bank.release_touched()
+                second = bank.rows(
+                    name,
+                    rows,
+                    dtype=torch.bfloat16,
+                )
+                bank.release_touched()
+                selected = bank.linear_rows(
+                    hidden,
+                    name,
+                    rows,
+                    output_dtype=torch.bfloat16,
+                )
+                bank.release_touched()
+                torch.testing.assert_close(second, first, rtol=0.0, atol=0.0)
+                self.assertEqual(tuple(selected.shape), (1, 3))
+                metrics = bank.metrics()
+                self.assertEqual(metrics["resident_protected_pages"], 2)
+                self.assertEqual(metrics["resident_payload_bytes"], 2 * page_size)
+                self.assertEqual(metrics["resident_page_admissions"], 2)
+                self.assertEqual(metrics["resident_page_hits"], 4)
+                self.assertEqual(
+                    bank._protected_pages[name],
+                    bank._row_page_runs(bank.entries[name], rows),
+                )
+                self.assertLess(
+                    metrics["resident_payload_bytes"],
+                    (
+                        (bank.entries[name].payload_bytes + page_size - 1)
+                        // page_size
+                        * page_size
+                    ),
+                )
+            finally:
+                bank.close()
+
+    def test_resident_pages_are_sticky_across_cyclic_tensor_demands(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "q4-resident"
             generator = torch.Generator().manual_seed(6380)
             names = (
                 "model.language_model.layers.0.self_attn.k_proj.weight",
                 "model.language_model.layers.0.self_attn.v_proj.weight",
+                "model.language_model.layers.0.self_attn.o_proj.weight",
             )
             tensors = {
                 name: torch.randn((64, 64), generator=generator) for name in names
@@ -2430,7 +2560,7 @@ class Q4BankTests(unittest.TestCase):
                 row_chunk=64,
                 threads=2,
             ).build()
-            payload_bytes = 64 * 36
+            page_size = int(getattr(mmap, "PAGESIZE", 4096))
             bank = Q4Bank.load(
                 root,
                 bundle_receipt=_BUNDLE,
@@ -2438,57 +2568,43 @@ class Q4BankTests(unittest.TestCase):
                 revision=_SOURCE["revision"],
                 inventory_fingerprint=_SOURCE["inventory_fingerprint"],
                 threads=2,
-                resident_budget_bytes=payload_bytes,
+                resident_budget_bytes=2 * page_size,
             )
             try:
                 hidden = torch.randn((1, 64), generator=generator).to(torch.bfloat16)
-                first = bank.linear(hidden, names[0], output_dtype=torch.bfloat16)
-                second = bank.linear(hidden, names[1], output_dtype=torch.bfloat16)
+                first_cycle = tuple(
+                    bank.linear(hidden, name, output_dtype=torch.bfloat16)
+                    for name in names
+                )
                 bank.release_touched()
-                after_first_release = bank.metrics()
-                self.assertEqual(
-                    after_first_release["resident_payload_bytes"], payload_bytes
+                second_cycle = tuple(
+                    bank.linear(hidden, name, output_dtype=torch.bfloat16)
+                    for name in names
                 )
-                self.assertEqual(after_first_release["resident_tensors"], 1)
-                self.assertEqual(after_first_release["resident_evictions"], 1)
-
-                second_again = bank.linear(
-                    hidden,
-                    names[1],
-                    output_dtype=torch.bfloat16,
-                )
-                bank.release_touched(force_prefetch=True)
-                torch.testing.assert_close(second_again, second, rtol=0.0, atol=0.0)
-                self.assertEqual(bank.metrics()["resident_evictions"], 1)
-
-                first_again = bank.linear(
-                    hidden,
-                    names[0],
-                    output_dtype=torch.bfloat16,
-                )
-                bank.discard_rows(names[0], 0, 1)
                 bank.release_touched()
-                torch.testing.assert_close(first_again, first, rtol=0.0, atol=0.0)
+                for actual, expected in zip(second_cycle, first_cycle, strict=True):
+                    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
                 metrics = bank.metrics()
-                self.assertEqual(metrics["resident_hits"], 1)
-                self.assertEqual(metrics["resident_misses"], 3)
-                self.assertEqual(metrics["resident_evictions"], 2)
-                self.assertEqual(metrics["resident_row_discard_skips"], 1)
-                self.assertEqual(metrics["resident_payload_bytes"], payload_bytes)
+                self.assertEqual(metrics["resident_page_admissions"], 2)
+                self.assertEqual(metrics["resident_page_bypasses"], 2)
+                self.assertEqual(metrics["resident_page_hits"], 2)
+                self.assertEqual(metrics["resident_page_misses"], 4)
+                self.assertEqual(metrics["resident_evictions"], 0)
+                self.assertEqual(metrics["resident_protected_pages"], 2)
+                self.assertEqual(metrics["resident_payload_bytes"], 2 * page_size)
+                self.assertEqual(
+                    set(bank._protected_pages),
+                    set(names[:2]),
+                )
             finally:
                 bank.close()
 
-    def test_resident_eviction_fallback_reopens_exact_mapping(self) -> None:
+    def test_resident_range_discard_fallback_drops_tensor_protection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "q4-resident-fallback"
             generator = torch.Generator().manual_seed(6381)
-            names = (
-                "model.language_model.layers.0.self_attn.k_proj.weight",
-                "model.language_model.layers.0.self_attn.v_proj.weight",
-            )
-            tensors = {
-                name: torch.randn((64, 64), generator=generator) for name in names
-            }
+            name = "model.language_model.layers.0.self_attn.k_proj.weight"
+            tensors = {name: torch.randn((1024, 64), generator=generator)}
             Q4BankBuilder(
                 root,
                 pager=_Pager(tensors),
@@ -2496,7 +2612,7 @@ class Q4BankTests(unittest.TestCase):
                 row_chunk=64,
                 threads=2,
             ).build()
-            payload_bytes = 64 * 36
+            page_size = int(getattr(mmap, "PAGESIZE", 4096))
             bank = Q4Bank.load(
                 root,
                 bundle_receipt=_BUNDLE,
@@ -2504,23 +2620,26 @@ class Q4BankTests(unittest.TestCase):
                 revision=_SOURCE["revision"],
                 inventory_fingerprint=_SOURCE["inventory_fingerprint"],
                 threads=2,
-                resident_budget_bytes=payload_bytes,
+                resident_budget_bytes=page_size,
             )
             try:
                 hidden = torch.randn((1, 64), generator=generator).to(torch.bfloat16)
-                expected = bank.linear(hidden, names[0], output_dtype=torch.bfloat16)
-                bank.release_touched()
-                bank.linear(hidden, names[1], output_dtype=torch.bfloat16)
+                expected = bank.linear(hidden, name, output_dtype=torch.bfloat16)
+                self.assertEqual(bank.metrics()["resident_protected_pages"], 1)
                 with mock.patch(
                     "immer.runtimes.qwen3_8.q4._MappedTensor.discard",
                     autospec=True,
                     return_value=False,
                 ):
                     bank.release_touched()
-                self.assertNotIn(names[0], bank._mapped)
+                self.assertNotIn(name, bank._mapped)
+                failed = bank.metrics()
+                self.assertEqual(failed["resident_protected_pages"], 0)
+                self.assertEqual(failed["resident_protection_drop_calls"], 1)
+                self.assertEqual(failed["resident_protection_drop_pages"], 1)
                 reopened = bank.linear(
                     hidden,
-                    names[0],
+                    name,
                     output_dtype=torch.bfloat16,
                 )
                 torch.testing.assert_close(reopened, expected, rtol=0.0, atol=0.0)
@@ -2528,8 +2647,14 @@ class Q4BankTests(unittest.TestCase):
                 metrics = bank.metrics()
                 self.assertEqual(metrics["mapping_discard_fallback_closes"], 1)
                 self.assertEqual(metrics["mapping_reopens"], 1)
-                self.assertEqual(metrics["resident_payload_bytes"], payload_bytes)
+                self.assertEqual(metrics["resident_payload_bytes"], page_size)
                 self.assertEqual(metrics["resident_tensors"], 1)
+                bank.close()
+                closed = bank.metrics()
+                self.assertTrue(closed["closed"])
+                self.assertEqual(closed["resident_payload_bytes"], 0)
+                self.assertEqual(closed["resident_protected_pages"], 0)
+                self.assertEqual(closed["resident_tensors"], 0)
             finally:
                 bank.close()
 

@@ -5657,7 +5657,7 @@ class Qwen38CausalChatTests(unittest.TestCase):
         self.assertEqual(options["q4_root"], str(q4))
         self.assertEqual(
             options["q4_resident_budget_bytes"],
-            16_384 * 1024**2,
+            13_312 * 1024**2,
         )
         self.assertEqual(options["draft_mode"], "hybrid")
         self.assertEqual(options["markov_draft_state_path"], str(markov_state))

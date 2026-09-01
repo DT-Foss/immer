@@ -187,7 +187,7 @@ class Qwen38WeightPager:
     # Preserve the established identity for the default eager-discard path.
     # Residency is output-neutral, but it gets a distinct execution-policy pin.
     Q4_WEIGHT_CACHE_POLICY = "causal-mmap-q4_0-q8_0/v1"
-    Q4_RESIDENT_WEIGHT_CACHE_POLICY = "causal-mmap-q4_0-q8_0-resident-lru/v2"
+    Q4_RESIDENT_WEIGHT_CACHE_POLICY = "causal-mmap-q4_0-q8_0-page-sticky/v3"
 
     def __init__(
         self,
@@ -2026,7 +2026,7 @@ class Qwen38WeightPager:
                     release_touched(force_prefetch=True)
             self._collect_locked("forced")
         elif self.q4_bank is not None:
-            # The Q4 bank enforces its configured eager-discard or resident-LRU
+            # The Q4 bank enforces its configured eager-discard or page-sticky
             # policy at every execution boundary. Both retain identical mmap
             # bytes and arithmetic; only page residency differs.
             release_touched = getattr(self.q4_bank, "release_touched", None)

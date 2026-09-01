@@ -143,7 +143,7 @@ _QWEN38_DEPLOYMENT_INFERENCE_ECONOMICS = (
 )
 _QWEN38_DEPLOYMENT_SERVICE_SOCKET = _QWEN38_DEPLOYMENT_STATE / "qwen3.8-service.sock"
 _QWEN38_DEPLOYMENT_ANCHOR_CACHE = _QWEN38_DEPLOYMENT_STATE / "qwen-chat-prefix-anchors"
-_QWEN38_DEPLOYMENT_Q4_RESIDENT_BUDGET_MB = 16_384
+_QWEN38_DEPLOYMENT_Q4_RESIDENT_BUDGET_MB = 13_312
 _QWEN38_DEPLOYMENT_CONTEXT_CRYSTAL_STATE = (
     _QWEN38_DEPLOYMENT_STATE / "qwen-contextual-continuation-v1.json"
 )
@@ -3605,8 +3605,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="MIB",
         help=(
-            "retain packed Q4/Q8 tensor pages across layer/token boundaries "
-            "under a whole-tensor LRU budget; canonical deployment: 16384, "
+            "protect recurring packed Q4/Q8 pages across layer/token boundaries "
+            "under a sticky page budget; canonical deployment: 13312, "
             "other layouts: 0, explicit 0 keeps eager MADV_DONTNEED"
         ),
     )
